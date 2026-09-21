@@ -1,0 +1,33 @@
+# =============================================================================
+# Whitelist .gitignore — 本目录混杂了大量参考/克隆子项目与构建产物(~420MB)。
+# 策略: 默认忽略全部, 仅放行"核心项目"。
+# 排除: .pio(148MB), ESP32_radio_evo3(212MB), ESP32-audioI2S, yoradio,
+#       tftziku, xiaozhi-esp32, CYDFlipClock, src_backup, nongli(独立库) 等。
+# =============================================================================
+
+# --- 忽略顶层全部条目 ---
+/*
+
+# --- 重新放行核心文件 ---
+!/AGENTS.md
+!/README.md
+!/FIRMWARE_FLASH_NOTES.md
+!/硬件接线图.html
+!/platformio.ini
+!/default_16MB.csv
+!/.gitignore
+
+# --- 重新放行核心目录 ---
+!/src/
+!/include/
+!/data/
+!/scripts/
+!/preview/
+
+# --- 在已放行目录内, 仍忽略生成物/缓存 ---
+**/__pycache__/
+**/*.pyc
+# preview 生成的图片/动画 (可用 make_preview.py / live_preview.py 重新生成)
+preview/*.png
+preview/*.gif
+
