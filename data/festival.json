@@ -1,18 +1,18 @@
 {
   "festival_music": {
-    "春节": "",
-    "元旦": "",
-    "元宵节": "",
-    "清明节": "",
-    "劳动节": "",
-    "端午节": "",
-    "国庆节": "",
-    "中秋节": "",
-    "重阳节": "",
-    "圣诞节": "",
-    "春分": "",
-    "秋分": "",
-    "夏至": "",
-    "冬至": ""
+    "春节": "http://piccpndali.v.myalicdn.com/audio/cctv15_2.m3u8",
+    "元旦": "http://lhttp.qtfm.cn/live/332/64k.mp3",
+    "元宵节": "http://lhttp.qtfm.cn/live/5022308/64k.mp3",
+    "清明": "http://radio.chinesemusicworld.com/chinesemusic.mp3",
+    "劳动节": "http://lhttp.qingting.fm/live/1149/64k.mp3",
+    "端午节": "http://lhttp.qtfm.cn/live/4938/64k.mp3",
+    "国庆节": "http://piccpndali.v.myalicdn.com/audio/cctv15_2.m3u8",
+    "中秋节": "http://lhttp.qtfm.cn/live/5022308/64k.mp3",
+    "重阳节": "http://lhttp.qtfm.cn/live/4873/64k.mp3",
+    "圣诞节": "http://az1.mediacp.eu/listen/airport-lounge-radio/radio.mp3",
+    "春分": "http://lhttp.qtfm.cn/live/4938/64k.mp3",
+    "秋分": "http://lhttp.qtfm.cn/live/4873/64k.mp3",
+    "夏至": "http://lhttp.qtfm.cn/live/332/64k.mp3",
+    "冬至": "http://lhttp-hw.qtfm.cn/live/267/64k.mp3"
   }
 }

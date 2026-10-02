@@ -45,7 +45,16 @@ double nl_moon_phase(int year, int month, int day); // 0..1 (0=新月, 0.5=满�
 
 // 节日查询: 当天节日名写入 out (无节日则 out[0]='\0')。
 // ly/lm/ldn 为农历(非闰), isLeap 是否闰月 (闰月不计节日)。返回 1=有, 0=无。
+// 干支/生肖年: 按"春节(正月初一)"分界取当日所属的农历年。
+// (旧规则 "lm>=10 && mon<=2 取前一年" 在农历 11/12 月误判, 如 2027-01-01 被算成蛇年;
+//  此处改为以该农历年正月初一的公历日期为界, 春节当天起算新生肖年。)
+int nl_zodiac_year(int year, int mon, int day);
+
 int nl_festival(int year, int mon, int day, int ly, int lm, int ldn, int isLeap,
                 char* out, int outSize);
+
+// 是否"除夕"(农历正月初一前一天)。依据内置农历表计算, 不依赖节假日 JSON,
+// 故该年节假日未发布时(如 2027 JSON 为空)除夕也能正确显示。
+int nl_is_chuxi(int year, int mon, int day);
 
 #endif

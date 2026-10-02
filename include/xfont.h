@@ -41,6 +41,17 @@ public:
     // 计算字符串宽度（像素）
     int textWidth(const String& str);
 
+    // 缩放绘制一个中文角标字符 (16x16 AA 灰度 -> dst x dst, 面积平均+逐通道合成)
+    void drawScaledChar(int x, int y, uint16_t ch, int dst, uint16_t fg, uint16_t bg) const;
+    // 放大绘制一个中文大标题字符 (源 AA 灰度 -> dst x dst, 顶角最近邻+逐通道合成,
+    // dst 可达 40; 用于黄历大标题等比字库更大的中文场景)。
+    // 源字形尺寸 = 字库原生分辨率 (_aaSize: ver1=16x16, ver2=32x32)。
+    void drawBigChar(int x, int y, uint16_t ch, int dst, uint16_t fg, uint16_t bg) const;
+    // 当前 AA 字库的原生字形边长 (16 或 32)。drawBigChar 依此取样。
+    int aaSize() const { return _aaSize; }
+    // 该 unicode 是否在 AA 字库中 (用于大字缺字回退)。非 AA 模式返回 false。
+    bool hasGlyph(uint16_t ch) const { return _isAA && findAA(ch) >= 0; }
+
     // 获取字符像素数据（旧 1-bit 模式, AA 模式返回空）
     String getPixelData(const String& str);
 
@@ -49,6 +60,7 @@ private:
     File _fontFile;
     bool _isInit;
     bool _isAA = false;         // 新版 AA 模式标志
+    int  _aaSize = 16;          // AA 字库原生字形边长 (ver1=16 ver2=32 ver3=64 ver4=24超采样16px); 决定 compositeGlyph/drawScaledChar/drawBigChar 取样
 
     String _fontFilePath;
     String _allUnicodes;

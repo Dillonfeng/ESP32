@@ -327,6 +327,22 @@ void nl_month_days(int year, int month, int* result){
     }
 }
 
+// 干支/生肖年: 按"春节(正月初一)"分界。某农历年 Y 的"正月初一"落在公历 Y 年的
+// 1 月或 2 月; 当日在该正月初一之前属上一年(Y-1), 当天及之后属 Y 年。
+// 修正旧规则 "lm>=10 && mon<=2 取前一年" 在农历 11/12 月(春节前的公历1月)误判的问题。
+int nl_zodiac_year(int year, int mon, int day) {
+    int ld1[31]; nl_month_days(year, 1, ld1);   // 1 月 1..31 天的农历 (M*100+D)
+    int ld2[31]; nl_month_days(year, 2, ld2);   // 2 月 1..28 天的农历
+    int janLen = g_days_in_month(year, 1);      // =31
+    int sf_doy = -1;                            // 正月初一的年内日序 (1-based)
+    for (int i = 0; i < 31; i++) if (ld1[i] == 101) { sf_doy = i + 1; break; }
+    if (sf_doy < 0)
+        for (int i = 0; i < 31; i++) if (ld2[i] == 101) { sf_doy = janLen + i + 1; break; }
+    if (sf_doy < 0) return year;                // 兜底 (理论上不会发生)
+    int doy = dn_days(year, mon, day) - dn_days(year, 1, 1) + 1;  // 当日年内日序 (1-based): 1月1日=1
+    return (doy >= sf_doy) ? year : (year - 1);
+}
+
 const char* nl_jq_text[24] = {
     "小寒", "大寒", "立春", "雨水", "惊蛰", "春分",
     "清明", "谷雨", "立夏", "小满", "芒种", "夏至",
@@ -457,7 +473,7 @@ static const SolarFest_t SOLAR_FESTS[] = {
     { 4,  1, "愚人节" }, { 5,  1, "劳动节" }, { 5,  4, "青年节" },
     { 6,  1, "儿童节" }, { 7,  1, "建党节" }, { 8,  1, "建军节" },
     { 9, 10, "教师节" }, {10,  1, "国庆节" }, {12, 24, "平安夜" },
-    {12, 25, "圣诞节" },
+    {12, 25, "圣诞节" }, {10, 31, "万圣节" }, {11, 11, "光棍节" },
 };
 #define SOLAR_FEST_N (sizeof(SOLAR_FESTS) / sizeof(SOLAR_FESTS[0]))
 
@@ -524,9 +540,28 @@ int nl_festival(int year, int mon, int day,
         }
     }
 
-    // 3) 浮动节日: 感恩节 (11 月第 4 个星期四) / 复活节
+    // 3) 浮动节日
     if (mon == 11 && day == nth_thursday_day(year, 11, 4)) {
         snprintf(out, outSize, "感恩节");
+        return 1;
+    }
+    // 黑色星期五 = 美国感恩节(11月第4个星期四)的次日(周五)。不能用"11月第5个周五"
+    //   (大多数年份 11 月只有 4 个周五, 会算错)。
+    int bf = nth_thursday_day(year, 11, 4) + 1;   // 感恩节 + 1 天 = 周五
+    if (mon == 11 && day == bf) {
+        snprintf(out, outSize, "黑色星期五");
+        return 1;
+    }
+    // 母亲节 = 5 月第 2 个星期日 (周日=6, 1900-01-01 为周一, dow==6 即周日)
+    int md = 1 + (6 - (dn_days(year, 5, 1) % 7) + 7) % 7 + 7;
+    if (mon == 5 && day == md) {
+        snprintf(out, outSize, "母亲节");
+        return 1;
+    }
+    // 父亲节 = 6 月第 3 个星期日
+    int fd = 1 + (6 - (dn_days(year, 6, 1) % 7) + 7) % 7 + 14;
+    if (mon == 6 && day == fd) {
+        snprintf(out, outSize, "父亲节");
         return 1;
     }
     int emon;
@@ -537,4 +572,26 @@ int nl_festival(int year, int mon, int day,
     }
 
     return 0;
+}
+
+/**
+ * 判断某公历日是否"除夕" (农历正月初一前一天)。
+ * 依据内置农历表 (1900-2099, 已全量验证): 除夕 = 该农历年正月初一的公历日期 - 1 天。
+ * 不依赖节假日 JSON —— 因此即使该年节假日未发布(如 2027 的 JSON 为空),
+ * 除夕也能正确显示 (2026-02-16 / 2027-02-05 / 2028-01-25 ... )。
+ */
+int nl_is_chuxi(int year, int mon, int day) {
+    int janLen = g_days_in_month(year, 1);   // =31
+    int sf_doy = -1;                          // 正月初一的年内日序 (1-based)
+    int ld1[31]; nl_month_days(year, 1, ld1);
+    int ld2[31]; nl_month_days(year, 2, ld2);
+    for (int i = 0; i < 31; i++) if (ld1[i] == 101) { sf_doy = i + 1; break; }
+    if (sf_doy < 0)
+        for (int i = 0; i < 31; i++) if (ld2[i] == 101) { sf_doy = janLen + i + 1; break; }
+    if (sf_doy < 0) return 0;                 // 兜底
+    if (sf_doy <= 1) return 0;                // 理论上不会 (正月初一最早 1/21)
+    int cdoy = sf_doy - 1;                    // 除夕的年内日序
+    int cm = (cdoy <= 31) ? 1 : 2;
+    int cday = (cm == 1) ? cdoy : (cdoy - janLen);
+    return (mon == cm && day == cday);
 }

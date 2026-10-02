@@ -21,51 +21,60 @@ OUT = os.path.dirname(os.path.abspath(__file__))
 def load_font_glyphs(path):
     d = open(path, "rb").read()
     assert d[0:4] == b"XAAX", "bad magic"
+    S = 64 if d[4] == 3 else (24 if d[4] == 4 else (32 if d[4] == 2 else 16))   # ver3=64 ver4=24 ver2=32 ver1=16
+    per = 3 + S * S
     n = struct.unpack(">H", d[6:8])[0]
     unis, advs = [], []
     pix = d[8:]
     for i in range(n):
-        g = pix[i * 259:i * 259 + 259]
+        g = pix[i * per:i * per + per]
         unis.append(struct.unpack(">H", g[0:2])[0])
         advs.append(g[2])
-    return unis, advs, pix
+    return unis, advs, pix, S
 
 
-def hw_compose_glyph(target, x, y, m, fg, bg):
-    """m: 16x16 灰度. 合成到 target (RGB), 区域 (x,y)-(x+16,y+16)。
-    out = (bg*(255-m)+fg*m)/255 — 与硬件 XFont::compositeGlyph 完全一致。"""
+def hw_compose_glyph(target, x, y, m, S, fg, bg):
+    """m: SxS 原生灰度 (ver4=24 超采样). 面积平均降到 16x16 再合成到 target (RGB), 区域 (x,y)-(x+16,y+16)。
+    out = (bg*(255-a)+fg*a)/255 — 与硬件 XFont::compositeGlyph (S->16) 完全一致。"""
     x, y = int(x), int(y)
-    for j in range(16):
-        for k in range(16):
-            a = int(m[j * 16 + k])
-            px, py = x + k, y + j
+    for oy in range(16):
+        sy0, sy1 = (oy * S) // 16, ((oy + 1) * S) // 16
+        if sy1 <= sy0: sy1 = sy0 + 1
+        for ox in range(16):
+            sx0, sx1 = (ox * S) // 16, ((ox + 1) * S) // 16
+            if sx1 <= sx0: sx1 = sx0 + 1
+            s = 0
+            for sy in range(sy0, sy1):
+                row = m[sy * S:(sy + 1) * S]
+                s += sum(row[sx0:sx1])
+            a = s // ((sy1 - sy0) * (sx1 - sx0))
+            px, py = x + ox, y + oy
             if px < 0 or py < 0 or px >= target.width or py >= target.height:
                 continue
-            r, g, b = target.getpixel((px, py))
-            a = int(a)
             target.putpixel((px, py), (
                 int((bg[0] * (255 - a) + fg[0] * a) // 255),
                 int((bg[1] * (255 - a) + fg[1] * a) // 255),
                 int((bg[2] * (255 - a) + fg[2] * a) // 255)))
 
 
-def hw_draw_string(img, x, y, s, unis, advs, pix, fg, bg):
+def hw_draw_string(img, x, y, s, unis, advs, pix, S, fg, bg):
     """模拟硬件: 逐字 16x16 合成, advance=字宽。y 是 pushImage 顶部 (左中锚点在 y+8)。
     Python3 str 已是 unicode, 每个 s[i] 直接是一个码点 (无需 UTF-8 解码)。"""
+    per = 3 + S * S
     cur = x
     for ch in s:
         cp = ord(ch)
         idx = bisect.bisect_left(unis, cp)
         if idx < len(unis) and unis[idx] == cp:
-            m = pix[idx * 259 + 3: idx * 259 + 3 + 256]
-            hw_compose_glyph(img, cur, y, m, fg, bg)
+            m = pix[idx * per + 3: idx * per + 3 + S * S]
+            hw_compose_glyph(img, cur, y, m, S, fg, bg)
             cur += advs[idx]
         else:
             cur += 16 if cp > 127 else 8
     return cur
 
 
-def render_date_hw(unis, advs, pix):
+def render_date_hw(unis, advs, pix, S):
     info = mp.date_strings()
     img = Image.new("RGB", (480, 320), mp.c565(0x0000))
     d = ImageDraw.Draw(img)
@@ -75,17 +84,17 @@ def render_date_hw(unis, advs, pix):
     cy1 = mp.ROW1_TOP + mp.ROW1_H // 2
     y1 = cy1 - 8
     x = mp.DATE_LEFT + 12
-    hw_draw_string(img, x, y1, info["date"], unis, advs, pix, mp.WHITE, mp.ROW1_BG)
+    hw_draw_string(img, x, y1, info["date"], unis, advs, pix, S, mp.WHITE, mp.ROW1_BG)
     x += mp.F16.getlength(info["date"]) + 8
-    hw_draw_string(img, x, y1, info["week"], unis, advs, pix, mp.CYAN, mp.ROW1_BG)
+    hw_draw_string(img, x, y1, info["week"], unis, advs, pix, S, mp.CYAN, mp.ROW1_BG)
     d.line([cx, mp.ROW1_TOP + 9, cx, mp.ROW1_TOP + mp.ROW1_H - 9], fill=mp.DATE_SEP)
     x = cx + 12
-    hw_draw_string(img, x, y1, info["lunar"], unis, advs, pix, mp.WHITE, mp.ROW1_BG)
+    hw_draw_string(img, x, y1, info["lunar"], unis, advs, pix, S, mp.WHITE, mp.ROW1_BG)
     x += mp.F16.getlength(info["lunar"]) + 6
-    hw_draw_string(img, x, y1, info["gz"], unis, advs, pix, mp.GOLD, mp.ROW1_BG)
+    hw_draw_string(img, x, y1, info["gz"], unis, advs, pix, S, mp.GOLD, mp.ROW1_BG)
     if info["fest"]:
         x += mp.F16.getlength(info["gz"]) + 6
-        hw_draw_string(img, x, y1, "今日" + info["fest"], unis, advs, pix,
+        hw_draw_string(img, x, y1, "今日" + info["fest"], unis, advs, pix, S,
                        mp.event_color(info["fest"]), mp.ROW1_BG)
     d.rounded_rectangle([mp.DATE_LEFT, mp.ROW2_TOP, mp.DATE_RIGHT, mp.ROW2_TOP + mp.ROW2_H - 1],
                         radius=8, fill=mp.ROW2_BG)
@@ -94,23 +103,23 @@ def render_date_hw(unis, advs, pix):
     xj = mp.DATE_LEFT + 12
     if info["cur_d"] == 0:
         cur_s = "今日" + info["cur"]
-        hw_draw_string(img, xj, y2, cur_s, unis, advs, pix, mp.event_color(info["cur"]), mp.ROW2_BG)
+        hw_draw_string(img, xj, y2, cur_s, unis, advs, pix, S, mp.event_color(info["cur"]), mp.ROW2_BG)
         xj += int(mp.F16.getlength(cur_s)) + 10
-        hw_draw_string(img, xj, y2, "%s %d天后" % (info["nxt"], info["nxt_d"]), unis, advs, pix, mp.SOFT, mp.ROW2_BG)
+        hw_draw_string(img, xj, y2, "%s %d天后" % (info["nxt"], info["nxt_d"]), unis, advs, pix, S, mp.SOFT, mp.ROW2_BG)
     else:
         hw_draw_string(img, xj, y2,
                        "%s 已过%d天   %s %d天后" % (info["cur"], info["cur_d"], info["nxt"], info["nxt_d"]),
-                       unis, advs, pix, mp.SOFT, mp.ROW2_BG)
+                       unis, advs, pix, S, mp.SOFT, mp.ROW2_BG)
     x = mp.DATE_RIGHT - 12
     hms = "%d%%" % mp.MOCK_HUMIDITY
-    hw_draw_string(img, x - mp.F16.getlength(hms), y2, hms, unis, advs, pix,
+    hw_draw_string(img, x - mp.F16.getlength(hms), y2, hms, unis, advs, pix, S,
                    mp.humid_color(mp.MOCK_HUMIDITY), mp.ROW2_BG)
     x -= int(mp.F16.getlength(hms)) + 8
     tms = "%d°C" % int(mp.MOCK_TEMP)
-    hw_draw_string(img, x - mp.F16.getlength(tms), y2, tms, unis, advs, pix,
+    hw_draw_string(img, x - mp.F16.getlength(tms), y2, tms, unis, advs, pix, S,
                    mp.temp_color(int(mp.MOCK_TEMP)), mp.ROW2_BG)
     x -= int(mp.F16.getlength(tms)) + 8
-    hw_draw_string(img, x - mp.F16.getlength(info["moon"]), y2, info["moon"], unis, advs, pix, mp.MOON_TXT, mp.ROW2_BG)
+    hw_draw_string(img, x - mp.F16.getlength(info["moon"]), y2, info["moon"], unis, advs, pix, S, mp.MOON_TXT, mp.ROW2_BG)
     x -= int(mp.F16.getlength(info["moon"])) + 6
     mp.draw_moon(d, int(x) - 8, cy2, 9, info["mp"])
     return img
@@ -124,8 +133,8 @@ def render_date_preview():
 
 
 def main():
-    unis, advs, pix = load_font_glyphs(FONT_FILE)
-    hw = render_date_hw(unis, advs, pix)
+    unis, advs, pix, S = load_font_glyphs(FONT_FILE)
+    hw = render_date_hw(unis, advs, pix, S)
     pv = render_date_preview()
     hw.save(os.path.join(OUT, "verify_hw.png"))
     pv.save(os.path.join(OUT, "verify_preview.png"))

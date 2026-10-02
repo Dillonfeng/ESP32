@@ -31,3 +31,13 @@
 preview/*.png
 preview/*.gif
 
+
+# --- debug/diagnostic/temp clutter (keep repo clean) ---
+**/_*
+**/*.log
+**/*.txt
+**/*.bak
+**/*.bak2
+**/*.png
+**/*.gif
+preview/diag_alm/

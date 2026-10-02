@@ -73,8 +73,8 @@
 
 //  #define SPI_FREQUENCY  20000000
 //  #define SPI_READ_FREQUENCY  20000000
-#define SPI_FREQUENCY   20000000
-#define SPI_READ_FREQUENCY  10000000
+#define SPI_FREQUENCY   40000000   // 40MHz (ST7796 支持; 20MHz 时翻页/指针整面闪)
+#define SPI_READ_FREQUENCY  20000000
 
 // ##################################################################################
 //

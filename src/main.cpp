@@ -1,20 +1,20 @@
 /*
- * ESP32-S3 网络收音机 - 主程序 v2
+ * ESP32-S3 网络收音�?- 主程�?v2
  * ===============================
- * 硬件: ESP32-S3-N16R8 + ST7796S 480x320 + XPT2046 + PCM5102A + INMP441
+ * �?�?: ESP32-S3-N16R8 + ST7796S 480x320 + XPT2046 + PCM5102A + INMP441
  * 
- * 参考设计: yoradio (widget布局), tftziku (中文字库), ESP32-audioI2S
+ * 参�?��?��?? yoradio (widget布局), tftziku (�?文字�?), ESP32-audioI2S
  * 
  * 功能模块:
- * 1. 翻页时钟 (数码管风格数字 + 中文日期)
- * 2. 万年历 (农历/干支/生肖/节气/定制节日)
- * 3. 网络收音机 (HLS+HTTPS, 电台列表, 触摸控制)
+ * 1. 翻页时钟 (数码管�?�格数�??+ �?文日�?)
+ * 2. 万年�?(农历/干支/生肖/节气/定制节日)
+ * 3. 网络收音�?(HLS+HTTPS, 电台列表, 触摸控制)
  * 4. 天气显示
  * 
- * 切换方式: 底部触摸导航栏4个按钮
+ * 切换方式: 底部触摸导航�?�?按�??
  *
- * ⚠️ 注意: 本文件已手动改写为"机械翻页(Split-Flap)时钟 + 局部刷新"。
- *    请勿再运行 scripts/rebuild_main.py —— 它会覆盖这些手动改动。
+ * ⚠️ 注意: �?文件已手动改写�??机�?�翻�?(Split-Flap)时钟 + �?部刷�?�?
+ *    请勿再运�?scripts/rebuild_main.py —�??它会覆盖这些手动改动�?
  */
 
 #include <Arduino.h>
@@ -24,19 +24,23 @@
 #include <time.h>
 #include <LittleFS.h>
 #include <nvs.h>
-#include <TFT_eSPI.h>   // 已包含 Fonts/GFXFF/* (FreeSansBold24pt7b 等)
+#include <TFT_eSPI.h>   // 已包�?Fonts/GFXFF/* (FreeSansBold24pt7b �?
 #include <Audio.h>
 #include <ArduinoJson.h>
 #include "xfont.h"
 #include "nongli.h"
 #include "digits.h"
 #include "dialnum.h"
+#include "almnum.h"
+#include "holiday_sync.h"
+#include "geo_pin.h"
+#include "esp_heap_caps.h"
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// 调试提示开关: 1=调试期显示"点屏幕切换"等提示; 正式产品改 0 全部隐藏
-// (与 preview/make_preview.py 的 DEBUG_UI 保持一致)。
+// 调试提示�?�? 1=调试期显�?点屏幕切�?等提�? 正式产品�?0 全部隐藏
+// (�?preview/make_preview.py �?DEBUG_UI 保持�?�?�?
 #define DEBUG_UI 0
 
 // ========== 引脚定义 ==========
@@ -48,8 +52,25 @@
 
 // ========== 全局对象 ==========
 TFT_eSPI tft = TFT_eSPI();
+// 指针表盘: 每帧�?(静�?�表�?白圆+刻度+12数字) + (3 根指�? 全部合成到这块内�?RAM 缓冲
+// (146x146 = 42.6KB), 再�?�单次�?�pushImage 整帧。关�?整帧�?次推�?原子�? �?TE 同�?��??
+// 面板持续�?�?, �?推表�?擦掉�? -> 再分几笔画针"会有�?间露针空�? -> 3 针闪�?+ 秒针
+// 像不动�?�合成到同一缓冲�?次推, 与已验证干净的翻页时钟同�?(�?pushImage, 无中间状�?�?
+static uint16_t *analogFace = nullptr;       // BUILD17: heap buffer (was static .bss), alloc'd by allocClockBufs
+static uint16_t *cardSram = nullptr;   // BUILD17: heap buffer (declared here; used before in-place decl below)
+static uint16_t *rollerSram = nullptr;   // BUILD17: heap buffer (declared here; used before in-place decl below)
+static uint16_t *bandSram = nullptr;   // BUILD17: heap buffer (declared here; used before in-place decl below)
+static uint16_t *bandBuf = nullptr;   // BUILD17: heap buffer (declared here; used before in-place decl below)
+static uint16_t *flapTmp = nullptr;   // BUILD17: heap buffer (declared here; used before in-place decl below)
+// 静�?�表盘缓�?(白圆+刻度+12数字), �?次�?�构建后每帧 memcpy 复用�?
+// 原实现每帧调 buildAnalogFace 重建全表 (~50-100ms on ESP32-S3), 实际 FPS 远低�?
+// ANALOG_FRAME_MS �?�? (30 FPS), 秒针每帧仅推�?<0.1px �?视�?��??冻结"�?
+// 缓存后每帧只 memcpy 42.6KB (~1ms) + �?3 �? 实际 FPS 回到 ~30, 秒针平滑�?秒�??
+static uint16_t *analogFaceCache = nullptr; // BUILD17: heap buffer (was static .bss), alloc'd by allocClockBufs
+static bool     analogFaceBuilt = false;
 XFont font16(&tft);
 XFont font24(&tft);
+XFont font32(&tft);   // 64px AA 字库 (黄历大字; ver3, ~1.0MB PSRAM)
 Audio audio;
 
 // ========== 触摸校准参数 ==========
@@ -65,10 +86,15 @@ enum UIMode {
 };
 UIMode currentMode = MODE_CLOCK;
 bool modeChanged = true;
-// 每个模式独立的"已绘制"标志，切换时全部重置为 false
+// 每个模式�?立�??已绘�?标志，切换时全部重置�?false
 bool modeDrawn[MODE_COUNT] = {false, false, false, false};
+// 导航栏重绘标�? 仅在"选中的�?�航项变�?"时重绘�?�时钟样式切�?翻页<->指针)不改变�?��??
+// 选中�? 若�?�时也重绘�?�航�? �?fillRect+4 �?AA �?4 条分隔线 多笔 SPI 会与整页重绘
+// 交错, �?TE 面板�?描撕�? -> 收音�?天气 之间出现"彩色竖条"(长度随机)。故样式切换�?�?
+// modeChanged(重绘页面), 不置 navDirty(不动导航�?�?
+bool navDirty = true;
 
-// ========== 导航栏布局 ==========
+// ========== 导航栏布�? ==========
 #define NAV_BAR_Y       288
 #define NAV_BAR_HEIGHT  32
 #define NAV_BTN_WIDTH   120
@@ -81,10 +107,10 @@ const char* navLabels[] = {"时钟", "日历", "收音机", "天气"};
 #define COLOR_ACCENT   TFT_CYAN
 #define COLOR_NAV_BG   0x2104
 #define COLOR_NAV_SEL  0x4A69
-#define COLOR_DIGIT    0x07FF  // 青色数码管
+#define COLOR_DIGIT    0x07FF  // 青色数码�?
 #define COLOR_DIM      0x7BEF  // 暗灰
 
-// ========== WiFi/NTP 状态 ==========
+// ========== WiFi/NTP 状�??==========
 bool wifiConnected = false;
 bool ntpSynced = false;
 bool wifiConnecting = false;
@@ -93,123 +119,165 @@ const char* ntpServer = "ntp.aliyun.com";
 const int gmtOffsetSec = 8 * 3600;
 
 // ========== 时间来源 ==========
-// 通过 WiFi + NTP 同步时间 (需联网)。
+// 通过 WiFi + NTP 同�?�时�? (�?联网)�?
 
-// ========== 时钟状态 ==========
+// ========== 时钟状�??==========
 int prevH = -1, prevM = -1, prevS = -1;
 bool colonBlink = true;
 
-// 时钟样式 (0=机械翻页 1=模拟指针) — 前向声明, 实现见下方
+// 时钟样式 (0=机�?�翻�? 1=模拟指针) �?前向声明, 实现见下�?
 enum ClockStyle { STYLE_FLAP = 0, STYLE_ANALOG = 1 };
 static uint8_t clockStyle = STYLE_FLAP;
 static uint8_t getClockStyle();
 static void saveClockStyle(uint8_t v);
 
-// ========== 收音机状态 ==========
-// 二进制 stations.bin 格式 (v2):
+// ========== 收音机状�?==========
+// 二进�?stations.bin 格式 (v2):
 //   Header(24) + RegionIdx(28*N) + StationRecords(变长)
 #define RADIO_SIDEBAR_W    70
 #define RADIO_HEADER_H     28
-#define RADIO_PLAYBAR_H    80   // 底部播放栏高度
+#define RADIO_PLAYBAR_H    80
 #define RADIO_LIST_X       70
-#define RADIO_LIST_W       390  // 减去滚动条 + 收藏列
+#define RADIO_LIST_W       390
 #define RADIO_SCROLLBAR_W  8
-#define RADIO_FAV_W        24   // 每行收藏按钮宽度
-#define RADIO_ROW_H        55
-// 列表可见行数: 320 - header(28) - playbar(80) - nav(32) = 180px / 55 = 3.27 → 3
-#define RADIO_STATION_ROWS 3
 #define RADIO_LIST_TOP     (RADIO_HEADER_H)
 #define RADIO_LIST_BOT     (NAV_BAR_Y - RADIO_PLAYBAR_H)
 #define RADIO_LIST_H       (RADIO_LIST_BOT - RADIO_LIST_TOP)
-#define RADIO_FULLSCREEN   1    // 是否显示电台全屏信息页
-
-// 收藏: 用 station bin_offset 作为唯一 ID
-#define MAX_FAVORITES 64
-uint32_t favorites[MAX_FAVORITES];
-int favoriteCount = 0;
-bool favoritedChanged = false;
-bool showingFullscreen = false;
-unsigned long lastTapTime = 0;
-int lastTapRow = -1;
-
+// 侧栏: 顶部 4 个固定行(全部/收藏/历史/个人) + 下方可滚动地区行 (与 make_preview 一致)
+#define RADIO_SPECIAL_CNT  4
+#define RADIO_SPECIAL_H    22
+#define RADIO_ROW_H_SIDE   24
+#define RADIO_REGION_TOP   (RADIO_HEADER_H + RADIO_SPECIAL_CNT * RADIO_SPECIAL_H)
+// 电台列表: 45px 行高, 4 行 (180/45=4, 与 make_preview R_ROW_H/R_ROWS 一致)
+#define RADIO_ROW_H        45
+#define RADIO_STATION_ROWS 4
+#define RADIO_FULLSCREEN   1
+#define RADIO_DBL_MS       500   // 列表双击判定窗口 (2026-09-27: 350->500 更灵敏; 与 live_preview 一致)
+#define RADIO_PLAY_FLUSH_MS 600  // 延迟起播: 双击窗口完全关闭后才真正连流 (防 connecttohost 阻塞吞掉双击第二击)
 struct RegionEntry {
-  char name[17];            // UTF-8 名称, null-padded
-  uint32_t first_offset;    // 在 station records section 的起始偏移
+  char name[17];
+  uint32_t first_offset;
   uint16_t count;
 };
-
-struct StationView {        // 列表显示用 (不含 URL)
-  char name[32];            // UTF-8, 截断显示
-  char freq[13];            // UTF-8, 如 "FM105.8"
-  uint8_t region_idx;
-  uint8_t category_idx;     // 对应 region_entries 下标
-  uint8_t r, g, b;
-  uint32_t bin_offset;      // 在 stations.bin 中的完整记录偏移
-};
-
-// 全局数据
 RegionEntry* regionEntries = nullptr;
 int regionCount = 0;
-StationView* curRegionStations = nullptr;
-int curRegionCount = 0;
-int curRegionIdx = 0;            // 当前选中的分类
-int curRegionFirstOffset = 0;   // 当前分类在 bin 中的起点
-
-// 播放状态
-int currentPlayingIdx = -1;     // 当前播放的电台在 curRegionStations 中的下标
+#define RMAX_STN 1700
+struct RadioStation {        // 全局 station 表 (全部 1668 个, 含 16 user)
+  char name[32];
+  char freq[13];
+  char region[18];
+  char cat[12];
+  uint8_t r, g, b;
+  bool is_user;
+  bool in_bin;            // true: url 在 stations.bin, url_offset=记录偏移
+  uint32_t url_offset;    // in_bin: bin 记录偏移; else: extraUrl 下标
+};
+RadioStation* radioStn = nullptr;   // PSRAM: 1700*84B ~= 142KB, 内部 DRAM 放不下
+int radioStnTotal = 0;
+#define RMAX_CATS 48
+struct RadioCat {
+  char label[18];
+  char key[18];
+  bool meta;
+  int  count;
+  uint16_t* sids;         // -> 全局 sid 列表 (PSRAM)
+};
+RadioCat radioCats[RMAX_CATS];
+int radioCatCount = 0;
+#define RMAX_ALL 1700
+uint16_t allSeq[RMAX_ALL];      int allCount = 0;
+#define RMAX_FAV 64
+uint16_t favSids[RMAX_FAV];     int favCount = 0;
+#define RMAX_HIST 48
+uint16_t histSids[RMAX_HIST];   int histCount = 0;
+int radioBinTotal = 0;
+int extraCount = 0;            // radio_meta 里额外(用户)电台数, buildRadioCats 用
+#define RMAX_EXTRA 24
+char extraUrl[RMAX_EXTRA][260]; int extraUrlCount = 0;
+static const char* RADIO_CATNAMES[] = { "交通","综合","经济","新闻","文艺","音乐","体育","农村","影视","教育","生活" };
+static const uint16_t RADIO_CATCOLS[] = { 0x34DB, 0x324B, 0xF4E2, 0xE267, 0xE3E4, 0x9AD6, 0x2E6E, 0x256C, 0xD2A0, 0x2C17, 0x1DF3 };
+#define RADIO_CATN (sizeof(RADIO_CATNAMES) / sizeof(RADIO_CATNAMES[0]))
+static const char* RLBL[] = { "全部", "收藏", "历史", "个人" };
+static const char* RHEAD[] = { "全国", "中央", "电视伴音", "国际" };
+static const char* RTAIL[] = { "海外", "其它" };
+static const char* RPINNED = "广东";   // 定位失败/离线时的兜底置顶省份
+static char radioPinnedUsed[18] = "";  // 最近一次 buildRadioCats 用的置顶省名, loop 用它判断定位是否变化需重建
+static const char* RORDER[] = { "山东","浙江","河北","江苏","河南","吉林","四川","安徽","山西","辽宁","湖北","云南","新疆","黑龙江","湖南","江西","广西","内蒙古","贵州","福建","北京","陕西","青海","上海","香港","重庆","宁夏","甘肃","台湾","海南","西藏","天津","澳门" };
+static const int RORDER_N = 33;
+int currentCat = 0;
+int currentPlayingSid = -1;   // 播放中的全局 sid (-1=无)
 bool radioPlaying = false;
 bool radioInited = false;
 int radioVolume = 10;
-bool musicPlaying = false;      // 节日/节气 网络流音乐正在播放
+bool musicPlaying = false;
+int regionScrollTop = 0;
+int listScrollTop = 0;
+// 触摸状态 (原 favorites/showingFullscreen 等)
+bool showingFullscreen = false;
+unsigned long lastTapTime = 0;
+int lastTapRow = -1;
+int pendingPlaySid = -1;          // 延迟起播 sid: 双击窗口(RADIO_DBL_MS)关闭后才真正连流
+unsigned long pendingPlayAt = 0;  // 起播请求的时间戳
+          // �?�?�?�?见的电台下标 (行号)
+bool listScrollDirty = true;
+bool sideScrollDirty = true;    // 侧栏(整列)需局部刷新 (2026-09-27)    // �?要重绘列�?
 
-// 侧边栏滚动
-int regionScrollTop = 0;        // 第一个可见的 region 下标
+// 触摸状�??
+// touchLastX/Y 已在 handleTouch 前的 static 变量�?定�??
 
-// 电台列表滚动
-int listScrollTop = 0;          // 第一个可见的电台下标 (行号)
-bool listScrollDirty = true;    // 需要重绘列表
-
-// 触摸状态
-// touchLastX/Y 已在 handleTouch 前的 static 变量中定义
-
-// ========== 天气状态 ==========
+// ========== 天气状�??==========
 bool weatherInited = false;
-// 温度/湿度 (占位 mock 值, 接入天气 API 后替换; 默认与 make_preview.py 一致)
+// 温度/湿度 (占位 mock �? 接入天气 API 后替�? 默�?��??make_preview.py �?�?
 int mockTempC = 25;
 int mockHumidity = 60;
 
-// ========== 翻页时钟 (机械翻页牌 / Split-Flap) ==========
-// 屏幕 480x480 (rot 1)。布局: 6 张白色翻页牌(HH:MM:SS) + 中央铰链线
-// + 下方日期条。只重绘发生变化的数字牌(局部刷新, 不整屏刷新)。
-// 数字: FreeSansBold24pt7b 缩放2 → '0' 约 48x70 px。
-#define CARD_W        56    // 单张数字牌宽 (容纳 48px 数字 + 边距)
-#define COLON_W       12    // 冒号宽
+// ========== 翻页时钟 (机�?�翻页�??/ Split-Flap) ==========
+// 屏幕 480x480 (rot 1)。布�?: 6 张白色翻页牌(HH:MM:SS) + �?�?铰链�?
+// + 下方日期条�?�只重绘发生变化的数字牌(�?部刷�? 不整屏刷�?�?
+// 数字: FreeSansBold24pt7b 缩放2 �?'0' �?48x70 px�?
+#define CARD_W        56    // 单张数字牌�?? (容纳 48px 数字 + 边距)
+#define COLON_W       12    // 冒号�?
 #define CARD_GAP      6     // 同组两数字牌间距
 #define COLON_GAP     10    // 冒号两侧间距
-#define CARD_TOP      48    // 翻页牌顶边
+#define CARD_TOP      48    // 翻页牌顶�?
 #define CARD_H        120   // 翻页牌高 (数字 70px 居中 + 上下留白)
-#define CARD_RADIUS   10    // 圆角半径
-#define DIGIT_SCALE   2     // FreeSansBold24 缩放 (24px -> 48px 宽)
-#define DATE_LEFT     31    // 日期条左边 (与 CARD_X0 对齐)
-#define DATE_RIGHT    449   // 日期条右边 (与末张牌右缘对齐)
-#define ROW1_TOP      186   // 主日期行顶边 (公历/星期 | 农历/干支)
-#define ROW1_H        46    // 主日期行高
-#define ROW2_TOP      240   // 详情行顶边 (节气 | 月相)
+#define CARD_RADIUS   10    // 圆�?�半�?
+#define DIGIT_SCALE   2     // FreeSansBold24 缩放 (24px -> 48px �?
+#define DATE_LEFT     31    // 日期条左�?(�?CARD_X0 对齐)
+#define DATE_RIGHT    449   // 日期条右�?(与末张牌右缘对齐)
+#define ROW1_TOP      186   // 主日期�?�顶�? (�?�?/星期 | 农历/干支)
+#define ROW1_H        46    // 主日期�?��??
+#define ROW2_TOP      240   // 详情行顶�?(节气 | 月相)
 #define ROW2_H        36    // 详情行高
 
-// 翻页牌配色
-#define CARD_FACE     0x6318  // 白  (0xE0,0xF8,0x08)
-#define CARD_SEAM     0x2108  // 中央铰链暗缝
+// 翻页牌配�?
+#define CARD_FACE     0xFFFF  // 白底牌面 (�?preview CARD_FACE_W=0xFFFF �?�? 黑字)
+#define CARD_SEAM     0x3A48  // 铰链: �?�? 1px 细缝 (冷灰, 白底上近乎隐�?
+#define HINGE_HI      0x9514  // 铰链: 两�??�?轴帽受光高�??(�?�?)
+#define HINGE_MID     0x4ACB  // 铰链: �?轴帽�?�?(�?�?)
+#define HINGE_LO      0x1945  // 铰链: �?轴帽底�??(暗沟)
 #define CARD_SHADE    0x1084  // 翻页时上半暗阴影
 #define CARD_EDGE     0x39C6  // 卡片下缘投影
 #define CARD_NUM      0x0000  // 数字黑色
-#define DATE_STRIP    0x18E3  // 详情行底色 (近黑, 与导航栏一致)
-#define ROW1_BG       0x2146  // 主日期行底色 (深灰蓝, 稍亮突出)
+#define DATE_STRIP    0x18E3  // 详情行底�?(近黑, 与�?�航栏一�?
+#define ROW1_BG       0x2146  // 主日期�?�底�? (深灰�? 稍亮突出)
 #define DATE_SEP      0x0821  // 日期分隔竖线
 #define COLOR_GOLD    0xFE4C  // 干支金色
-#define SOFT_C        0x94F6  // 灰蓝 (普通节气文字)
+#define SOFT_C        0x94F6  // 灰蓝 (�?通节气文�?
+// 节假日同步高�?(�?preview make_preview.py HOL_* �?�?
+#define CAL_OFF       0xF800  // 放假(�? - �?(与周�?同�?? 表示休息)
+#define CAL_WORK      0x6CF1  // 补班(�? - 浅蓝 (黑底高可�? �?tempColor 冰点�?
+// 日历浅色主�?? (仅日历页; 其余页面仍深�? �?�?make_preview.py CAL_* 同�??
+#define CAL_LIGHT_BG  0xFFFF  // 页面白底
+#define CAL_GRID      0xC65A  // table 网格�?(浅灰�?
+#define CAL_HDR       0x5ACB  // 星期表头 / �?�? (深灰)
+#define CAL_TITLE     0x12D9  // 月份标�?? / "今日" (�?
+#define CAL_NORM      0x31A6  // �?通日期数�?(深灰)
+#define CAL_STRIP_L   0xEF9F  // 底部信息条底�?(浅蓝�?
+#define CAL_GOLD_L    0xCC21  // 干支 (深金, 白底�?�?)
+#define CAL_WORK_L    0x01F4  // 补班 (深蓝, 白底�?�?)
 
-// 节日/节气 当天显示颜色 ("今日XX" 用, 未知事件 -> 灰蓝)
+// 节日/节气 当天显示颜色 ("今日XX" �? �?知事�? -> 灰蓝)
 static uint16_t eventColor(const char* name) {
   if (!name || !name[0]) return SOFT_C;
   // 24 节气
@@ -224,7 +292,7 @@ static uint16_t eventColor(const char* name) {
   if (!strcmp(name,"小暑")||!strcmp(name,"大暑")||!strcmp(name,"立秋")||
       !strcmp(name,"处暑")||!strcmp(name,"小满")||!strcmp(name,"芒种"))
                                       return TFT_YELLOW;
-  // 24 节气之外 (春分/秋分) 用金色
+  // 24 节气之�?? (春分/秋分) 用金�?
   if (!strcmp(name,"春分")||!strcmp(name,"秋分")) return COLOR_GOLD;
   // 节日
   if (!strcmp(name,"春节")||!strcmp(name,"元旦")||!strcmp(name,"国庆节")||
@@ -236,30 +304,30 @@ static uint16_t eventColor(const char* name) {
   return SOFT_C;
 }
 
-// 温度颜色: 随数值变化 (越冷越蓝, 越热越红) — 天气接入后在 drawDateRow 使用
-// 冰点以下用浅蓝 (0x6CF1) 而非纯蓝 (0x001F), 避免在深色背景上不可读
+// 温度颜色: 随数值变�?(越冷越蓝, 越热越红) �?天气接入后在 drawDateRow 使用
+// 冰点以下用浅�?(0x6CF1) 而非�?�? (0x001F), 避免在深色背�?上不�?�?
 uint16_t tempColor(int c) {
-  if (c <= 0)  return 0x6CF1;       // 冰点以下 - 浅蓝 (高对比度)
-  if (c <= 8)  return TFT_CYAN;     // 冷
-  if (c <= 15) return TFT_GREEN;    // 凉
-  if (c <= 24) return COLOR_GOLD;   // 舒适
-  if (c <= 29) return TFT_YELLOW;   // 热
+  if (c <= 0)  return 0x6CF1;       // 冰点以下 - 浅蓝 (高�?�比�?)
+  if (c <= 8)  return TFT_CYAN;     // �?
+  if (c <= 15) return TFT_GREEN;    // �?
+  if (c <= 24) return COLOR_GOLD;   // 舒�??
+  if (c <= 29) return TFT_YELLOW;   // �?
   return TFT_RED;                   // 炎热 (>30°)
 }
 
-// 湿度颜色: 随数值变化 (过干偏黄, 舒适绿, 过湿偏蓝)
+// 湿度颜色: 随数值变�?(过干偏黄, 舒�?�绿, 过湿偏蓝)
 uint16_t humidColor(int h) {
   if (h <= 30) return TFT_YELLOW;   // 过干
   if (h <= 45) return COLOR_GOLD;   // 偏干
-  if (h <= 65) return TFT_GREEN;    // 舒适
+  if (h <= 65) return TFT_GREEN;    // 舒�??
   if (h <= 80) return TFT_CYAN;     // 偏湿
-  return 0x6CF1;                    // 过湿 - 浅蓝 (高对比度)
+  return 0x6CF1;                    // 过湿 - 浅蓝 (高�?�比�?)
 }
-#define MOON_LIT      0xFF97  // 月相亮部
+#define MOON_LIT      0xFF97  // 月相�?�?
 #define MOON_DARK     0x2146  // 月相暗部
-#define MOON_EDGE     0x424B  // 月相轮廓
+#define MOON_EDGE     0x424B  // 月相�?�?
 
-// 数字牌 x 坐标 (居中布局: 6 张牌 + 2 个冒号, 总宽 418, 左右各 31px 边距)
+// 数字�?x 坐标 (居中布局: 6 张牌 + 2 �?冒�?? 总�?? 418, 左右�?31px 边距)
 #define CARD_X0       31
 #define CARD_X1       (CARD_X0 + CARD_W + CARD_GAP)              // 93
 #define COLON_X       (CARD_X1 + CARD_W + COLON_GAP)             // 159
@@ -269,16 +337,44 @@ uint16_t humidColor(int h) {
 #define CARD_X4       (COLON_X2 + COLON_W + COLON_GAP)           // 331
 #define CARD_X5       (CARD_X4 + CARD_W + CARD_GAP)              // 393
 
-// 每张数字牌的状态 (current=已显示的旧数字, 用于翻页)
-struct FlipCard {
-  char current;   // 当前显示的字符
-  bool ready;     // 是否已完成初始绘制
-};
-FlipCard flipCard[6] = {
-  {'0',false},{'0',false},{'0',false},{'0',false},{'0',false},{'0',false}
-};
+// 两相 split-flap 翻页时序 & 滚动齿轮 (�?preview live_preview / make_preview �?�?
+// 再放慢版 (�?260/220): 让翻�?齿轮滚动更清晰可�?
+#define FLIP_TOP_MS   400
+#define FLIP_BOT_MS   340
+// 翻页刷新帧间�?(ms) = preview live_preview �?TICK_MS=40 (~25 FPS)�?
+// loop() 无节�? tickFlapClock 若每�?都�??(~1000+ FPS) 会把 SPI 打满,
+// 每帧 ~13KB 牌面重绘丢帧 -> 翻页�?抖�?�按 40ms 门控调用, 与�?��?�同帧率�?
+// 状�?�机�?�?�?millis() 计时, �?�?"调用频率"不改变动画时序�??
+#define FLAP_FRAME_MS 40
+// 指针样式刷新帧间�?(ms) �?30 FPS。�?�针�?平滑�?�?, 每帧都会重绘整张表盘
+// (~40KB: fillCircle 白底 + 60 刻度 + 12 数字 + 指针)。loop() 无节流时 (~1000+ FPS)
+// 会把 20MHz SPI 打满 -> 整面�?�?/撕�?��?�限�?~30 FPS, 秒针 6°/s => 0.2°/�?
+// 依然平滑, 与翻页的 FLAP_FRAME_MS 节流同理�?
+#define ANALOG_FRAME_MS 33
+#define ROLLER_W      16
+#define ROLLER_PITCH  14
+#define GAP1_CX       (COLON_X  + COLON_W / 2)   // 165 (= preview GAP1_CX)
+#define GAP2_CX       (COLON_X2 + COLON_W / 2)   // 315 (= preview GAP2_CX)
 
-// 农历/星期 名称表
+// 两相 split-flap 翻页 (非阻塞状态机), �?preview live_preview.Sim �?�?
+struct FlipState {
+  bool     flipping;   // �?否�?�在翻页
+  char     shown;      // 当前显示的旧数字 (翻页期间 = 旧数�? 完成 = 新数�?
+  char     newD;       // �?标数�?
+  int      clicks;     // 已完成的"�?�?(0/1/2, �?�?, 供齿�?滚动�?)
+  bool     redrawn;    // �?会话�?否已绘制 (稳�?�避免重�?
+  uint32_t startMs;    // 翻页起�?�时�?
+};
+static FlipState fstate[6];
+
+// 翻页动画的半牌/翻片带全部用内部 RAM (octal PSRAM DMA 读取错乱 = "秒个位彩虹花屏" 根因,
+// 故彻底弃用 PSRAM 预渲染): 半牌由 renderHalfCard() 按需从 flash 数字遮罩现算, 翻片带 buildFlapBand 现算。
+// bandBuf buffer (declared at top; alloc'd by allocClockBufs)         // BUILD17: heap buffer (was static .bss), alloc'd by allocClockBufs   // 内部 RAM: 翻片带 (56x60), buildFlapBand 现算
+// flapTmp buffer (declared at top; alloc'd by allocClockBufs)         // BUILD17: heap buffer (was static .bss), alloc'd by allocClockBufs   // 内部 RAM: 现渲染半牌中转 (renderHalfCard/buildFlapBand 复用)
+static float rollerColB[ROLLER_W];
+static bool flapReady = false;
+
+// 农历/星期 名称�?
 const char* lunarMonths[] = {"正","二","三","四","五","六","七","八","九","十","冬","腊"};
 const char* lunarDays[] = {
   "初一","初二","初三","初四","初五","初六","初七","初八","初九","初十",
@@ -294,30 +390,30 @@ void drawNavBar();
 void handleTouch();
 void modeClock();
 void modeCalendar();
+void drawCalPicker();
 void modeRadio();
 void modeWeather();
 void checkFestivalMusic(int year, int mon, int mday);
 bool loadRadioDB();
-void loadRegionStations(int regionIdx);
-void playStationAt(int listIdx);
+bool loadRadioMeta();
+void playStationAt(int sid);
 void stopRadio();
-String readStationURL(uint32_t binOffset);
+String readURLForSid(int sid);
+static RadioStation* stn(int sid);   // 前置声明 (modeRadio 延迟起播需要)
 void drawRadioRegionSidebar();
 void drawRadioList();
 void drawRadioHeader();
-void drawRadioNowPlaying();
-void drawStationRow(int rowY, StationView& st, bool playing);
+void drawStationRow(int rowY, RadioStation* st, bool playing, bool favorited);
+void drawStationIcon(int cx, int cy, RadioStation* st, int size);
 void drawRadioScrollbar();
-void saveFavorites();
-bool isFavorited(uint32_t binOffset);
-void toggleFavorite(uint32_t binOffset);
-void loadFavorites();
 void drawRadioPlayBar();
 void handleRadioTap(uint16_t tx, uint16_t ty);
+void handleCalendarTap(uint16_t tx, uint16_t ty);
+static int  curCount();
 void drawStationFullscreen();
 
 // ============================================================
-// 触摸状态变量 (边沿检测)
+// 触摸状�?�变�?(边沿�?�?
 // ============================================================
 static bool touchWasDown = false;
 static int touchStartX = 0, touchStartY = 0;
@@ -325,6 +421,8 @@ static int touchLastX = 0, touchLastY = 0;
 static unsigned long touchStartTime = 0;
 static bool touchDidScroll = false;
 static int touchScrollStartScrollTop = 0;
+static int touchScrollZone = 0;         // 0=无 1=右侧电台列表 2=左侧地区侧栏 (镜像 live_preview)
+static int touchScrollStartRegion = 0;  // 侧栏拖拽起始 regionScrollTop
 
 // ============================================================
 // initTFT / initTouch / drawNavBar
@@ -332,6 +430,12 @@ static int touchScrollStartScrollTop = 0;
 void initTFT() {
   tft.init();
   tft.setRotation(3);   // 180° 旋转 (原为 1)
+  // ⚠️ ST7796 �?BGR 顺序 (User_Setup.h TFT_BGR), 必须 swap 字节�?
+  // ESP32 小�?? uint16_t 0x07FE 在内存是 0xFE 0x07; pushImage �?swap 就推
+  // 0xFE 0x07, ST7796 读成 0xFE07 (B=31,G=57,R=7) = 蓝色, �?应是青�??
+  // 之前 drawCard/blitDialNum 用黑字白�?(0x0000/0xFFFF swap 后仍�?�?/�?
+  // 看不出错, 但日期条彩色�?彩色背景就暴露字节序错乱 (字体颜色�?彩色背景).
+  tft.setSwapBytes(true);
   tft.fillScreen(TFT_BLACK);
   tft.setTextFont(1);
   pinMode(TFT_BL_PIN, OUTPUT);
@@ -350,7 +454,7 @@ void drawNavBar() {
     if (sel) {
       tft.fillRect(x + 2, NAV_BAR_Y + 2, NAV_BTN_WIDTH - 4, NAV_BAR_HEIGHT - 4, COLOR_NAV_SEL);
     }
-    uint16_t tc = sel ? TFT_YELLOW : 0xC618;
+    uint16_t tc = sel ? TFT_YELLOW : TFT_WHITE;   // 选中=黄字, 未选=白字 (与 live preview 一致)
     int tw = font16.textWidth(navLabels[i]);
     font16.drawString(x + (NAV_BTN_WIDTH - tw) / 2, NAV_BAR_Y + 8, navLabels[i], tc, sel ? COLOR_NAV_SEL : COLOR_NAV_BG);
     if (i > 0) tft.drawFastVLine(x, NAV_BAR_Y + 2, NAV_BAR_HEIGHT - 4, 0x630C);
@@ -358,26 +462,30 @@ void drawNavBar() {
 }
 
 // ============================================================
-// handleTouch (边沿检测版)
+// handleTouch (边沿�?测版)
 // ============================================================
 void handleTouch() {
   uint16_t tx, ty;
   int touched = tft.getTouch(&tx, &ty);
   bool isDown = (touched > 0);
-
-  // 触摸补偿: getTouch 不随 setRotation 变换, 返回固定物理帧坐标。
-  // 显示当前为 rotation(3) (相对原 rotation(1) 旋转 180°), 故 x/y 均需翻转。
-  if (isDown) {
-    tx = tft.width()  - tx;
-    ty = tft.height() - ty;
-  }
-
+  // 触摸坐标 = 屏幕坐标 (getTouch 已按 rotation(3) 校准), 与 live preview 1:1 一致, 无需翻转.
+  // 之前此处曾多翻 180 度 -> 点底部导航栏被映射到顶部, 点日历变成切换时钟样式 (已移除).
   if (isDown && !touchWasDown) {
     touchStartX = touchLastX = tx;
     touchStartY = touchLastY = ty;
     touchStartTime = millis();
     touchDidScroll = false;
     touchScrollStartScrollTop = listScrollTop;
+    // 拖拽分区 (镜像 live_preview _on_press): 左侧地区侧栏 / 右侧电台列表 都可上下拖动
+    if (currentMode == MODE_RADIO) {
+      if (tx < RADIO_SIDEBAR_W && ty >= RADIO_HEADER_H && ty < NAV_BAR_Y) {
+        touchScrollZone = 2; touchScrollStartRegion = regionScrollTop;
+      } else if (tx >= RADIO_LIST_X && ty >= RADIO_LIST_TOP && ty < RADIO_LIST_BOT) {
+        touchScrollZone = 1;
+      } else touchScrollZone = 0;
+    } else touchScrollZone = 0;
+    Serial.printf("[DBG-T] press(%d,%d) mode=%d zone=%d regionTop=%d listTop=%d listBot=%d navY=%d regionScroll=%d\n",
+                 tx, ty, (int)currentMode, touchScrollZone, RADIO_REGION_TOP, RADIO_LIST_TOP, RADIO_LIST_BOT, NAV_BAR_Y, regionScrollTop);
   }
 
   if (!isDown && touchWasDown) {
@@ -387,13 +495,28 @@ void handleTouch() {
     touchWasDown = false;
     touchStartTime = 0;
 
+    // 2026-09-27: 侧栏拖拽结束吸附 -> 视口顶所在行的行顶对齐视口顶(28px), 避免停在半行
+    if (touchDidScroll && touchScrollZone == 2 && currentMode == MODE_RADIO) {
+      int totalH = RADIO_SPECIAL_CNT * RADIO_SPECIAL_H + max(0, radioCatCount - RADIO_SPECIAL_CNT) * RADIO_ROW_H_SIDE;
+      int smax = max(0, totalH - (NAV_BAR_Y - RADIO_HEADER_H));
+      int topk = 0, snap = 0;
+      for (int k = 0; k < radioCatCount; k++) {
+        if (topk <= regionScrollTop) snap = topk;
+        topk += (k < RADIO_SPECIAL_CNT) ? RADIO_SPECIAL_H : RADIO_ROW_H_SIDE;
+      }
+      if (snap > smax) snap = smax;
+      if (snap != regionScrollTop) { regionScrollTop = snap; sideScrollDirty = true; }
+    }
+    if (touchDidScroll) touchScrollZone = 0;   // 拖拽结束 -> 复位分区 (避免下次按下误判)
     if (!touchDidScroll && dur < 800 && abs(dy) < 15 && abs(dx) < 15) {
+      Serial.printf("[TOUCH] tap @ (%d,%d) dur=%lu mode=%d\n", touchStartX, touchStartY, (unsigned long)dur, (int)currentMode);  // 临时调试: 确认触摸坐标与屏幕坐标一致
       if (touchStartY >= NAV_BAR_Y) {
         int btnIdx = touchStartX / NAV_BTN_WIDTH;
         if (btnIdx >= 0 && btnIdx < MODE_COUNT) {
           if (btnIdx != currentMode) {
             currentMode = (UIMode)btnIdx;
             modeChanged = true;
+            navDirty = true;   // 选中项变�?-> 导航栏高�?�?重绘 (样式切换不走这里)
             for (int i = 0; i < MODE_COUNT; i++) modeDrawn[i] = false;
             prevH = prevM = prevS = -1;
           }
@@ -401,6 +524,9 @@ void handleTouch() {
         }
       } else if (currentMode == MODE_RADIO) {
         handleRadioTap(touchStartX, touchStartY);
+      } else if (currentMode == MODE_CALENDAR && touchStartY < NAV_BAR_Y) {
+        // 点日历页: �?1/3 = 上一�? �?1/3 = 下一�?(�?preview �?�?/ �?�?�?
+        handleCalendarTap(touchStartX, touchStartY);
       } else if (currentMode == MODE_CLOCK && touchStartY < 30 && touchStartX < 100) {
         font16.drawString(100, 100, "WiFi配网模式", TFT_YELLOW, COLOR_BG);
         font16.drawString(80, 130, "手机连接: ESP32-Radio", TFT_WHITE, COLOR_BG);
@@ -412,14 +538,17 @@ void handleTouch() {
         if (WiFi.status() == WL_CONNECTED) { wifiConnected = true; configTime(gmtOffsetSec, 0, ntpServer); }
         modeChanged = true; prevH = prevM = prevS = -1;
       } else if (currentMode == MODE_CLOCK && touchStartY < NAV_BAR_Y) {
-        // 点击时钟页 (左上角 30x100 为配网热区) 切换 翻页/指针 样式
+        // 点击时钟�?(左上�?30x100 为配网热�? 切换 翻页/指针 样式
         clockStyle = (clockStyle == STYLE_FLAP) ? STYLE_ANALOG : STYLE_FLAP;
         saveClockStyle(clockStyle);
         modeChanged = true;
         prevH = prevM = prevS = -1;
         Serial.printf("clock style -> %s\n", clockStyle == STYLE_FLAP ? "flap" : "analog");
       }
-      delay(150);
+      // fix(2026-09-27): 旧版此处 delay(150) 在每次 tap 释放后阻塞主循环 150ms。
+      // 快速双击时, 第二下的 按下+释放 整个落在该 150ms 阻塞内 -> 主循环没采样到 -> 第二下丢失,
+      // 双击永远不触发(=用户"快速双击打不开播放界面"的根因)。触摸本身已有边沿检测(getTouch
+      // 的 50ms _pressTime 保持), 无需这层 150ms 阻塞去防抖。删掉后主循环能立即采样第二下。
     }
     touchDidScroll = false;
   }
@@ -428,15 +557,28 @@ void handleTouch() {
     int dy = ty - touchStartY;
     if (abs(dy) > 10 && !touchDidScroll) touchDidScroll = true;
     if (touchDidScroll) {
-      int newScroll = touchScrollStartScrollTop + dy / 3;
-      newScroll = constrain(newScroll, 0, max(0, curRegionCount - RADIO_STATION_ROWS));
-      if (newScroll != listScrollTop) { listScrollTop = newScroll; listScrollDirty = true; }
+      static unsigned long lastScDbg = 0;
+      if (millis() - lastScDbg > 120) { lastScDbg = millis(); Serial.printf("[DBG-T] scroll zone=%d dy=%d regionScroll=%d\n", touchScrollZone, dy, regionScrollTop); }
+      if (touchScrollZone == 2) {
+        // 2026-09-27: 侧栏整列(固定4行+地区行)一起滚动, 像素级 1:1 跟手(最灵敏);
+        // 局部刷新: 只重绘 70x260 侧栏 (sideScrollDirty), 不整页 (旧版每行整页重绘, SPI 要 ~100ms
+        // 阻塞主循环, 拖拽采样跟不上 -> 不灵敏/卡顿)。
+        int totalH = RADIO_SPECIAL_CNT * RADIO_SPECIAL_H + max(0, radioCatCount - RADIO_SPECIAL_CNT) * RADIO_ROW_H_SIDE;
+        int smax = max(0, totalH - (NAV_BAR_Y - RADIO_HEADER_H));
+        int ns = constrain(touchScrollStartRegion - dy, 0, smax);
+        if (ns != regionScrollTop) { regionScrollTop = ns; sideScrollDirty = true; }
+      } else if (touchScrollZone == 1) {
+        // 自然滚动(上划=看下面更多电台)。fix(2026-09-27): 方向改 `- dy/3`, 与地区列表统一。
+        int newScroll = touchScrollStartScrollTop - dy / 3;
+        newScroll = constrain(newScroll, 0, max(0, curCount() - RADIO_STATION_ROWS));
+        if (newScroll != listScrollTop) { listScrollTop = newScroll; listScrollDirty = true; }
+      }
     }
     touchLastX = tx; touchLastY = ty;
   }
 
-  // 边沿检测: 必须在所有检查完旧 touchWasDown 之后再更新,
-  // 否则释放沿 (!isDown && touchWasDown) 永远为 false → 触摸无反应。
+  // 边沿�?�? 必须在所有�??查完�?touchWasDown 之后再更�?
+  // 否则释放�?(!isDown && touchWasDown) 永远�?false �?触摸无反应�??
   touchWasDown = isDown;
 }
 
@@ -444,28 +586,29 @@ void handleTouch() {
 // modeClock / modeCalendar / modeWeather
 // ============================================================
 
-// 单张数字牌各 x 坐标 (索引 0..5 → HH MM SS)
+// 单张数字牌各 x 坐标 (索引 0..5 �?HH MM SS)
 static const int cardX[6] = {CARD_X0, CARD_X1, CARD_X2, CARD_X3, CARD_X4, CARD_X5};
 
-// 绘制一张静态数字牌: 白底圆角 + 中央铰链线 + 下缘投影 + 居中数字
-// shadeTop: 是否给上半部加暗阴影 (用于翻页动画)
+// 金属铰链 (直写屏幕�?: 5px 竖直渐变�?(高光->�?�?->暗沟->�?�?->反光) + 两�?? 3x5 �?轴钉�?
+static void drawHingeCard(int x, int seamY, int w);
+
+// 绘制�?张静态数字牌: 白底圆�?? + �?�?铰链 + 下缘投影 + 居中数字
+// shadeTop: �?否给上半部加暗阴�? (用于翻页动画)
 static void drawCard(int idx, char digit, bool shadeTop) {
+  if (!cardSram) return;   // BUILD17: guard (alloc failed)
   int x = cardX[idx], y = CARD_TOP, w = CARD_W, h = CARD_H;
   int seamY = y + h / 2;
-  // 下缘投影 (先画, 让牌浮起)
+  // 下缘投影 (先画, 让牌�?�?)
   tft.fillRoundRect(x, y + 3, w, h, CARD_RADIUS, CARD_EDGE);
   // 牌面
   tft.fillRoundRect(x, y, w, h, CARD_RADIUS, CARD_FACE);
-  // 翻页阴影: 覆盖上半部
+  // 翻页阴影: 覆盖上半�?
   if (shadeTop) {
     tft.fillRoundRect(x, y, w, h / 2, CARD_RADIUS, CARD_SHADE);
-    tft.fillRect(x, seamY, w, 1, CARD_FACE); // 擦平铰链线处的阴影边
+    tft.fillRect(x, seamY, w, 1, CARD_FACE); // 擦平铰链线�?�的阴影�?
   }
-  // 中央铰链线
-  tft.drawFastHLine(x + 2, seamY, w - 4, CARD_SEAM);
-  tft.drawFastHLine(x + 2, seamY + 1, w - 4, CARD_FACE);
-  // 抗锯齿数字: 用 8 位灰度遮罩按当前背景(牌面/翻页阴影)逐通道混合后推送。
-  // mask=255 -> 背景色, mask=0 -> 黑(数字笔画)。逐通道混合才不偏色。
+  // 抗锯齿数�? �?8 位灰度遮罩按当前背景(牌面/翻页阴影)逐�?�道混合后推送�??
+  // mask=255 -> 背景�? mask=0 -> �?数字笔画)。�?��?�道混合才不偏色�?
   const uint8_t *mask = DigitMasks[digit - '0'];
   static uint16_t dgb[DIGIT_BYTES];
   uint16_t bg = shadeTop ? CARD_SHADE : CARD_FACE;
@@ -477,18 +620,367 @@ static void drawCard(int idx, char digit, bool shadeTop) {
     dgb[i] = (((r5 * m) / 255) << 11) | (((g6 * m) / 255) << 5) | ((b5 * m) / 255);
   }
   tft.pushImage(x + (w - DIGIT_W) / 2, y + (h - DIGIT_H) / 2, DIGIT_W, DIGIT_H, dgb);
+  // 金属铰链 (5px 渐变�?+ 两�??�?轴�?? 必须在数字之后画, 否则�?数字盖�?? �?preview _draw_hinge �?�?
+  drawHingeCard(x, seamY, w);
 }
 
-// "快门"翻页: 变暗 → 换数字 → 恢复。仅作用于单张牌(局部)。
-// 本构建无 startWindow/endWindow 裁剪, 故用整牌重绘模拟翻页。
-static void flipDigitAnim(int idx, char newDigit) {
-  drawCard(idx, newDigit, true);   // 1) 上半变暗, 显示新数字
-  delay(120);
-  drawCard(idx, newDigit, false);  // 2) 恢复, 显示新数字
-  delay(60);                       // 3) 短停顿, 让翻页更从容
+// ---- 两相 split-flap 翻页 (非阻�? �?preview live_preview/make_preview 逐帧�?�? ----
+#define FLAP_BAND_LINE 0x7350   // (120,120,135) 翻片带边�?
+
+static bool flapInRoundRect(int px, int py, int W, int H, int r) {
+  if (px < 0 || px >= W || py < 0 || py >= H) return false;
+  int cx = (px < r) ? r : (px > W - 1 - r) ? (W - 1 - r) : px;
+  int cy = (py < r) ? r : (py > H - 1 - r) ? (H - 1 - r) : py;
+  if (cx == px && cy == py) return true;
+  int dx = px - cx, dy = py - cy;
+  return dx * dx + dy * dy <= r * r;
 }
 
-// ========== 时钟样式实现 (0=机械翻页 1=模拟指针) ==========
+static float flapEase(float p) {           // smoothstep: �?�?�?(preview _ease)
+  if (p < 0) p = 0; if (p > 1) p = 1;
+  return p * p * (3 - 2 * p);
+}
+
+// 翻页动画: 半牌不再预渲染进 PSRAM (octal PSRAM DMA 读取错乱 = "秒个位彩虹花屏" 根因),
+// 改为每次按需由 renderHalfCard() 从 flash 数字遮罩现渲染进内部 RAM, 翻页全程只碰内部 RAM。
+// flapInit() 只预计算齿轮列明暗, 无 PSRAM 分配, 不会失败。
+static bool flapInit(void) {
+  if (flapReady) return true;
+  for (int x = 0; x < ROLLER_W; x++) {             // 齿轮列明暗 (preview _roller_col_profile)
+    float t = (float)x / (ROLLER_W - 1);
+    float g = 0.20f + 0.80f * sinf(t * (float)M_PI);
+    float spec = 1.0f - fabsf(t - 0.5f) / 0.16f; if (spec < 0) spec = 0; spec *= 0.30f;
+    rollerColB[x] = g + spec;
+  }
+  flapReady = true;
+  return true;
+}
+// 现渲染单张半牌 (上/下, 56x60) 进内部 RAM out[]: 圆角白牌面 (角区=屏幕背景) + 8 位灰度数字遮罩。
+// 从 flash (DigitMasks) 现算, 不经过 PSRAM, 彻底消除翻页时 octal PSRAM DMA 读取错乱 (彩虹花屏)。
+static void renderHalfCard(int digit, bool top, uint16_t *out) {
+  const int HH = CARD_H / 2;                       // 60
+  const int r5 = (CARD_FACE >> 11), g6 = (CARD_FACE >> 5) & 0x3F, b5 = CARD_FACE & 0x1F;
+  for (int y = 0; y < HH; y++) {
+    int py = top ? y : (HH + y);                   // 全牌坐标 (0..119)
+    for (int px = 0; px < CARD_W; px++)
+      out[y * CARD_W + px] = flapInRoundRect(px, py, CARD_W, CARD_H, CARD_RADIUS)
+        ? ((r5 << 11) | (g6 << 5) | b5) : 0x0000;
+  }
+  const uint8_t *mask = DigitMasks[digit];
+  for (int dy = 0; dy < DIGIT_H; dy++)
+    for (int dx = 0; dx < DIGIT_W; dx++) {
+      int px = (CARD_W - DIGIT_W) / 2 + dx;
+      int py = (CARD_H - DIGIT_H) / 2 + dy;        // 全牌坐标
+      if (top ? (py < HH) : (py >= HH)) {          // 只落在本半牌内
+        uint8_t m = pgm_read_byte(&mask[dy * DIGIT_W + dx]);
+        int oy = top ? py : (py - HH);
+        out[oy * CARD_W + px] = (((r5 * m) / 255) << 11) | (((g6 * m) / 255) << 5) | ((b5 * m) / 255);
+      }
+    }
+}
+// 翻片带: 旧半牌现渲染 (renderHalfCard, 内部 RAM) 后压缩到 bandH 高, 逐行变暗
+// (preview _shade_band, LANCZOS≈面积平均)。不再读 PSRAM, 消除翻页彩虹花屏。
+static void buildFlapBand(int oldD, bool top, int bandH, float strength, bool flipShade = false) {
+  const int HH = CARD_H / 2;
+  renderHalfCard(oldD, top, flapTmp);
+  const uint16_t *src = flapTmp;
+  int H2 = max(1, bandH);
+  for (int yy = 0; yy < H2; yy++) {
+    int from = (int)((long)yy * HH / H2);
+    int to   = (int)((long)(yy + 1) * HH / H2);
+    if (to <= from) to = from + 1;
+    float t = (flipShade ? (float)(H2 - 1 - yy) : (float)yy) / max(1, H2 - 1);              // 0 靠近铰链 .. 1 远端
+    float k = 1.0f - (0.12f + 0.70f * strength * t);    // 越远越暗
+    for (int xx = 0; xx < CARD_W; xx++) {
+      int sr = 0, sg = 0, sb = 0;
+      for (int sy = from; sy < to; sy++) {
+        uint16_t c = src[sy * CARD_W + xx];
+        sr += (c >> 11); sg += ((c >> 5) & 0x3F); sb += (c & 0x1F);
+      }
+      int n = to - from;
+      int rr = (int)((sr / n) * k), gg = (int)((sg / n) * k), bb = (int)((sb / n) * k);
+      if (rr < 0) rr = 0; if (gg < 0) gg = 0; if (bb < 0) bb = 0;
+      bandBuf[yy * CARD_W + xx] = (rr << 11) | (gg << 5) | bb;
+    }
+  }
+}
+
+// ---- 原子�?(atomic frame) 内部 RAM 缓冲 ----
+// 根因 = **帧撕�?(frame tearing)**: ST7796S �?SPI 驱动�?*�?�? TE(撕�?�同�?)�?*, 屏幕
+// 面板持续以自�?~60-120Hz �?描自己�??GRAM, �?MCU 同时�?里写像素 -> 两�?�不同�?��?�凡
+// "每帧内�?�会�?"的区�?秒个位卡/两枚齿轮/指针秒针)�?描线与写入交�? -> 上半显示新数�?�?
+// 下半显示旧数�?= 用户看到�?半旧半新 / 铰链糊成长条 / �?�? / 翻页乱序"; �?每帧不变"
+// 的区�?�?分卡 1-5)GRAM 稳定 -> 无撕�? �?以看起来干净。preview(Pillow) �?渲染到�?�屏
+// 图像后一次�??blit(= 天然帧同�?, 故完美�??
+// �?�? = �?会动的区�?, �?帧内�?有像素先合成�?*�?块内�?RAM 缓冲**, �?*单�?? pushImage
+// 整帧**(原子�? 无中间状�? —�??与已验证干净的指针表�?analogFace 同�?��??
+//  (此前"PSRAM 彩虹花屏 = DMA �?PSRAM 取错数据"�?�?�? �?板�??USE_FSPI_PORT 同�??
+//   spi.transfer(), 无异�?DMA, �?PSRAM 同�?��?�没�?�?; 真�?�根因就�?上面的帧撕�?��??
+// 整张牌缓�? 56 x (120+3), �?�?(120) + 下缘投影露出�?3px �? �?�?pushImage 覆盖�?
+#define CARD_SHAD_ROW 3
+#define CARD_SRAM_H   (CARD_H + CARD_SHAD_ROW)
+// cardSram buffer (declared at top; alloc'd by allocClockBufs)        // BUILD17: heap buffer (was static .bss), alloc'd by allocClockBufs
+// 齿轮缓冲: 16 x 120
+// rollerSram buffer (declared at top; alloc'd by allocClockBufs)      // BUILD17: heap buffer (was static .bss), alloc'd by allocClockBufs
+// ---- 齿轮�?(atomic roller band): 两枚齿轮 + �?间两张�??(�?,3) 合成进一块内�?RAM
+// 缓冲, �?*单�?? pushImage** 整帧。根�? 两齿�?若各�?�?�? pushImage (每帧 3 �?SPI 事务:
+// 翻牌 + 左齿�?+ 右齿�?, �?TE 面板�?描线与写入交�? -> 右齿�?后推, �?描相位不�?)顶�??
+// 出现"彩色撕�??/blur", 而左齿轮相位合�?�故干净(用户观察到的"右有左无")。合并为�?笔后
+// 两齿�?同扫描相位原子更�?, 消除不�?�称。带�?= GAP1 齿轮左缘 .. GAP2 齿轮右缘�?
+#define BAND_X0     (GAP1_CX - ROLLER_W / 2)      // 157
+#define BAND_X1     (GAP2_CX + ROLLER_W / 2)      // 323
+#define BAND_W      (BAND_X1 - BAND_X0)           // 166
+// bandSram buffer (declared at top; alloc'd by allocClockBufs)        // BUILD17: heap buffer (was static .bss), alloc'd by allocClockBufs
+
+// 把一行水平线画进整卡缓冲 (y �?[0, CARD_SRAM_H) �?
+static void lineBufCard(int x0, int y, int x1, uint16_t col) {
+  if (y < 0 || y >= CARD_SRAM_H) return;
+  if (x0 < 0) x0 = 0; if (x1 >= CARD_W) x1 = CARD_W - 1;
+  for (int x = x0; x <= x1; x++) cardSram[y * CARD_W + x] = col;
+}
+// 铰链 (整卡缓冲�?: �?�? 1px 细缝 + 两�?? 3x3 金属�?轴�?? 写进 cardSram (x 相�?�牌左�??
+// �?drawHingeCard 逐像素一�?
+static void hingeBufCard(int seamY, int w) {
+  lineBufCard(4, seamY, w - 5, CARD_SEAM);   // 中央 1px 细缝 (两端转轴帽之间)
+  const uint16_t kc[6] = { (uint16_t)HINGE_HI, (uint16_t)HINGE_HI, (uint16_t)HINGE_MID, (uint16_t)HINGE_MID, (uint16_t)HINGE_LO, (uint16_t)HINGE_LO };
+  for (int r = 0; r < 6; r++) {
+    for (int px = 0; px < 4; px++) {
+      cardSram[(seamY - 3 + r) * CARD_W + px] = kc[r];              // 左转轴帽
+      cardSram[(seamY - 3 + r) * CARD_W + (w - 4 + px)] = kc[r];    // 右转轴帽
+    }
+  }
+}
+// 圆�?�矩形填进整卡缓�? (�?tft.fillRoundRect 同几�? 角区�?flapInRoundRect 判断)
+static void fillRoundRectCard(int ox, int oy, int w, int h, int r, uint16_t col) {
+  for (int py = 0; py < h; py++) {
+    int by = oy + py; if (by < 0 || by >= CARD_SRAM_H) continue;
+    for (int px = 0; px < w; px++) {
+      int bx = ox + px; if (bx < 0 || bx >= CARD_W) continue;
+      if (flapInRoundRect(px, py, w, h, r)) cardSram[by * CARD_W + bx] = col;
+    }
+  }
+}
+
+// 铰链 (直写屏幕�?: �?�? 1px 细缝 + 两�?? 3x3 金属�?轴�??(受光高光->�?�?->暗沟 竖渐�?�?
+// 细缝在牌面�?��?? 两�??帽是机�?�翻牌的�?轴�?�x=牌绝�?x, seamY=缝绝�?y, w=CARD_W�?
+static void drawHingeCard(int x, int seamY, int w) {
+  tft.drawFastHLine(x + 4, seamY, w - 8, CARD_SEAM);   // 中央 1px 细缝 (两端转轴帽之间)
+  const uint16_t kc[6] = { (uint16_t)HINGE_HI, (uint16_t)HINGE_HI, (uint16_t)HINGE_MID, (uint16_t)HINGE_MID, (uint16_t)HINGE_LO, (uint16_t)HINGE_LO };  // 顶高光->中->底暗
+  for (int r = 0; r < 6; r++) {
+    for (int px = 0; px < 4; px++) {
+      tft.fillRect(x + px,         seamY - 3 + r, 1, 1, kc[r]);   // 左转轴帽
+      tft.fillRect(x + w - 4 + px, seamY - 3 + r, 1, 1, kc[r]);   // 右转轴帽
+    }
+  }
+}
+
+// 单张牌当前帧 (phase 1=上半翻片下落露新上半 / 2=下半翻片上翻补新下半)�?
+// 整张�?牌面+�?旧上下半+翻片�?铰链�?铰链�?)先合成进 cardSram, �?*单�??** pushImage
+// 整帧 => 原子�? 消除"�?�?->推半�?>推翻片带->画缝"多�?�写之间的面板扫描空�?(乱序/撕�??)�?
+static void drawFlapFrame(int idx, char oldD, char newD, int phase, float p) {
+  int x = cardX[idx], y = CARD_TOP, w = CARD_W, h = CARD_H;
+  int half = h / 2, seamY = h / 2;              // 缓冲内坐�?(y=0 = CARD_TOP)
+  // 先整块清成页面背�?�?: cardSram �?复用缓�?? 圆�?��??下缘投影两�?�区若不显式�?
+  // 会残留上�?帧像素�??�?并推�?(花屏)。整块填黑后, 圆�?��??= �?= 页面底色�?
+  for (int i = 0; i < CARD_W * CARD_SRAM_H; i++) cardSram[i] = COLOR_BG;
+  // 下缘投影 (牌下露出 3px) + 牌面
+  fillRoundRectCard(0, CARD_SHAD_ROW, w, h, CARD_RADIUS, CARD_EDGE);
+  fillRoundRectCard(0, 0, w, h, CARD_RADIUS, CARD_FACE);
+  int bandH = max(1, (int)((1.0f - p) * half + 0.5f));
+  if (phase == 1) {
+    renderHalfCard(newD - '0', true,  flapTmp);
+    memcpy(&cardSram[0],                    flapTmp, CARD_W * half * 2);                      // 新上半
+    renderHalfCard(oldD - '0', false, flapTmp);
+    memcpy(&cardSram[seamY * CARD_W],       flapTmp, CARD_W * half * 2);                      // 旧下半
+    buildFlapBand(oldD - '0', true, bandH, p);
+    memcpy(&cardSram[(seamY - bandH) * CARD_W], bandBuf, CARD_W * bandH * 2);                // 旧上半翻片带
+    lineBufCard(1, seamY - bandH, w - 2, FLAP_BAND_LINE);
+  } else {
+    renderHalfCard(newD - '0', true,  flapTmp);
+    memcpy(&cardSram[0],                    flapTmp, CARD_W * half * 2);                      // 新上半
+    renderHalfCard(newD - '0', false, flapTmp);
+    memcpy(&cardSram[seamY * CARD_W],       flapTmp, CARD_W * half * 2);                      // 新下半
+    buildFlapBand(oldD - '0', false, bandH, p, true);
+    memcpy(&cardSram[(seamY + half - bandH) * CARD_W], bandBuf, CARD_W * bandH * 2);         // 旧下半翻片带
+    lineBufCard(1, seamY + half - bandH, w - 2, FLAP_BAND_LINE);
+  }
+  // 金属铰链 (�?上层, 必须在半牌之后画, 否则�?数字盖�?? �?preview _draw_hinge �?�?
+  hingeBufCard(seamY, w);
+  tft.pushImage(x, y, w, CARD_SRAM_H, cardSram);   // 原子�? 整牌�?次推�?
+}
+// 间隙 3D 滚动齿轮 (16x120 圆柱, 齿纹�?scroll 下移, �?preview draw_roller �?�?
+// 稳态静态牌 (整牌: 投影+白底+完整数字+铰链) 合成进 cardSram 再*单次* pushImage (原子帧)。
+// 与 drawCard 逐像素一致, 但走内部 RAM 原子推屏。用于翻页"完成"瞬间: 若用 drawCard(多笔直写屏:
+// 白底填充 -> 数字 push -> 画铰链) 会在"擦白 -> 画数字"之间被面板扫到 => 用户看到"每翻一次闪一下"。
+static void drawCardStaticAtomic(int idx, char digit) {
+  int x = cardX[idx], y = CARD_TOP, w = CARD_W, h = CARD_H;
+  int half = h / 2, seamY = half;
+  for (int i = 0; i < CARD_W * CARD_SRAM_H; i++) cardSram[i] = COLOR_BG;
+  fillRoundRectCard(0, CARD_SHAD_ROW, w, h, CARD_RADIUS, CARD_EDGE);   // 下缘投影 (先画, 让牌压在它上面)
+  fillRoundRectCard(0, 0, w, h, CARD_RADIUS, CARD_FACE);               // 白底牌面
+  renderHalfCard(digit - '0', true,  flapTmp);
+  memcpy(&cardSram[0],              flapTmp, CARD_W * half * 2);       // 完整数字上半
+  renderHalfCard(digit - '0', false, flapTmp);
+  memcpy(&cardSram[seamY * CARD_W], flapTmp, CARD_W * half * 2);       // 完整数字下半
+  hingeBufCard(seamY, w);                                               // 铰链 (最上层, 必须在数字之后画)
+  tft.pushImage(x, y, w, CARD_SRAM_H, cardSram);   // 原子帧: 整牌一次推 (消除"每翻一次闪一下")
+}
+static void drawRoller(int cx, float scroll) {
+  if (!rollerSram) return;   // BUILD17: guard (alloc failed)
+  const int x0 = cx - ROLLER_W / 2, H = CARD_H;
+  float phase = fmodf(scroll, (float)ROLLER_PITCH);
+  if (phase < 0) phase += ROLLER_PITCH;
+  for (int yy = 0; yy < H; yy++) {
+    float ly = fmodf((float)yy + phase, (float)ROLLER_PITCH);
+    float th = (ly / ROLLER_PITCH) * 2.0f * (float)M_PI;
+    float tf = 0.62f + 0.38f * cosf(th) - 0.08f * cosf(2.0f * th);   // �?形波�?
+    for (int x = 0; x < ROLLER_W; x++) {
+      float v = rollerColB[x] * tf; if (v > 1.0f) v = 1.0f;
+      int c = (int)(24 + 210.0f * v); if (c < 0) c = 0; if (c > 255) c = 255;
+      int cb = c + 8; if (cb > 255) cb = 255;
+      rollerSram[yy * ROLLER_W + x] = (((c * 31) / 255) << 11) | (((c * 63) / 255) << 5) | ((cb * 31) / 255);
+    }
+  }
+  uint16_t edge = (((40 * 31) / 255) << 11) | (((40 * 63) / 255) << 5) | ((52 * 31) / 255);  // (40,40,52)
+  for (int yy = 0; yy < H; yy++) {
+    rollerSram[yy * ROLLER_W + 0] = edge;
+    rollerSram[yy * ROLLER_W + ROLLER_W - 1] = edge;
+  }
+  for (int x = 0; x < ROLLER_W; x++) {                          // 上下�?�?
+    float t = (float)x / (ROLLER_W - 1);
+    int c = (int)(40 + 150.0f * sinf(t * (float)M_PI));
+    int cr = c - 24, cg = c - 24, cbb = c - 16;
+    if (cr < 0) cr = 0; if (cg < 0) cg = 0; if (cbb < 0) cbb = 0;
+    uint16_t cap = (((cr * 31) / 255) << 11) | (((cg * 63) / 255) << 5) | ((cbb * 31) / 255);
+    rollerSram[0 * ROLLER_W + x] = cap;
+    rollerSram[(H - 1) * ROLLER_W + x] = cap;
+  }
+  tft.pushImage(x0, CARD_TOP, ROLLER_W, H, rollerSram);   // 内部 RAM, 原子�?(消除齿轮滚动撕�??)
+}
+
+// ---- 齿轮带渲�?(合成�?bandSram, 不直写屏�? ----
+static void bandFillRoundRect(int ox, int oy, int w, int h, int r, uint16_t col) {
+  for (int py = 0; py < h; py++) {
+    int by = oy + py; if (by < 0 || by >= CARD_SRAM_H) continue;
+    for (int px = 0; px < w; px++) {
+      int bx = ox + px; if (bx < 0 || bx >= BAND_W) continue;
+      if (flapInRoundRect(px, py, w, h, r)) bandSram[by * BAND_W + bx] = col;
+    }
+  }
+}
+// 静�?�牌 (投影+白底+数字+铰链+�?) 渲染�?bandSram �?�?x (�?drawCard 同�?�几�?)
+static void bandCard(int idx, char digit) {
+  int lx = cardX[idx] - BAND_X0;
+  int w = CARD_W, h = CARD_H, seamY = h / 2;
+  bandFillRoundRect(lx, CARD_SHAD_ROW, w, h, CARD_RADIUS, CARD_EDGE);
+  bandFillRoundRect(lx, 0, w, h, CARD_RADIUS, CARD_FACE);
+  const uint8_t *mask = DigitMasks[digit - '0'];
+  uint16_t bg = CARD_FACE;
+  int r5 = bg >> 11, g6 = (bg >> 5) & 0x3F, b5 = bg & 0x1F;
+  int nx = lx + (w - DIGIT_W) / 2, ny = (h - DIGIT_H) / 2;
+  for (int dy = 0; dy < DIGIT_H; dy++)
+    for (int dx = 0; dx < DIGIT_W; dx++) {
+      uint8_t m = pgm_read_byte(&mask[dy * DIGIT_W + dx]);
+      bandSram[(ny + dy) * BAND_W + (nx + dx)] = (((r5 * m) / 255) << 11) | (((g6 * m) / 255) << 5) | ((b5 * m) / 255);
+    }
+  // 铰链 (1px 细缝 + 两端 4x6 金属转轴帽; 与 drawHingeCard/hingeBufCard 一致)
+  for (int px = 4; px <= w - 5; px++) bandSram[seamY * BAND_W + lx + px] = CARD_SEAM;   // 中央 1px 细缝 (两端转轴帽之间)
+  {
+    const uint16_t kc[6] = { (uint16_t)HINGE_HI, (uint16_t)HINGE_HI, (uint16_t)HINGE_MID, (uint16_t)HINGE_MID, (uint16_t)HINGE_LO, (uint16_t)HINGE_LO };
+    for (int r = 0; r < 6; r++)
+      for (int px = 0; px < 4; px++) {
+        bandSram[(seamY - 3 + r) * BAND_W + lx + px] = kc[r];              // 左转轴帽
+        bandSram[(seamY - 3 + r) * BAND_W + lx + w - 4 + px] = kc[r];      // 右转轴帽
+      }
+  }
+}
+// �?枚齿�?(3D 圆柱 + 齿纹 + �?�?) 渲染�?bandSram �?�?x (�?drawRoller 同�??)
+static void bandRoller(int cx, float scroll) {
+  int lx = cx - ROLLER_W / 2 - BAND_X0;
+  int H = CARD_H;
+  float phase = fmodf(scroll, (float)ROLLER_PITCH);
+  if (phase < 0) phase += ROLLER_PITCH;
+  for (int yy = 0; yy < H; yy++) {
+    float ly = fmodf((float)yy + phase, (float)ROLLER_PITCH);
+    float th = (ly / ROLLER_PITCH) * 2.0f * (float)M_PI;
+    float tf = 0.62f + 0.38f * cosf(th) - 0.08f * cosf(2.0f * th);
+    for (int x = 0; x < ROLLER_W; x++) {
+      float v = rollerColB[x] * tf; if (v > 1.0f) v = 1.0f;
+      int c = (int)(24 + 210.0f * v); if (c < 0) c = 0; if (c > 255) c = 255;
+      int cb = c + 8; if (cb > 255) cb = 255;
+      bandSram[yy * BAND_W + lx + x] = (((c * 31) / 255) << 11) | (((c * 63) / 255) << 5) | ((cb * 31) / 255);
+    }
+  }
+  uint16_t edge = (((40 * 31) / 255) << 11) | (((40 * 63) / 255) << 5) | ((52 * 31) / 255);
+  for (int yy = 0; yy < H; yy++) { bandSram[yy * BAND_W + lx] = edge; bandSram[yy * BAND_W + lx + ROLLER_W - 1] = edge; }
+  for (int x = 0; x < ROLLER_W; x++) {
+    float t = (float)x / (ROLLER_W - 1);
+    int c = (int)(40 + 150.0f * sinf(t * (float)M_PI));
+    int cr = c - 24, cg = c - 24, cbb = c - 16;
+    if (cr < 0) cr = 0; if (cg < 0) cg = 0; if (cbb < 0) cbb = 0;
+    uint16_t cap = (((cr * 31) / 255) << 11) | (((cg * 63) / 255) << 5) | ((cbb * 31) / 255);
+    bandSram[0 * BAND_W + lx + x] = cap;
+    bandSram[(H - 1) * BAND_W + lx + x] = cap;
+  }
+}
+// 两枚齿轮 + �?间两张�??(2,3) 合成�?bandSram, 单�?? pushImage 整帧 (原子�?�?
+// 仅当�?,3 不在翻页时调�?(翻页时由 drawFlapFrame 单独渲染, 避免覆盖其动�?�?
+static void drawRollerBand(float scroll) {
+  if (!bandSram || !cardSram || !rollerSram) return;   // BUILD17: guard (alloc failed)
+  for (int i = 0; i < BAND_W * CARD_SRAM_H; i++) bandSram[i] = COLOR_BG;
+  bandCard(2, fstate[2].shown);
+  bandCard(3, fstate[3].shown);
+  bandRoller(GAP1_CX, scroll);
+  bandRoller(GAP2_CX, scroll);
+  tft.pushImage(BAND_X0, CARD_TOP, BAND_W, CARD_SRAM_H, bandSram);   // 原子�? 两齿�?同相�?
+}
+
+// 每帧驱动: 6 位数字两相翻�?+ 齿轮滚动量累�?(�?preview live_preview.Sim.tick �?�?
+static float rollLast = -1e6f;
+static void tickFlapClock(const char *target) {
+  if (!bandSram || !bandBuf || !flapTmp || !cardSram || !rollerSram) return;   // BUILD17: guard (alloc failed)
+  uint32_t now = millis();
+  float scroll = 0.0f;
+  for (int i = 0; i < 6; i++) {
+    FlipState &fs = fstate[i];
+    char newD = target[i];
+    if (!fs.flipping && newD != fs.shown) {          // �?动翻�? (�?�? != 当前显示)
+      fs.flipping = true; fs.newD = newD; fs.startMs = now; fs.clicks = 0; fs.redrawn = false;
+    }
+    if (!fs.flipping) {
+      scroll += fs.clicks * ROLLER_PITCH;
+      if (!fs.redrawn) { drawCard(i, fs.shown, false); fs.redrawn = true; }   // 稳�?�才重绘
+      continue;
+    }
+    uint32_t el = now - fs.startMs;
+    int phase; float p;
+    if (el < (uint32_t)FLIP_TOP_MS) {
+      phase = 1; p = (float)el / FLIP_TOP_MS;
+    } else if (el < (uint32_t)(FLIP_TOP_MS + FLIP_BOT_MS)) {
+      if (fs.clicks < 1) fs.clicks = 1;
+      phase = 2; p = (float)(el - FLIP_TOP_MS) / FLIP_BOT_MS;
+    } else {
+      if (fs.clicks < 2) fs.clicks = 2;
+      fs.shown = fs.newD; fs.flipping = false; fs.redrawn = false;   // 翻页完成
+      scroll += fs.clicks * ROLLER_PITCH;
+      drawCardStaticAtomic(i, fs.shown); fs.redrawn = true;   // 原子帧(内部 RAM 单次 push), 消除"每翻一次闪一下"
+      continue;
+    }
+    scroll += fs.clicks * ROLLER_PITCH + flapEase(p) * ROLLER_PITCH;
+    drawFlapFrame(i, fs.shown, fs.newD, phase, flapEase(p));
+  }
+  if (fabsf(scroll - rollLast) > 0.01f) {            // 滚动量变化才重绘齿轮
+    if (!fstate[2].flipping && !fstate[3].flipping)
+      drawRollerBand(scroll);        // 两齿�?�?间两�? �?次原子推�?(消除右齿�?顶�?�彩色撕�?
+    else {
+      drawRoller(GAP1_CX, scroll);   // �?/3 翻页�? �?回两齿轮�?立�??(避免覆盖翻页动画)
+      drawRoller(GAP2_CX, scroll);
+    }
+    rollLast = scroll;
+  }
+}
+
+// ========== 时钟样式实现 (0=机�?�翻�? 1=模拟指针) ==========
 static uint8_t getClockStyle() {
   uint8_t v = STYLE_FLAP;
   nvs_handle_t h;
@@ -508,7 +1000,7 @@ static void saveClockStyle(uint8_t v) {
   }
 }
 
-// 顶右侧: 当前时钟样式 + 操作提示 (黑底白字小字) — 仅 DEBUG_UI 时显示
+// 顶右�? 当前时钟样式 + 操作提示 (黑底白字小字) �?�?DEBUG_UI 时显�?
 static void drawModeHint(uint8_t style) {
 #if !DEBUG_UI
   (void)style;
@@ -522,110 +1014,194 @@ static void drawModeHint(uint8_t style) {
 #endif
 }
 
-// 模拟指针表盘 —— 白色表盘 + 黑指针/刻度/数字 + 红秒针 (与 make_preview.py 完全一致)。
-// 数字用与翻页时钟同款 Bahnschrift 位图遮罩 (dialnum.h), 抗锯齿平滑; 无外圈描边。
-static const uint16_t AC_FACE  = 0xFFFF;   // 表盘 (白)
-static const uint16_t AC_TICK1 = 0x0000;   // 时标 (黑)
-static const uint16_t AC_TICK2 = 0x0000;   // 分标 (黑)
-static const uint16_t AC_H     = 0x0000;   // 时针 (黑)
-static const uint16_t AC_M     = 0x0000;   // 分针 (黑)
-static const uint16_t AC_S     = 0xF800;   // 秒针 (红)
-static const uint16_t AC_HUB   = 0xF800;   // 中心枢纽 (红)
-static const uint16_t AC_NUM   = 0x0000;   // 数字 (黑)
+// 模拟指针表盘 —�??白色表盘 + 黑指�?刻度/数字 + 红�?��??(�?make_preview.py 完全�?�?�?
+// 数字用与翻页时钟同�?? Bahnschrift 位图�?�? (dialnum.h), 抗锯齿平�? 无�?�圈描边�?
+static const uint16_t AC_FACE  = 0xFFFF;   // 表盘 (�?
+static const uint16_t AC_TICK1 = 0x0000;   // 时标 (�?
+static const uint16_t AC_TICK2 = 0x0000;   // 分标 (�?
+static const uint16_t AC_H     = 0x0000;   // 时针 (�?
+static const uint16_t AC_M     = 0x0000;   // 分针 (�?
+static const uint16_t AC_S     = 0xF800;   // 秒针 (�?
+static const uint16_t AC_HUB   = 0xF800;   // �?心枢�? (�?
+static const uint16_t AC_NUM   = 0x0000;   // 数字 (�?
 
-// 数字位图指针 (顺序同 dialnum.h: [0]="12",[1..9]="1".."9",[10]="10",[11]="11")
+// 数字位图指针 (顺序�?dialnum.h: [0]="12",[1..9]="1".."9",[10]="10",[11]="11")
 static const uint8_t *const DialNums[12] = {
   DialNum0, DialNum1, DialNum2, DialNum3, DialNum4, DialNum5, DialNum6,
   DialNum7, DialNum8, DialNum9, DialNum10, DialNum11
 };
 
-// 把某个数字位图按 8 位灰度遮罩合成到白色表盘, 用 pushImage 推屏 (与 drawCard 同款)。
-// mask=255 -> 表盘色(白), mask=0 -> 黑(数字笔画)。cx/cy 为数字中心。
-static void blitDialNum(int cx, int cy, int idx, uint16_t face) {
+// ---- 指针表盘: 静�?�表�?(白圆+刻度+12数字) �?次�?�烘焙进内部 RAM 缓冲 ----
+// 之后每帧�?tft.pushImage 这块缓冲 + 直渲 3 根指�?(�?drawAnalogClock 注释)�?
+static void drawLineBuf(uint16_t *buf, int W, int x0, int y0, int x1, int y1, uint16_t col) {
+  int dx = abs(x1 - x0), dy = -abs(y1 - y0);
+  int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;
+  for (;;) {
+    if (x0 >= 0 && y0 >= 0 && x0 < W && y0 < W) buf[y0 * W + x0] = col;
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+// 实心 2px 线写进缓冲: 对中心线(Bresenham)逐像素画 3x3 实心方块. 任何方向都连续实心,
+// 不会像"3 条 1px 平行线 offset 0/±1.5"那样在 ~45° 方向 (7~8 点/1~2 点) 因 (int) 截断
+// 漏 1 行而对角出现"双线/白缝". 与 preview d.line(..., width=2) 的粗线目标一致.
+static void thickLineBuf(uint16_t *buf, int W, int x0, int y0, int x1, int y1, uint16_t col) {
+  int dx = abs(x1 - x0), dy = -abs(y1 - y0);
+  int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;
+  for (;;) {
+    for (int ox = -1; ox <= 1; ox++) for (int oy = -1; oy <= 1; oy++) {
+      int px = x0 + ox, py = y0 + oy;
+      if (px >= 0 && py >= 0 && px < W && py < W) buf[py * W + px] = col;
+    }
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+// 实心圆写进缓�?(带边界�?��??
+static void fillCircleBuf(uint16_t *buf, int W, int H, int cx, int cy, int r, uint16_t col) {
+  for (int y = -r; y <= r; y++) {
+    int yy = cy + y; if (yy < 0 || yy >= H) continue;
+    int hw = (int)(sqrt((double)(r * r - y * y)));
+    for (int x = cx - hw; x <= cx + hw; x++) {
+      if (x < 0 || x >= W) continue;
+      buf[yy * W + x] = col;
+    }
+  }
+}
+// 实心三�?�形写进缓�??(边�?�号测�?? �?边�??-> 无内部缝�? 带边界�?��??
+static void fillTriangleBuf(uint16_t *buf, int W, int H,
+                            int x0, int y0, int x1, int y1, int x2, int y2, uint16_t col) {
+  auto E = [](int ax, int ay, int bx, int by, int px, int py) {
+    return (long)(bx - ax) * (py - ay) - (long)(by - ay) * (px - ax);
+  };
+  int minx = x0, maxx = x0, miny = y0, maxy = y0;
+  auto upd = [&](int x, int y) { if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y; };
+  upd(x1, y1); upd(x2, y2);
+  minx = max(minx, 0); miny = max(miny, 0); maxx = min(maxx, W - 1); maxy = min(maxy, H - 1);
+  for (int y = miny; y <= maxy; y++)
+    for (int x = minx; x <= maxx; x++) {
+      long e1 = E(x0, y0, x1, y1, x, y);
+      long e2 = E(x1, y1, x2, y2, x, y);
+      long e3 = E(x2, y2, x0, y0, x, y);
+      if ((e1 >= 0 && e2 >= 0 && e3 >= 0) || (e1 <= 0 && e2 <= 0 && e3 <= 0))
+        buf[y * W + x] = col;
+    }
+}
+static void blitDialNumBuf(uint16_t *buf, int W, int cx, int cy, int idx, uint16_t face) {
   const uint8_t *mask = DialNums[idx];
   int w = pgm_read_byte(&DialNumW[idx]);
   int h = pgm_read_byte(&DialNumH[idx]);
-  static uint16_t nbuf[24 * 22];   // 最大数字盒 24x22
   uint16_t r5 = face >> 11, g6 = (face >> 5) & 0x3F, b5 = face & 0x1F;
-  for (int i = 0; i < w * h; i++) {
-    uint8_t m = pgm_read_byte(&mask[i]);
-    nbuf[i] = (((r5 * m) / 255) << 11) | (((g6 * m) / 255) << 5) | ((b5 * m) / 255);
+  for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+    int px = cx - w / 2 + x, py = cy - h / 2 + y;
+    if (px < 0 || py < 0 || px >= W || py >= W) continue;
+    uint8_t m = pgm_read_byte(&mask[y * w + x]);
+    buf[py * W + px] = (((r5 * m) / 255) << 11) | (((g6 * m) / 255) << 5) | ((b5 * m) / 255);
   }
-  tft.pushImage(cx - w / 2, cy - h / 2, w, h, nbuf);
 }
-
-static void drawAnalogClock(int h, int m, int s) {
-  unsigned long nowMs = millis();
-  int cx = 240, cy = 108, R = 73;   // 指针表盘放大 (顶 ~32 / 底 ~184, 不压日期条)
-  double t2h = h + m / 60.0 + s / 3600.0;
-  double t2m = m + s / 60.0;
-  double t2s = (s + (nowMs % 1000) / 1000.0) / 60.0;
-
-  // 表盘 (白色, 无外圈描边)
-  tft.fillCircle(cx, cy, R, AC_FACE);
-  // 刻度: 60 分标 + 12 时标
-  for (int i = 0; i < 60; i++) {
+static void buildAnalogFace(int cx, int cy, int R) {
+  const int S = 2 * R;
+  for (int y = 0; y < S; y++) for (int x = 0; x < S; x++) {
+    int dx = x - R, dy = y - R;
+    analogFace[y * S + x] = (dx * dx + dy * dy <= R * R) ? AC_FACE : COLOR_BG;  // 白圆�?+ 页底
+  }
+  for (int i = 0; i < 60; i++) {           // 60 分标 + 12 时标
     double a = M_PI * 2.0 * i / 60.0 - M_PI / 2.0;
     bool major = (i % 5 == 0);
     double ro = R - 2, ri = R - (major ? 10 : 5);
-    tft.drawLine((int)(cx + cosf(a) * ri), (int)(cy + sinf(a) * ri),
-                 (int)(cx + cosf(a) * ro), (int)(cy + sinf(a) * ro),
-                 major ? AC_TICK1 : AC_TICK2);
+    drawLineBuf(analogFace, S, (int)(R + cosf(a) * ri), (int)(R + sinf(a) * ri),
+                (int)(R + cosf(a) * ro), (int)(R + sinf(a) * ro), major ? AC_TICK1 : AC_TICK2);
   }
-  // 数字 12..11 (位图遮罩, 与翻页时钟同款字体; 中心落在半径 R-20 处, 与 make_preview.py 一致)
-  for (int k = 1; k <= 12; k++) {
+  for (int k = 1; k <= 12; k++) {          // 12 数字 (位图�?�?, �?心落在半�? R-20 �? �?preview �?�?
     double an = M_PI * 2.0 * k / 12.0 - M_PI / 2.0;
-    int idx = (k == 12) ? 0 : k;   // 12->0, 10->10, 11->11, 1..9 -> 1..9 (DialNum[10]="10",[11]="11")
-    int nx = (int)(cx + cosf(an) * (R - 20));
-    int ny = (int)(cy + sinf(an) * (R - 20));
-    blitDialNum(nx, ny, idx, AC_FACE);
+    int idx = (k == 12) ? 0 : k;           // 12->0, 10->10, 11->11, 1..9 -> 1..9
+    blitDialNumBuf(analogFace, S, (int)(R + cosf(an) * (R - 20)), (int)(R + sinf(an) * (R - 20)), idx, AC_FACE);
   }
-  // 时针 / 分针 (棒棒指针: 中段最宽、向两端渐细的多边形 + 圆头帽, 边缘平滑)
+}
+
+static void drawAnalogClock(int h, int m, int s) {
+  if (!analogFace || !analogFaceCache) return;   // BUILD17: guard (alloc failed)
+  unsigned long nowMs = millis();
+  int cx = 240, cy = 108, R = 73;   // 指针表盘放大 (�?~32 / �?~184, 不压日期�?
+  double t2h = h + m / 60.0 + s / 3600.0;
+  double t2m = m + s / 60.0;
+  // 秒针平滑扫秒: 整数秒用 NTP s (绝对位置正确, 与翻页秒个位一致), 分数部分用 millis (单一
+  // 单调时钟, 每帧匀速 +6°/s 无跳变)。关键: 在每个 NTP 秒边界把"秒起点"锚到 millis,
+  // 分数 = (nowMs - 锚点)/1000 —— 秒针既平滑又指向正确秒位, 与 live_preview 效果一致。
+  // 旧写法 (s + (nowMs%1000)/1000): NTP 秒与 millis 相位不锁, 每"秒"回跳 => "前后摇摆"。
+  // 纯 millis (nowMs%60000): 平滑但相对真实秒有固定相位偏移(从开机计), 指向错误秒位。
+  static unsigned long lastSec = 0xFFFFFFFFUL, secAnchorMs = 0;
+  if (s != (int)lastSec) { lastSec = (unsigned long)s; secAnchorMs = nowMs; }   // NTP 秒变了: 锚定该秒起点
+  double t2s = (s + (nowMs - secAnchorMs) / 1000.0) / 60.0;
+
+  // 每帧: �?(静�?�表�?白圆+刻度+12数字) + (3 根指�? 合成进�?�同�?块�?�内�?RAM 缓冲, �?
+  // 【单次�?�pushImage 整帧。关�?整帧�?次推�?原子�? �?TE 同�?�时面板持续�?�? �?
+  // "推表�?擦掉�? -> 再分几笔画针"会有�?间露针空�? -> 3 针闪�?+ 秒针像不动�??
+  // 静�?�表盘只烘焙�?�?(analogFaceCache), 每帧 memcpy 复用: buildAnalogFace 全表重建
+  // �?�?~50-100ms, 若每帧都重建会把实际 FPS 打到 <10, 秒针每帧推进 <0.1px �?视�??"冻结"�?
+  // memcpy 42.6KB �?~1ms, 实际 FPS 回到 ~30 (ANALOG_FRAME_MS 门控), 秒针 6°/s 平滑�?秒�??
+  if (!analogFaceBuilt) { buildAnalogFace(cx, cy, R); memcpy(analogFaceCache, analogFace, 146 * 146 * sizeof(uint16_t)); analogFaceBuilt = true; }
+  memcpy(analogFace, analogFaceCache, 146 * 146 * sizeof(uint16_t));   // 还原静�?�表�?(清掉上一帧指�?
+  int S = 2 * R, lcx = R, lcy = R;             // 缓冲内中�?= (73,73), 对应屏幕 (cx,cy)
+  // 时针 / 分针 (棒�?�指�?: �?段最宽�?�向两�??渐细的�?�边�? + 圆头�? 画进缓冲)
   auto hand = [&](double ang, int len, int w, int tail, uint16_t col) {
     double a = M_PI * 2.0 * ang - M_PI / 2.0;
     float dx = cosf(a), dy = sinf(a);
     float ux = -sinf(a), uy = cosf(a);
-    float hb = w / 2.0f;                 // 中段半宽
-    float ht = fmaxf(1.0f, w * 0.30f);   // 两端半宽
-    float capD = len - ht;               // 圆帽起点(距中心)
-    // 多边形顶点: 尾上A -> 中段左C -> 尖上E -> 尖下F -> 中段右D -> 尾下B
-    int Ax = (int)(cx + dx * (-tail) + ux * ht), Ay = (int)(cy + dy * (-tail) + uy * ht);
-    int Cx = (int)(cx + ux * hb),          Cy = (int)(cy + uy * hb);
-    int Ex = (int)(cx + dx * capD + ux * ht), Ey = (int)(cy + dy * capD + uy * ht);
-    int Fx = (int)(cx + dx * capD - ux * ht), Fy = (int)(cy + dy * capD - uy * ht);
-    int Dx = (int)(cx - ux * hb),          Dy = (int)(cy - uy * hb);
-    int Bx = (int)(cx + dx * (-tail) - ux * ht), By = (int)(cy + dy * (-tail) - uy * ht);
-    tft.fillTriangle(Ax, Ay, Cx, Cy, Ex, Ey, col);
-    tft.fillTriangle(Ax, Ay, Ex, Ey, Fx, Fy, col);
-    tft.fillTriangle(Ax, Ay, Fx, Fy, Dx, Dy, col);
-    tft.fillTriangle(Ax, Ay, Dx, Dy, Bx, By, col);
-    // 尖端圆帽
-    tft.fillCircle((int)(cx + dx * capD), (int)(cy + dy * capD), (int)ht + 1, col);
+    float hb = w / 2.0f;                 // �?段半�?
+    float ht = fmaxf(1.0f, w * 0.30f);   // 两�??半�??
+    float capD = len - ht;               // 圆帽起点(距中�?
+    // 多边形顶�? 尾上A -> �?段左C -> 尖上E -> 尖下F -> �?段右D -> 尾下B
+    int Ax = (int)(lcx + dx * (-tail) + ux * ht), Ay = (int)(lcy + dy * (-tail) + uy * ht);
+    int Cx = (int)(lcx + ux * hb),          Cy = (int)(lcy + uy * hb);
+    int Ex = (int)(lcx + dx * capD + ux * ht), Ey = (int)(lcy + dy * capD + uy * ht);
+    int Fx = (int)(lcx + dx * capD - ux * ht), Fy = (int)(lcy + dy * capD - uy * ht);
+    int Dx = (int)(lcx - ux * hb),          Dy = (int)(lcy - uy * hb);
+    int Bx = (int)(lcx + dx * (-tail) - ux * ht), By = (int)(lcy + dy * (-tail) - uy * ht);
+    fillTriangleBuf(analogFace, S, S, Ax, Ay, Cx, Cy, Ex, Ey, col);
+    fillTriangleBuf(analogFace, S, S, Ax, Ay, Ex, Ey, Fx, Fy, col);
+    fillTriangleBuf(analogFace, S, S, Ax, Ay, Fx, Fy, Dx, Dy, col);
+    fillTriangleBuf(analogFace, S, S, Ax, Ay, Dx, Dy, Bx, By, col);
+    // 尖�??圆帽
+    fillCircleBuf(analogFace, S, S, (int)(lcx + dx * capD), (int)(lcy + dy * capD), (int)ht + 1, col);
   };
   hand(t2h / 12.0, 40, 4, 11, AC_H);
   hand(t2m / 60.0, 55, 3, 14, AC_M);
-  // 秒针 (细线, 平滑扫秒)
+  // 秒针 (细线 + 尾�??配重�? 平滑�?�?)
   double sa = M_PI * 2.0 * t2s - M_PI / 2.0;
-  tft.drawLine(cx, cy, cx + (int)cosf(sa) * 60, cy + (int)sinf(sa) * 60, AC_S);
-  tft.fillCircle(cx - (int)cosf(sa) * 15, cy - (int)sinf(sa) * 15, 3, AC_S);
-  // 中心枢纽
-  tft.fillCircle(cx, cy, 5, AC_HUB);
-  tft.fillCircle(cx, cy, 2, AC_FACE);
+  int sex = lcx + (int)(cosf(sa) * 60), sey = lcy + (int)(sinf(sa) * 60);   // 先乘后取整 (旧写法 (int)cosf*60 截断后*60 => 秒针塌到中心看不见)
+  // 秒针加粗到 ~2px (1px 在 4.0" 屏上看不清).
+  // 旧写法用 3 条 1px 平行线 (垂向 offset 0/±1.5): 在 ~45° 方向 (7~8 点 / 1~2 点) offset 经
+  // (int) 截断后垂直位移 ≈ 2px, 而 45° 相邻对角线行只相距 1px -> 中间漏 1 行 -> 出现"双线/白缝"
+  // (角相关, 水平/垂直方向不出现). 改用 thickLineBuf (中心线逐像素 3x3 实心方块): 任何角度都
+  // 连续实心, 与 preview d.line(width=2) 一致.
+  thickLineBuf(analogFace, S, lcx, lcy, sex, sey, AC_S);
+  fillCircleBuf(analogFace, S, S, lcx - (int)(cosf(sa) * 15), lcy - (int)(sinf(sa) * 15), 3, AC_S);
+  // �?心枢�?
+  fillCircleBuf(analogFace, S, S, lcx, lcy, 5, AC_HUB);
+  fillCircleBuf(analogFace, S, S, lcx, lcy, 2, AC_FACE);
+
+  // 整帧�?次推�?(原子�? 无中间露�?撕�??): 内部 RAM �? swapBytes=true, �?drawCard 同�??
+  tft.pushImage(cx - R, cy - R, 2 * R, 2 * R, analogFace);
 
   drawModeHint(STYLE_ANALOG);
 }
 
-// 月相图标: 暗底圆盘 + 亮部 (上弦亮右 / 下弦亮左), 亮暗交界为内缩椭圆(黄经差)
+// 月相图标: 暗底圆盘 + �?�? (上弦�?�? / 下弦�?�?), �?暗交界为内缩�?�?黄经�?
 static void drawMoonIcon(int cx, int cy, int R, double phase) {
   double cosP = cos(2.0 * M_PI * phase);
   tft.fillCircle(cx, cy, R, MOON_DARK);
   for (int yy = -R; yy <= R; yy++) {
-    double hw = sqrt((double)(R * R - yy * yy));   // 该行的圆盘半宽
+    double hw = sqrt((double)(R * R - yy * yy));   // 该�?�的圆盘半�??
     double xl, xr;
-    if (phase <= 0.5) {                             // 上弦: 亮部在右
+    if (phase <= 0.5) {                             // 上弦: �?部在�?
       xl = cosP * hw; if (xl < -hw) xl = -hw;
       xr = hw;
-    } else {                                          // 下弦: 亮部在左
+    } else {                                          // 下弦: �?部在�?
       xl = -hw;
       xr = -cosP * hw; if (xr > hw) xr = hw;
     }
@@ -638,46 +1214,48 @@ static void drawMoonIcon(int cx, int cy, int R, double phase) {
   tft.drawCircle(cx, cy, R, MOON_EDGE);
 }
 
-// 日期条: 两行布局
-//   行1: 公历+星期 | 农历+干支
-//   行2: 节气(当前/下一+天数) | 月相(图标+名称)
+// 日期�? 两�?�布�?
+//   �?: �?�?+星期 | 农历+干支
+//   �?: 节气(当前/下一+天数) | 月相(图标+名称)
 static void drawDateRow(int year, int mon, int mday, int wday) {
   if (!font16.isReady()) return;
   int x0 = DATE_LEFT, x1 = DATE_RIGHT;
-  int cx = (x0 + x1) / 2;                 // 行1 分隔线 x
+  // 行1 分隔线 + 右半块(农历/干支/今日XX) 整体左移到左半块(日期+星期, 恒止于 x≈193)右侧空白处,
+  // 而非居中(旧 (x0+x1)/2=240): 否则长节日名(如 "今日中秋节"=80px)会溢出圆角背景右缘(DATE_RIGHT=449)
+  // 约 23px。移到 x=200 后, 右半块左移到 212, 右缘约 444, 全部落在背景内。与 make_preview.py 一致。
+  int cx = 200;                 // �? 分隔�?x
 
-  // 清场: 先把两行日期条整段(含左右溢出区)擦成背景色。
-  // 否则上一次更长的文字(如 1970-01-01 的 "今日元旦")会溢出圆角矩形
-  // 右缘 (x>DATE_RIGHT=449), 跨日重绘时右缘外的 "旦" 擦不掉 -> 残影。
+  // 清场: 先把两�?�日期条整�??�?左右溢出�?)擦成背景色�??
+  // 否则上一次更长的文字(�?1970-01-01 �?"今日元旦")会溢出圆角矩�?
+  // 右缘 (x>DATE_RIGHT=449), 跨日重绘时右缘�?��??"�? 擦不�?-> 残影�?
   tft.fillRect(0, ROW1_TOP, 480, (ROW2_TOP + ROW2_H) - ROW1_TOP, COLOR_BG);
 
-  // 农历 + 干支 (春节前取前一年, 与预览一致)
+  // 农历 + 干支 (春节前取前一�? 与�?��?�一�?
   int ld[31]; nl_month_days(year, mon, ld);
   int v = ld[mday - 1];
   int lm = v / 100, ldn = v % 100;
   bool isLeap = (lm > 100); if (isLeap) lm -= 100;
-  int ly = year; if (lm >= 10 && mon <= 2) ly--;
+  int ly = nl_zodiac_year(year, mon, mday);   // 干支/生肖�?(按春节分�? �?正农�?11/12月�??�?
   char lunar[32];
   snprintf(lunar, sizeof(lunar), "%s月%s%s", lunarMonths[lm - 1], lunarDays[ldn - 1],
            isLeap ? "(闰)" : "");
   char gz[16];
-  snprintf(gz, sizeof(gz), "%s%s%s年", nl_tg_text[nl_tg(ly)], nl_dz_text[nl_dz(ly)],
-           nl_sx_text[nl_dz(ly)]);
+  snprintf(gz, sizeof(gz), "%s%s%s年", nl_tg_text[nl_tg(ly)], nl_dz_text[nl_dz(ly)], nl_sx_text[nl_dz(ly)]);
   char fest[16] = "";
   nl_festival(year, mon, mday, ly, lm, ldn, isLeap ? 1 : 0, fest, sizeof(fest));
 
-  // 节气 (当前 + 下一, 含天数)
+  // 节气 (当前 + 下一, �?天�??
   int jqCur = -1, jqCurD = 0, jqNxt = -1, jqNxtD = 0;
   nl_jq_info(year, mon, mday, &jqCur, &jqCurD, &jqNxt, &jqNxtD);
 
   // 月相
   double mp = nl_moon_phase(year, mon, mday);
 
-  // ---- 行1: 公历+星期 | 农历+干支+节日 ----
+  // ---- �?: �?�?+星期 | 农历+干支+节日 ----
   int y1 = ROW1_TOP, h1 = ROW1_H, cy1 = y1 + h1 / 2;
   tft.fillRoundRect(x0, y1, x1 - x0, h1, 8, ROW1_BG);
-  // 行1: 日期(白) + 星期(青, 与 preview 一致分开绘制) | 农历(白) + 干支(金) + 节日
-  // AA 字库: 逐字 advance + 抗锯齿合成, bg 传所画行底色 (ROW1_BG)
+  // �?: 日期(�? + 星期(�? �?preview �?致分�?绘制) | 农历(�? + 干支(�? + 节日
+  // AA 字库: 逐字 advance + 抗锯齿合�? bg 传所画�?�底�? (ROW1_BG)
   char date[16];
   snprintf(date, sizeof(date), "%d-%02d-%02d", year, mon, mday);
   font16.drawStringFast(x0 + 12, cy1 - 8, date, TFT_WHITE, ROW1_BG);
@@ -688,19 +1266,19 @@ static void drawDateRow(int year, int mon, int mday, int wday) {
   int lw = font16.textWidth(lunar);
   int gx = cx + 12 + lw + 6;
   font16.drawStringFast(gx, cy1 - 8, gz, COLOR_GOLD, ROW1_BG);
-  if (fest[0]) {  // 当天节日: "今日XX" + 节日色, 紧跟干支之后
+  if (fest[0]) {  // 当天节日: "今日XX" + 节日�? 紧跟干支之后
     char s[16];
     snprintf(s, sizeof(s), "今日%s", fest);
     font16.drawStringFast(gx + font16.textWidth(gz) + 6, cy1 - 8, s, eventColor(fest), ROW1_BG);
   }
 
-  // ---- 行2: 节气 | 月相 ----
+  // ---- �?: 节气 | 月相 ----
   int y2 = ROW2_TOP, h2 = ROW2_H, cy2 = y2 + h2 / 2;
   tft.fillRoundRect(x0, y2, x1 - x0, h2, 8, DATE_STRIP);
   int tx = x0 + 12;
   if (jqCur >= 0 && jqNxt >= 0) {
     if (jqCurD == 0) {
-      // 节气当天: "今日XX" + 节日色, 后接下一节气 (灰蓝)
+      // 节气当天: "今日XX" + 节日�? 后接下一节气 (灰蓝)
       char s[16];
       snprintf(s, sizeof(s), "今日%s", nl_jq_text[jqCur]);
       font16.drawStringFast(tx, cy2 - 8, s, eventColor(nl_jq_text[jqCur]), DATE_STRIP);
@@ -710,14 +1288,14 @@ static void drawDateRow(int year, int mon, int mday, int wday) {
       font16.drawStringFast(tx, cy2 - 8, rest, SOFT_C, DATE_STRIP);
     } else {
       char jqLine[48];
-      snprintf(jqLine, sizeof(jqLine), "%s 已过%d天   %s %d天后",
+      snprintf(jqLine, sizeof(jqLine), "%s 已过%d天  %s %d天后",
                nl_jq_text[jqCur], jqCurD, nl_jq_text[jqNxt], jqNxtD);
       font16.drawStringFast(tx, cy2 - 8, jqLine, SOFT_C, DATE_STRIP);
     }
   } else {
     font16.drawStringFast(tx, cy2 - 8, "--", SOFT_C, DATE_STRIP);
   }
-  // 右侧: 湿度 | 温度 | 月相名 | 月相图标 (自右向左, 与 make_preview.py draw_date 一致)
+  // 右侧: 湿度 | 温度 | 月相�?| 月相图标 (�?右向�?, �?make_preview.py draw_date �?�?
   int mi = (int)(mp * 8.0 + 0.5) % 8;
   char hms[8], tms[8];
   snprintf(hms, sizeof(hms), "%d%%", mockHumidity);
@@ -726,12 +1304,62 @@ static void drawDateRow(int year, int mon, int mday, int wday) {
   font16.drawStringFast(hR - font16.textWidth(hms), cy2 - 8, hms, humidColor(mockHumidity), DATE_STRIP);
   int tR = hR - font16.textWidth(hms) - 8;           // 温度右缘
   font16.drawStringFast(tR - font16.textWidth(tms), cy2 - 8, tms, tempColor(mockTempC), DATE_STRIP);
-  int mR = tR - font16.textWidth(tms) - 8;           // 月相名右缘
+  int mR = tR - font16.textWidth(tms) - 8;           // 月相名右�?
   int mTw = font16.textWidth(nl_moon_text[mi]);
   font16.drawStringFast(mR - mTw, cy2 - 8, nl_moon_text[mi], 0xDE72, DATE_STRIP);  // 淡金
   int R = 9;
   int mcx = mR - mTw - 6 - R;
   drawMoonIcon(mcx, cy2, R, mp);
+}
+
+// ---- BUILD17: clock render buffers -> heap (lazy alloc on clock entry, free on leave) ----
+// The 7 static uint16_t render buffers (~153KB) lived in .bss permanently, capping the internal
+// heap's largest contiguous block at ~40KB -- below the mbedTLS HTTPS handshake peak (~48KB), so
+// every https:// radio failed at start_ssl_client / "esp-aes: Failed to allocate". Converting them
+// to malloc shrinks .bss, expanding the internal heap so the max free block reaches ~200KB in radio
+// mode. Only the *active* style's buffers are allocated (the style-mutex pair), so the clock page
+// keeps everything it needs and the radio page gets the full heap for TLS. No pixel/animation logic
+// changes -- only where the buffers come from.
+static bool clockBufsReady = false;   // BUILD17: buffers for the current style are allocated
+void allocClockBufs() {
+  // CRITICAL: force MALLOC_CAP_INTERNAL. A plain malloc() (=MALLOC_CAP_DEFAULT) would route the
+  // ~40KB buffers (bandSram / analogFace / analogFaceCache) into octal PSRAM when internal is tight,
+  // and tft.pushImage() reading PSRAM => "rainbow screen" (anti-pattern R3). These display buffers
+  // MUST stay in internal RAM; the internal heap is large enough now that the .bss copy is gone.
+  if (clockStyle == STYLE_FLAP) {
+    // style-mutex: drop the analog buffers, keep/alloc the flap buffers
+    heap_caps_free(analogFace);      analogFace      = nullptr;
+    heap_caps_free(analogFaceCache); analogFaceCache = nullptr;
+    analogFaceBuilt = false;
+    if (!cardSram)   cardSram   = (uint16_t *)heap_caps_malloc((size_t)CARD_W * CARD_SRAM_H * 2, MALLOC_CAP_INTERNAL);
+    if (!rollerSram) rollerSram = (uint16_t *)heap_caps_malloc((size_t)ROLLER_W * CARD_H * 2, MALLOC_CAP_INTERNAL);
+    if (!bandSram)   bandSram   = (uint16_t *)heap_caps_malloc((size_t)BAND_W * CARD_SRAM_H * 2, MALLOC_CAP_INTERNAL);
+    if (!bandBuf)    bandBuf    = (uint16_t *)heap_caps_malloc((size_t)CARD_W * (CARD_H / 2) * 2, MALLOC_CAP_INTERNAL);
+    if (!flapTmp)    flapTmp    = (uint16_t *)heap_caps_malloc((size_t)CARD_W * (CARD_H / 2) * 2, MALLOC_CAP_INTERNAL);
+    if (cardSram && rollerSram && bandSram && bandBuf && flapTmp) clockBufsReady = true;
+    else { clockBufsReady = false; Serial.println("[MEM] BUILD17 flap buffer alloc FAILED (internal)"); }
+  } else {
+    heap_caps_free(cardSram);   cardSram   = nullptr;
+    heap_caps_free(rollerSram); rollerSram = nullptr;
+    heap_caps_free(bandSram);   bandSram   = nullptr;
+    heap_caps_free(bandBuf);    bandBuf    = nullptr;
+    heap_caps_free(flapTmp);    flapTmp    = nullptr;
+    if (!analogFace)      analogFace      = (uint16_t *)heap_caps_malloc(146 * 146 * 2, MALLOC_CAP_INTERNAL);
+    if (!analogFaceCache) analogFaceCache = (uint16_t *)heap_caps_malloc(146 * 146 * 2, MALLOC_CAP_INTERNAL);
+    if (analogFace && analogFaceCache) { clockBufsReady = true; analogFaceBuilt = false; }
+    else { clockBufsReady = false; Serial.println("[MEM] BUILD17 analog buffer alloc FAILED (internal)"); }
+  }
+}
+void freeClockBufs() {
+  heap_caps_free(analogFace);      analogFace      = nullptr;
+  heap_caps_free(analogFaceCache); analogFaceCache = nullptr;
+  heap_caps_free(cardSram);        cardSram        = nullptr;
+  heap_caps_free(rollerSram);      rollerSram      = nullptr;
+  heap_caps_free(bandSram);        bandSram        = nullptr;
+  heap_caps_free(bandBuf);         bandBuf         = nullptr;
+  heap_caps_free(flapTmp);         flapTmp         = nullptr;
+  analogFaceBuilt = false;
+  clockBufsReady = false;
 }
 
 void modeClock() {
@@ -744,50 +1372,66 @@ void modeClock() {
   int mday = tm_info.tm_mday;
   int wday = tm_info.tm_wday;
 
-  // 首次进入: 清场 + 按当前样式绘制 (翻页 6 张牌 / 指针表盘) + 日期条
+  // 首�?�进�?: 清场 + 按当前样式绘�?(翻页 6 张牌 / 指针表盘) + 日期�?
   if (!modeDrawn[MODE_CLOCK] || modeChanged) {
+    allocClockBufs();   // BUILD17: alloc the active style's clock buffers on clock-page entry (freed in loop() when leaving)
     tft.fillRect(0, 0, 480, NAV_BAR_Y, COLOR_BG);
     if (clockStyle == STYLE_FLAP) {
       char cur[7];
       snprintf(cur, sizeof(cur), "%02d%02d%02d", h, m, s);
-      for (int i = 0; i < 6; i++) { drawCard(i, cur[i], false); flipCard[i].current = cur[i]; }
+      flapInit();                              // 预渲染半�?齿轮 (PSRAM); 失败则�??�?
+      for (int i = 0; i < 6; i++) {
+        if (!(flapReady && (i == 2 || i == 3))) drawCard(i, cur[i], false);  // �?,3 由齿�?带渲�?
+        fstate[i].flipping = false;
+        fstate[i].shown = cur[i]; fstate[i].newD = cur[i];
+        fstate[i].clicks = 0; fstate[i].redrawn = true; fstate[i].startMs = 0;
+      }
+      rollLast = 0.0f;
+      if (flapReady) drawRollerBand(0.0f);   // 两齿�?+ �?间两�? (2,3) �?次原子推�?(稳�??
       drawModeHint(STYLE_FLAP);
     } else {
       drawAnalogClock(h, m, s);
     }
-    // 顶部状态行 (WiFi 状态) — 仅翻页样式显示, 指针样式表盘更大不需要
-    if (clockStyle == STYLE_FLAP) {
-      tft.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_CYAN : 0xF800);
-      tft.setFreeFont(&FreeSansBold24pt7b);
-      tft.setTextSize(1);
-      tft.setTextDatum(TL_DATUM);
-      tft.drawString(WiFi.status() == WL_CONNECTED ? "NTP OK" : "NTP --", 10, 20);
-    }
-    // 日期条 (农历/干支/节气/月相 均在 drawDateRow 内计算)
+    // 日期�?(农历/干支/节气/月相 均在 drawDateRow 内�?��??
+    // 注意: 不画 "NTP OK" �?preview (make_preview.scene / draw_analog_scene) 均不显示,
+    // �?件必须与预�?�一�?(预�?��??target)�?
     drawDateRow(year, mon, mday, wday);
-    checkFestivalMusic(year, mon, mday);   // 节日/节气音乐 (每天一次)
+    checkFestivalMusic(year, mon, mday);   // 节日/节气音乐 (每天�?�?
     prevH = h; prevM = m; prevS = s;
     modeDrawn[MODE_CLOCK] = true;
     return;
   }
 
   if (clockStyle == STYLE_ANALOG) {
-    // 指针样式: 秒针平滑扫秒, 每帧重绘表盘
-    drawAnalogClock(h, m, s);
+    // 指针样式: 秒针平滑�?�?, 每帧重绘表盘�?
+    // �?ANALOG_FRAME_MS(�?0 FPS) 门控: loop() 无节�? 若每�?~1000+ FPS)都重绘整�?
+    // (~40KB) 会把 20MHz SPI 打满 -> 整面�?�?/撕�?��?�限�?~30 FPS, 秒针 6°/s 仍平滑�??
+    // 整帧包在 startWrite/endWrite �? 减少 CS 切换�?�?�?
+    static uint32_t anaLast = 0;
+    uint32_t anow = millis();
+    if (anow - anaLast >= ANALOG_FRAME_MS) {
+      anaLast = anow;
+      tft.startWrite();
+      drawAnalogClock(h, m, s);
+      tft.endWrite();
+    }
   } else {
-    // 翻页样式: 目标时间字符串 HH MM SS (6 位 + null)
-    char target[7];
-    snprintf(target, sizeof(target), "%02d%02d%02d", h, m, s);
-
-    if (h != prevH || m != prevM || s != prevS) {
+    // 翻页样式: 驱动两相 split-flap (非阻�? + 齿轮滚动。稳态时几乎不重绘�??
+    // �?FLAP_FRAME_MS(=preview TICK_MS=40) 门控: loop() 无节�? 若每�?都调用会�?
+    // SPI 打满导致翻页�?�? 限到 ~25 FPS 与�?��?�同帧率。状态机�?millis() 计时,
+    // �?限调用�?�率, 不改变翻�?齿轮时序�?
+    static uint32_t flapLast = 0;
+    uint32_t fnow = millis();
+    if (flapReady && (fnow - flapLast >= FLAP_FRAME_MS)) {
+      flapLast = fnow;
+      char target[7];
+      snprintf(target, sizeof(target), "%02d%02d%02d", h, m, s);
       prevH = h; prevM = m; prevS = s;
-      // 从个位(秒)向高位级联翻页; 秒的进位会自然触发分/时重绘
-      for (int i = 5; i >= 0; i--) {
-        if (target[i] != flipCard[i].current) {
-          flipDigitAnim(i, target[i]);
-          flipCard[i].current = target[i];
-        }
-      }
+      // 整帧�?startWrite/endWrite: 每张�?齿轮都是"合成到内�?RAM 缓冲 + 单�?? pushImage
+      // 整帧"(原子�?, 在同�? SPI 事务内完�? 消除帧撕�?半旧半新/乱序)与局部闪�?
+      tft.startWrite();
+      tickFlapClock(target);
+      tft.endWrite();
     }
   }
 
@@ -796,16 +1440,666 @@ void modeClock() {
   if (mday != lastDay || mon != lastMon || year != lastYear) {
     lastDay = mday; lastMon = mon; lastYear = year;
     drawDateRow(year, mon, mday, wday);
-    checkFestivalMusic(year, mon, mday);   // 跨日 -> 检查节日/节气音乐
+    checkFestivalMusic(year, mon, mday);   // 跨日 -> �?查节�?节气音乐
+  }
+}
+
+// ---------- 万年历页�?(布局�?preview draw_calendar_scene 完全�?�? ----------
+#define CAL_X0       16
+#define CAL_CELL_W   64
+#define CAL_CELL_H   30
+#define CAL_X1       (CAL_X0 + 7 * CAL_CELL_W)   // 464
+#define CAL_GRID_TOP 54
+#define CAL_WKND     0xF800   // 周末 - �?
+static const char* weekHdr[] = {"日", "一", "二", "三", "四", "五", "六"};  // 0=周日
+static int calYear, calMon;   // 当前显示月份 (初�?��??首�?�进入�??= 今天)
+static int calSelY, calSelM, calSelD;
+static int calPrevSelY = 0, calPrevSelM = 0, calPrevSelD = 0;   // prev selected day (partial refresh)   // 选中的日�?(默�??=今天); 底部信息条显示它的农�?
+static int calFirstW = 0, calDim = 30;
+static bool calAlmOpen = false;
+static int calLastTapDay = 0, calLastTapY = 0, calLastTapM = 0;  // 上一次点某天的日/年/月 (双击判定)
+static unsigned long calLastTapMs = 0;                             // 上一次点某天的时刻 (400ms 内再点同一天=双击)       // 黄历弹层是否打开 (点某天 -> 选中日黄历)  // 上�?�绘制�?? 1号星�?0=�? / 当月天数
+static bool calPickerOpen = false;      // 年月选择弹层�?否打�?
+static int calPickY = 2000, calPickM = 1; // 选择器临时�??
+// 年月选择弹层几何 (�?make_preview.py PICK_* �?�?
+#define PICK_PANEL_X  20
+#define PICK_PANEL_W  440
+#define PICK_PT       40
+#define PICK_PB       250
+#define PICK_MCOL_W   60
+#define PICK_MROW_H   40
+#define PICK_MGRID_X  60          // (480 - 6*60)/2
+#define PICK_MTOP     128
+
+
+// ---------- 黄历 (米纸 + 红/褐 新设计) 弹层: 双击某天打开 (镜像 preview make_preview.py draw_almanac_popup) ----------
+// 配色 (565 值, 与 preview ALM_* 一致):
+#define ALM_PAPER     0xEF9C  // 纸面 (暖白米纸)
+#define ALM_RED       0xB9C5  // 主红 (大数字 / 月份 / 忌 / 节日框)
+#define ALM_DARK      0x3985  // 深褐 (标题 / 干支 / 星期)
+#define ALM_LINE      0xCCB0  // 细线 (四角括号 / 分栏线 / 星期框 / 图例)
+#define ALM_JI        0x6D0C  // 吉 (绿, "宜"标签底)
+#define ALM_RING      0xE5F5  // 大数字装饰双环 (淡粉)
+#define ALM_WKND      0x8A52  // 周末图例点 (褐红, 区别于 平日深褐 / 节假日主红)
+// 宜/忌 项池 (12, 2字/项); 装饰性 dayStd%12 顺序取 3 项 (两侧同公式).
+static const char* ALM_YI_ITEMS[12] = {"嫁娶","出行","移徙","入宅","装修","动土","栽种","祭祀","安床","会友","嫁娶","出行"};
+static const char* ALM_JI_ITEMS[12] = {"开张","开业","嫁娶","动土","安葬","出行","安床","入宅","词讼","破土","开光","会友"};
+static int almJDN(int y, int m, int d) {
+  int a = (14 - m) / 12;
+  int yy = y + 4800 - a;
+  int mm = m + 12 * a - 3;
+  return d + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045;
+}
+
+static void drawAlmPopup(int y, int m, int d);   // 前置声明 (drawCalendar 先调用, 定义在后)
+// ---- calendar bottom info strip (shared by full-page draw + partial refresh) ----
+static void drawCalBottomStrip(int ty, int tmn, int td) {
+  int ld[31]; nl_month_days(calSelY, calSelM, ld);
+  int v = ld[calSelD - 1];
+  int lm = v / 100, ldn = v % 100;
+  bool isLeap = (lm > 100); if (isLeap) lm -= 100;
+  int ly = nl_zodiac_year(calSelY, calSelM, calSelD);   // 干支/生肖�?(按春节分�? �?正农�?11/12月�??�?
+  int stripTop = CAL_GRID_TOP + 6 * CAL_CELL_H + 8;
+  tft.fillRoundRect(CAL_X0, stripTop, CAL_X1 - CAL_X0, 34, 8, CAL_STRIP_L);
+  int cys = stripTop + 17;
+  char gz[16];
+  snprintf(gz, sizeof(gz), "%s%s%s年", nl_tg_text[nl_tg(ly)], nl_dz_text[nl_dz(ly)], nl_sx_text[nl_dz(ly)]);
+  int x = CAL_X0 + 12;
+  font16.drawStringFast(x, cys - 8, gz, CAL_GOLD_L, CAL_STRIP_L);
+  x += font16.textWidth(gz) + 12;
+  // 选中�?= 今天 -> "今日农历X月X"; 否则 "M月D�?农历X月X"
+  char lmS[40];
+  if (calSelY == ty && calSelM == tmn && calSelD == td) {
+    snprintf(lmS, sizeof(lmS), "今日农历%s月%s%s", lunarMonths[lm - 1], lunarDays[ldn - 1],
+             isLeap ? "(闰)" : "");
+  } else {
+    snprintf(lmS, sizeof(lmS), "%d月%d日 农历%s月%s%s", calSelM, calSelD, lunarMonths[lm - 1],
+             lunarDays[ldn - 1], isLeap ? "(闰)" : "");
+  }
+  font16.drawStringFast(x, cys - 8, lmS, CAL_NORM, CAL_STRIP_L);
+  // "今日" 按钮 (信息条右�?: �?�?回到今�??(当前�?+ 选中今天)�?
+  // 已在今天�?在月时高�?�?, 点击 = 把�?�中日重�?为今天�??
+  {
+    const char* btTxt = "今日";
+    int btW = font16.textWidth(btTxt) + 16;
+    int btX = CAL_X1 - 8 - btW;
+    int btY = stripTop + 5, btH = 24;
+    bool atToday = (calYear == ty && calMon == tmn);
+    tft.fillRoundRect(btX, btY, btW, btH, 6, atToday ? TFT_CYAN : CAL_STRIP_L);
+    font16.drawStringFast(btX + 8, cys - 8, btTxt, atToday ? TFT_BLACK : CAL_TITLE,
+                          atToday ? TFT_CYAN : CAL_STRIP_L);
+  }
+}
+// selection changed: erase old border + draw new + redraw bottom strip (no full-page redraw)
+static void redrawCalSelection(int ty, int tmn, int td) {
+  bool prevIsToday = (calPrevSelY == ty && calPrevSelM == tmn && calPrevSelD == td);
+  if (calPrevSelY == calYear && calPrevSelM == calMon && calPrevSelD >= 1 && calPrevSelD <= calDim && !prevIsToday) {
+    int r = (calFirstW + calPrevSelD - 1) / 7;
+    if (r < 6) {
+      int c = (calFirstW + calPrevSelD - 1) % 7;
+      int cx = CAL_X0 + c * CAL_CELL_W + CAL_CELL_W / 2;
+      int cy = CAL_GRID_TOP + r * CAL_CELL_H + CAL_CELL_H / 2;
+      tft.drawRect(cx - 14, cy - 13, 29, 27, CAL_LIGHT_BG);   // erase old selection border
+    }
+  }
+  bool newIsToday = (calSelY == ty && calSelM == tmn && calSelD == td);
+  if (calSelY == calYear && calSelM == calMon && calSelD >= 1 && calSelD <= calDim && !newIsToday) {
+    int r = (calFirstW + calSelD - 1) / 7;
+    if (r < 6) {
+      int c = (calFirstW + calSelD - 1) % 7;
+      int cx = CAL_X0 + c * CAL_CELL_W + CAL_CELL_W / 2;
+      int cy = CAL_GRID_TOP + r * CAL_CELL_H + CAL_CELL_H / 2;
+      tft.drawRect(cx - 14, cy - 13, 29, 27, CAL_TITLE);      // draw new selection border
+    }
+  }
+  calPrevSelY = calSelY; calPrevSelM = calSelM; calPrevSelD = calSelD;
+  drawCalBottomStrip(ty, tmn, td);
+}
+void drawCalendar() {
+  if (!font16.isReady()) return;
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+  int ty = t.tm_year + 1900, tmn = t.tm_mon + 1, td = t.tm_mday;
+  if (calYear <= 0) { calYear = ty; calMon = tmn; }
+  if (calSelY <= 0) { calSelY = ty; calSelM = tmn; calSelD = td; }   // 默�?��?�中今天
+  holiday::ensureYear(calYear);   // 浏�?�到某年且无缓�??-> 排队网络同�??(在线时立即做)
+  tft.fillRect(0, 0, 480, NAV_BAR_Y, CAL_LIGHT_BG);
+  if (calPickerOpen) { drawCalPicker(); return; }
+  if (calAlmOpen) { drawAlmPopup(calSelY, calSelM, calSelD); return; }
+  // 顶部: 上月 | 月份标�??(点击选年�? | 下月
+  font16.drawStringFast(14, 16, "<", CAL_HDR, CAL_LIGHT_BG);
+  char mt[16];
+  snprintf(mt, sizeof(mt), "%d年%d月", calYear, calMon);
+  int mw = font16.textWidth(mt);
+  font16.drawStringFast(240 - mw / 2, 16, mt, CAL_TITLE, CAL_LIGHT_BG);
+  font16.drawStringFast(446, 16, ">", CAL_HDR, CAL_LIGHT_BG);
+  // 星期表头
+  for (int i = 0; i < 7; i++) {
+    int cx = CAL_X0 + i * CAL_CELL_W + CAL_CELL_W / 2;
+    font16.drawStringFast(cx - 8, 34, weekHdr[i], CAL_HDR, CAL_LIGHT_BG);
+  }
+  // table 网格�?(7 �?× 6 �?
+  for (int i = 0; i <= 7; i++) {
+    int gx = CAL_X0 + i * CAL_CELL_W;
+    tft.drawFastVLine(gx, CAL_GRID_TOP, 6 * CAL_CELL_H + 1, CAL_GRID);
+  }
+  for (int r = 0; r <= 6; r++) {
+    int gy = CAL_GRID_TOP + r * CAL_CELL_H;
+    tft.drawFastHLine(CAL_X0, gy, (CAL_X1 - CAL_X0) + 1, CAL_GRID);
+  }
+  // 日期网格 (周日列起)
+  static const int mdays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  int dim = mdays[calMon - 1];
+  bool leap = (calYear % 4 == 0 && calYear % 100 != 0) || (calYear % 400 == 0);
+  if (calMon == 2 && leap) dim = 29;
+  calDim = dim;
+  // 该月 1 号的星期 (0=周日), �?mktime 计算, 跨月/跨年都�?��??
+  int firstW = 0;
+  {
+    struct tm t1;
+    memset(&t1, 0, sizeof(t1));
+    t1.tm_year = calYear - 1900;
+    t1.tm_mon = calMon - 1;
+    t1.tm_mday = 1;
+    t1.tm_isdst = -1;
+    time_t tt1 = mktime(&t1);
+    struct tm t1l;
+    localtime_r(&tt1, &t1l);
+    firstW = t1l.tm_wday;   // 0=Sun
+  }
+  calFirstW = firstW;
+  char dn[3];
+  for (int day = 1; day <= dim; day++) {
+    int r = (firstW + day - 1) / 7;
+    if (r >= 6) break;
+    int c = (firstW + day - 1) % 7;
+    int cx = CAL_X0 + c * CAL_CELL_W + CAL_CELL_W / 2;
+    int cy = CAL_GRID_TOP + r * CAL_CELL_H + CAL_CELL_H / 2;
+    snprintf(dn, sizeof(dn), "%d", day);
+    int tw = font16.textWidth(dn);
+    bool isToday = (ty == calYear && tmn == calMon && td == day);
+    if (isToday) {                                            // 今天: 青色圆�?�高�?
+      tft.fillRoundRect(cx - 13, cy - 12, 26, 24, 6, TFT_CYAN);
+      font16.drawStringFast(cx - tw / 2, cy - 8, dn, TFT_BLACK, TFT_CYAN);
+      { int htd = holiday::dayType(calYear, calMon, day);   // 2026-09-28: today-that-is-a-holiday still shows the badge (isToday branch used to skip it -> 9/27 had no xiu)
+        if (htd == HOL_OFF || htd == HOL_WORK)
+          font16.drawScaledChar(cx + 19, cy - 14, htd == HOL_OFF ? 0x4F11 : 0x73ED, 12,
+                                (htd == HOL_OFF) ? CAL_OFF : CAL_WORK_L, TFT_CYAN); }
+    } else {
+      int ht = holiday::dayType(calYear, calMon, day);
+      uint16_t fc = (ht == HOL_OFF) ? CAL_OFF
+                     : (ht == HOL_WORK) ? CAL_WORK_L
+                     : ((c == 0 || c == 6) ? CAL_WKND : CAL_NORM);
+      font16.drawStringFast(cx - tw / 2, cy - 8, dn, fc, CAL_LIGHT_BG);
+      if (ht == HOL_OFF || ht == HOL_WORK) {                 // 右上角小 "�?/"�? 角标 (缩放 12px, 替代下划�?
+        // 0x4F11=�? 0x73ED=�?(�?Unicode 码点绘制, 避免多字�?char 字面量�?��??
+        font16.drawScaledChar(cx + 19, cy - 14, ht == HOL_OFF ? 0x4F11 : 0x73ED, 12, fc, CAL_LIGHT_BG);
+      }
+    }
+    if (calSelY == calYear && calSelM == calMon && calSelD == day && !isToday) {  // 选中�? 蓝色边�??
+      tft.drawRect(cx - 14, cy - 13, 29, 27, CAL_TITLE);
+    }
+  }
+  // 底部信息�? 干支�?+ 选中日的农历 (点击某天即显示那�? 默�??=今天)
+  drawCalBottomStrip(ty, tmn, td);
+  calPrevSelY = calSelY; calPrevSelM = calSelM; calPrevSelD = calSelD;
+}
+
+// 年月选择弹层: 顶部 < 年份 > 步进 + 6x2 月份网格 + �?�?/取消
+void drawCalPicker() {
+  tft.fillRect(0, 0, 480, NAV_BAR_Y, CAL_LIGHT_BG);
+  tft.fillRoundRect(PICK_PANEL_X, PICK_PT, PICK_PANEL_W, PICK_PB - PICK_PT, 12, CAL_LIGHT_BG);
+  tft.drawRoundRect(PICK_PANEL_X, PICK_PT, PICK_PANEL_W, PICK_PB - PICK_PT, 12, CAL_GRID);
+  font16.drawStringFast(240 - font16.textWidth("选择年月") / 2, PICK_PT + 12, "选择年月", CAL_HDR, CAL_LIGHT_BG);
+  // 年份步进: < 2026 >
+  font16.drawStringFast(40, 92, "<", CAL_HDR, CAL_LIGHT_BG);
+  char ys[8];
+  snprintf(ys, sizeof(ys), "%d", calPickY);
+  font16.drawStringFast(240 - font16.textWidth(ys) / 2, 88, ys, CAL_TITLE, CAL_LIGHT_BG);
+  font16.drawStringFast(420, 92, ">", CAL_HDR, CAL_LIGHT_BG);
+  // 月份网格 6 �?x 2 �?
+  char mlab[8];
+  for (int m = 1; m <= 12; m++) {
+    int col = (m - 1) % 6;
+    int row = (m - 1) / 6;
+    int bx = PICK_MGRID_X + col * PICK_MCOL_W;
+    int by = PICK_MTOP + row * PICK_MROW_H;
+    snprintf(mlab, sizeof(mlab), "%d月", m);
+    int lw = font16.textWidth(mlab);
+    if (m == calPickM) {
+      tft.fillRoundRect(bx + 3, by + 3, PICK_MCOL_W - 6, PICK_MROW_H - 6, 8, TFT_CYAN);
+      font16.drawStringFast(bx + PICK_MCOL_W / 2 - lw / 2, by + PICK_MROW_H / 2 - 8,
+                            mlab, CAL_TITLE, TFT_CYAN);
+    } else {
+      tft.fillRoundRect(bx + 3, by + 3, PICK_MCOL_W - 6, PICK_MROW_H - 6, 8, CAL_STRIP_L);
+      font16.drawStringFast(bx + PICK_MCOL_W / 2 - lw / 2, by + PICK_MROW_H / 2 - 8,
+                            mlab, CAL_NORM, CAL_STRIP_L);
+    }
+  }
+  // 按钮: 取消 | �?�?  (文字垂直居中�?�?�? 按钮: 按钮 y=PICK_PB-34..PICK_PB-8, �?�?=PICK_PB-21;
+  //  �?�? AA 16px 字形按左上锚�? �?y = �?�?-8 = PICK_PB-29)
+  font16.drawStringFast(150 - font16.textWidth("取消") / 2, PICK_PB - 29, "取消", CAL_HDR, CAL_LIGHT_BG);
+  tft.fillRoundRect(280, PICK_PB - 34, 120, 26, 8, CAL_TITLE);
+  font16.drawStringFast(340 - font16.textWidth("确定") / 2, PICK_PB - 29, "确定", CAL_LIGHT_BG, CAL_TITLE);
+}
+
+// 放大中文/数字文字 (逐字 drawBigChar): 镜像 preview big_text. ASCII advance = dst*7/10,
+// 其它 = dst. (x,y) = 左上角; center=true 时以 x 为水平中心. 返回总宽(像素).
+static int almBigText(int x, int y, const String& s, int dst, uint16_t fg, uint16_t bg, bool center) {
+  int total = 0;
+  for (unsigned i = 0; i < s.length(); i++) {
+    uint8_t c0 = s[i];
+    uint16_t cp;
+    int adv;
+    if (c0 < 0x80) { cp = c0; adv = dst * 7 / 10; }
+    else if (c0 < 0xE0) { cp = ((c0 & 0x1F) << 6) | (s[i + 1] & 0x3F); i++; adv = dst; }
+    else if (c0 < 0xF0) { cp = ((c0 & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F); i += 2; adv = dst; }
+    else { i += 3; continue; }
+    total += adv;
+  }
+  if (center) x -= total / 2;
+  int sx = x;
+  for (unsigned i = 0; i < s.length(); i++) {
+    uint8_t c0 = s[i];
+    uint16_t cp;
+    int adv;
+    if (c0 < 0x80) { cp = c0; adv = dst * 7 / 10; }
+    else if (c0 < 0xE0) { cp = ((c0 & 0x1F) << 6) | (s[i + 1] & 0x3F); i++; adv = dst; }
+    else if (c0 < 0xF0) { cp = ((c0 & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F); i += 2; adv = dst; }
+    else { i += 3; continue; }
+    if (font32.isReady() && font32.hasGlyph(cp)) font32.drawBigChar(sx, y, cp, dst, fg, bg);
+    else font16.drawBigChar(sx, y, cp, dst, fg, bg);   // 缺字回退 16px
+    sx += adv;
+  }
+  return total;
+}
+
+// 小字 (逐字 drawScaledChar, 16px AA 面积平均缩放到 size): 镜像 preview hw_small.
+// (x,ytop) = 左上角; ASCII advance = size*7/10, 其它 = size; center=true 时以 x 为中心. 返回总宽.
+static int almScaledText(int x, int ytop, const String& s, int size, uint16_t fg, uint16_t bg, bool center) {
+  int total = 0;
+  for (unsigned i = 0; i < s.length(); i++) {
+    uint8_t c0 = s[i];
+    if (c0 < 0x80) { total += size * 7 / 10; }
+    else if (c0 < 0xE0) { i++; total += size; }
+    else if (c0 < 0xF0) { i += 2; total += size; }
+    else { i += 3; }
+  }
+  if (center) x -= total / 2;
+  int sx = x;
+  for (unsigned i = 0; i < s.length(); i++) {
+    uint8_t c0 = s[i]; uint16_t cp; int adv;
+    if (c0 < 0x80) { cp = c0; adv = size * 7 / 10; }
+    else if (c0 < 0xE0) { cp = ((c0 & 0x1F) << 6) | (s[i + 1] & 0x3F); i++; adv = size; }
+    else if (c0 < 0xF0) { cp = ((c0 & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F); i += 2; adv = size; }
+    else { i += 3; continue; }
+    // BUILD21: 小字也走 64px 字库(font32)下采样(同 almBigText 路径), 而不是 16px 源。
+    // 根因: 16px 源 area-average 降到 13px 会把只占源行14-15 的 2px 笔画(如"三"底横)塌成 1px ->
+    //       视觉上"底横被截一半"。64px 源有 4x 分辨率, 降采样后笔画保持 2px, 与 24px 大字一样干净。
+    // 缺字回退 font16(16px 源), 与 almBigText 的回退策略一致。
+    if (font32.isReady() && font32.hasGlyph(cp)) font32.drawBigChar(sx, ytop, cp, size, fg, bg);
+    else font16.drawBigChar(sx, ytop, cp, size, fg, bg);
+    sx += adv;
+  }
+  return total;
+}
+// 粗体大数字: 两位 62x112 8bit 遮罩 (almnum.h, Bahnschrift w700) 并排 = 124x112, 纸底 + 红笔画.
+// 逐行流式合成 (每行 124px 临时行缓冲 248B, 不占大块静态 RAM), 行内单次 pushImage.
+// day<10 时十位留纸底 (遮罩值 255). 整体 124 宽由调用者定位.
+// lint:skip-rule-1  (弹层为一次性静态绘制, 无连续动态区域, 逐行推无闪烁风险)
+static void almBigNum(int x0, int y0, int day, uint16_t col) {
+  static uint16_t row[ALM_DW * 2];   // 124 px 行缓冲 (内部 RAM)
+  const uint8_t* m0 = AlmMasks[day / 10];
+  const uint8_t* m1 = AlmMasks[day % 10];
+  int pr = ALM_PAPER >> 11, pg = (ALM_PAPER >> 5) & 0x3F, pb = ALM_PAPER & 0x1F;
+  int fr = col >> 11, fg = (col >> 5) & 0x3F, fb = col & 0x1F;   // 筒单颜色随日期类型 (red/purple/dark)
+  for (int dy = 0; dy < ALM_DH; dy++) {
+    for (int dx = 0; dx < ALM_DW; dx++) {
+      uint8_t a = pgm_read_byte(&m0[dy * ALM_DW + dx]);   // 十位; 0=笔画,255=底 (前导零: day<10 显 "0")
+      uint8_t c = pgm_read_byte(&m1[dy * ALM_DW + dx]);
+      int ra = (pr * a + fr * (255 - a)) / 255, ga = ((pg * a + fg * (255 - a)) / 255) & 0x3F, ba = (pb * a + fb * (255 - a)) / 255 & 0x1F;
+      int rc = (pr * c + fr * (255 - c)) / 255, gc = ((pg * c + fg * (255 - c)) / 255) & 0x3F, bc = (pb * c + fb * (255 - c)) / 255 & 0x1F;
+      row[dx] = (ra << 11) | (ga << 5) | ba;
+      row[ALM_DW + dx] = (rc << 11) | (gc << 5) | bc;
+    }
+    tft.pushImage(x0, y0 + dy, ALM_DW * 2, 1, row);
+  }
+}
+
+// 黄历 (米纸+红/褐 新设计) 弹层: 覆盖日历页, 点任意处关闭 (无关闭按钮).
+// 逐像素镜像 preview make_preview.py draw_almanac_popup.
+// 布局 (面板 PX=24,PT=16,432x272; 四角花纹括号):
+//   顶行        y30 (年份 big 32 | 干支X年 | 月份 big 26 红 + 月 | 节气 | 右上 节日红框)
+//   三列中部    (左 农历X月X big24 红 + 农历·花名月 / 中央 双环 + 大数字 day 红 / 右 干支X日 big24 + 干支·生肖)
+//   底栏        分隔线 y230 + 星期框(左) + 宜[吉]3项/忌[凶]3项(中) + 平日/周末/节假日 图例(右)
+// lint:skip-rule-1  (弹层为一次性静态绘制: 双击打开后无连续动态区域, 逐笔/逐行推无闪烁风险)
+// ---- almanac festival box: whole contiguous holiday run shares one festival name ----
+// (Spring Festival run 2/15-23 all show "chunjie"; National Day 10/1-7 all show "guoqingjie".)
+static void almAddDay(int* y, int* m, int* d, int delta) {
+  struct tm t; memset(&t, 0, sizeof(t));
+  t.tm_year = *y - 1900; t.tm_mon = *m - 1; t.tm_mday = *d; t.tm_isdst = -1;
+  time_t tt = mktime(&t) + (long)delta * 86400L;
+  struct tm r; localtime_r(&tt, &r);
+  *y = r.tm_year + 1900; *m = r.tm_mon + 1; *d = r.tm_mday;
+}
+
+static bool almRealFest(int y, int m, int d, char* f, int fsz) {
+  int ld[31]; nl_month_days(y, m, ld);
+  int v = ld[d - 1]; int lm = v / 100, ldn = v % 100;
+  bool isLeap = (lm > 100); if (isLeap) lm -= 100;
+  f[0] = 0;
+  return nl_festival(y, m, d, nl_zodiac_year(y, m, d), lm, ldn, isLeap ? 1 : 0, f, fsz) == 1;
+}
+
+static const char* almHolidayFest(int y, int m, int d, char* buf, int bufsz) {
+  char f[16];
+  // BUILD21: 除夕 = 正月初一前一天。两条判据(任一命中即为除夕):
+  //   (a) holidays JSON 当天名 == "除夕" (政府数据, 2026 等已发布的年);
+  //   (b) nl_is_chuxi(y,m,d) 内置农历表算出"该年正月初一 - 1 天"。
+  //   (b) 不依赖 JSON —— 2027 的 JSON 为空(节假日未发布)时, 除夕(2/5)也能显示。
+  //   必须放在 almRealFest **之前**: 农历表对 2026 差一天(把 2/16 记成正月初一),
+  //   若放后面, almRealFest 会先误返"春节"。
+  const char* chuxiName = holiday::dayName(y, m, d);
+  bool isChuxi = (chuxiName && strcmp(chuxiName, "除夕") == 0) || nl_is_chuxi(y, m, d);
+  if (isChuxi) { snprintf(buf, bufsz, "除夕"); return buf; }
+  if (almRealFest(y, m, d, f, sizeof(f))) { snprintf(buf, bufsz, "%s", f); return buf; }
+  if (holiday::dayType(y, m, d) != HOL_OFF) { buf[0] = 0; return buf; }
+  int ay = y, am = m, ad = d;
+  for (int i = 0; i < 40; i++) {
+    int ny = ay, nm = am, nd = ad; almAddDay(&ny, &nm, &nd, -1);   // BUILD21: from running ay (not y), walk whole run
+    if (holiday::dayType(ny, nm, nd) == HOL_OFF) { ay = ny; am = nm; ad = nd; } else break;
+  }
+  int by = y, bm = m, bd = d;
+  for (int i = 0; i < 40; i++) {
+    int ny = by, nm = bm, nd = bd; almAddDay(&ny, &nm, &nd, 1);   // BUILD21: from running by (not y), walk whole run
+    if (holiday::dayType(ny, nm, nd) == HOL_OFF) { by = ny; bm = nm; bd = nd; } else break;
+  }
+  int cy = ay, cm = am, cd = ad;
+  for (int i = 0; i < 40; i++) {
+    bool past = (cy > by) || (cy == by && (cm > bm || (cm == bm && cd > bd)));
+    if (past) break;
+    char cf[16];
+    if (almRealFest(cy, cm, cd, cf, sizeof(cf))) { snprintf(buf, bufsz, "%s", cf); return buf; }
+    almAddDay(&cy, &cm, &cd, 1);
+  }
+  const char* hol = holiday::dayName(y, m, d);
+  if (hol && hol[0]) snprintf(buf, bufsz, "%s", hol); else buf[0] = 0;
+  return buf;
+}
+static void drawAlmPopup(int y, int m, int d) {
+  // lint:skip-rule-1  (alm popup: one-shot static draw, no continuous dynamic region)
+  const int PX = 24, PW = 432, PT = 16, PH = 272;
+  int cx = 240;
+  int ld[31]; nl_month_days(y, m, ld);
+  int v = ld[d - 1];
+  int lm = v / 100, ldn = v % 100;
+  bool isLeap = (lm > 100); if (isLeap) lm -= 100;
+  int lyz = nl_zodiac_year(y, m, d);
+  static const char* TG2[10] = {"甲","乙","丙","丁","戊","己","庚","辛","壬","癸"};
+  static const char* DZ2[12] = {"子","丑","寅","卯","辰","巳","午","未","申","酉","戌","亥"};
+  static const char* ZODIAC_D[12] = {"鼠","牛","虎","兔","龙","蛇","马","羊","猴","鸡","狗","猪"};
+  static const char* PMON[12] = {"正月","杏月","桃月","槐月","榴月","荷月","兰月","桂月","菊月","阳月","冬月","腊月"};
+  char ygz[24];
+  snprintf(ygz, sizeof(ygz), "%s%s%s", nl_tg_text[nl_tg(lyz)], nl_dz_text[nl_dz(lyz)], nl_sx_text[nl_dz(lyz)]);
+  int dayStd = (almJDN(y, m, d) + 49) % 60;
+  int jqCur = -1;
+  int _jqCurD = 0, _jqNxt = -1, _jqNxtD = 0;
+  nl_jq_info(y, m, d, &jqCur, &_jqCurD, &_jqNxt, &_jqNxtD);
+  char dgz[8]; snprintf(dgz, sizeof(dgz), "%s%s", TG2[dayStd % 10], DZ2[dayStd % 12]);
+  char pmon[8];
+  if (isLeap) snprintf(pmon, sizeof(pmon), "闰%s", PMON[(lm - 1) % 12]);
+  else snprintf(pmon, sizeof(pmon), "%s", PMON[(lm - 1) % 12]);
+  char lcol_main[16]; snprintf(lcol_main, sizeof(lcol_main), "%s月%s", lunarMonths[lm - 1], lunarDays[ldn - 1]);
+  struct tm t0; memset(&t0, 0, sizeof(t0)); t0.tm_year = y - 1900; t0.tm_mon = m - 1; t0.tm_mday = d; t0.tm_isdst = -1;
+  time_t tt0 = mktime(&t0); struct tm tl; localtime_r(&tt0, &tl);
+  const char* wday = weekHdr[tl.tm_wday];
+  char yistr[8]; snprintf(yistr, sizeof(yistr), "%d", y);
+  char mistr[8]; snprintf(mistr, sizeof(mistr), "%d", m);
+  char fest[16] = "";
+  almHolidayFest(y, m, d, fest, sizeof(fest));   // festival name for the whole holiday run
+  // BUILD23: dedup yi/ji (mirror make_preview.py seen-set). Old 3-consecutive pick
+  // hit YI pool dups 嫁娶(0,10)/出行(1,11) -> 10/28 (dayStd%12=11) gave 出行/嫁娶/出行.
+  const char* yi3[3];
+  {
+    int n = 0;
+    for (int k = 0; k < 12 && n < 3; k++) {
+      const char* it = ALM_YI_ITEMS[(dayStd + k) % 12];
+      int dup = 0;
+      for (int j = 0; j < n; j++) if (strcmp(yi3[j], it) == 0) { dup = 1; break; }
+      if (!dup) yi3[n++] = it;
+    }
+  }
+  const char* ji3[3];
+  {
+    int n = 0;
+    for (int k = 0; k < 12 && n < 3; k++) {
+      const char* it = ALM_JI_ITEMS[(dayStd + k) % 12];
+      int dup = 0;
+      for (int j = 0; j < n; j++) if (strcmp(ji3[j], it) == 0) { dup = 1; break; }
+      if (!dup) ji3[n++] = it;
+    }
+  }
+  // ---- 背景 + 四角括号 ----
+  tft.fillRect(PX, PT, PW, PH, ALM_PAPER);
+  {
+    const int L = 16;
+    tft.drawFastHLine(PX, PT, L, ALM_LINE); tft.drawFastVLine(PX, PT, L, ALM_LINE);
+    tft.drawFastHLine(PX + PW - 1 - L, PT, L, ALM_LINE); tft.drawFastVLine(PX + PW - 1, PT, L, ALM_LINE);
+    tft.drawFastHLine(PX, PT + PH - 1, L, ALM_LINE); tft.drawFastVLine(PX, PT + PH - 1 - L, L, ALM_LINE);
+    tft.drawFastHLine(PX + PW - 1 - L, PT + PH - 1, L, ALM_LINE); tft.drawFastVLine(PX + PW - 1, PT + PH - 1 - L, L, ALM_LINE);
+  }
+  // ---- 顶行 (y=30): 年份 干支X年 | 月份 月 | 农历X月X | 花名月·节气后/今日X | 右上 节日框 ----
+  almBigText(PX + 14, 30, String(yistr), 24, ALM_DARK, ALM_PAPER, false);  // 2026
+  int ygzX = PX + 14 + 4 * (24 * 7 / 10) + 8;
+  almScaledText(ygzX, 36, String(ygz), 13, ALM_DARK, ALM_PAPER, false);  // 丙午马 (13px)
+  const int monX = 162;
+  almBigText(monX, 30, String(mistr), 24, ALM_RED, ALM_PAPER, false);  // 10 (大红)
+  almScaledText(monX + 2 * (24 * 7 / 10) + 4, 36, "月", 13, ALM_RED, ALM_PAPER, false);  // 月
+  const int lunX = 218;
+  String lunStr2 = String("农历") + lunarMonths[lm - 1] + "月" + lunarDays[ldn - 1];
+  almScaledText(lunX, 36, lunStr2, 13, ALM_DARK, ALM_PAPER, false);  // 农历X月X
+  char pjText[24];
+  if (jqCur < 0) snprintf(pjText, sizeof(pjText), "%s", pmon);
+  else if (_jqCurD == 0) snprintf(pjText, sizeof(pjText), "今日%s", nl_jq_text[jqCur]);  // 节气当日 -> 今日X
+  else snprintf(pjText, sizeof(pjText), "%s·%s后", pmon, nl_jq_text[jqCur]);  // 之后 -> X后
+  int lunW = font16.textWidth(lunStr2) * 13 / 16;
+  int pjW = font16.textWidth(String(pjText)) * 13 / 16;
+  int pjX = lunX + lunW + 6;
+  int fw = fest[0] ? (font16.textWidth(String(fest)) + 14) : 0;
+  int boxLeft = fest[0] ? (PX + PW - 12 - fw) : (PX + PW - 14);
+  if (pjX + pjW > boxLeft - 4) pjX = max(lunX + lunW + 2, boxLeft - 4 - pjW);  // 不越过节日框
+  // BUILD21: 花名月·节气 节日当天也显示(与右上节日框并排, 靠左由上方 clamp 保证不重叠)。
+  // 旧版 if(!fest[0]) 会在节日天隐藏它 -> 用户看到"节日那天节气/花月名消失"。
+  almScaledText(pjX, 36, String(pjText), 13, ALM_DARK, ALM_PAPER, false);  // 花名月·节气后 / 今日X
+  if (fest[0]) {
+    tft.drawRect(PX + PW - 12 - fw, 28, fw, 26, ALM_RED);
+    almScaledText(PX + PW - 12 - fw + 7, 34, String(fest), 15, ALM_RED, ALM_PAPER, false);
+  }
+  // ---- 三列中部 (左列 农历 红 / 右列 干支 深褐; 中央环 + 大数字 红; 环中心 y=148) ----
+  const int LC = 90, RC = 390;
+  uint16_t numCol;
+  {
+    int _htd = holiday::dayType(y, m, d);
+    if (_htd == HOL_OFF || _htd == HOL_WORK) numCol = ALM_RED;   // 放假/补班 -> 红
+    else if (fest[0]) numCol = ALM_RED;                          // BUILD23: 任何节日(含西方 万圣节/黑五/母亲节...) -> 红 (镜像 preview fest)
+    else if (tl.tm_wday == 0 || tl.tm_wday == 6) numCol = ALM_WKND;
+    else numCol = ALM_JI;
+  }
+  almBigText(LC, 122, String(lcol_main), 24, numCol, ALM_PAPER, true);
+  almScaledText(LC, 166, String("农历·") + pmon, 14, ALM_DARK, ALM_PAPER, true);  // 农历·桂月
+  almBigText(RC, 122, String(dgz) + "日", 24, ALM_DARK, ALM_PAPER, true);  // 壬寅日 (深褐)
+  almScaledText(RC, 166, String("干支·") + ZODIAC_D[dayStd % 12], 14, ALM_DARK, ALM_PAPER, true);  // 干支·虎
+  tft.drawCircle(cx, 148, 72, ALM_RING);  // 外环
+  tft.drawCircle(cx, 148, 57, ALM_RING);  // 内环
+  almBigNum(cx - ALM_DW, 148 - ALM_DH / 2, d, numCol);  // 大数字 (中心对齐环中心 148)
+  // ---- 底栏 ----
+  tft.drawFastHLine(PX + 10, 230, PW - 21, ALM_LINE);
+  {
+    almScaledText(PX + 12, 240, "星期", 18, ALM_DARK, ALM_PAPER, false);  // 星期 (18px, 底栏垂直中忉)
+    almBigText(PX + 54, 234, String(wday), 30, ALM_DARK, ALM_PAPER, false);  // 六 (30px, 底栏垂直中忉)
+  }
+  {
+    int tx = 150;
+    tft.fillRect(tx, 236, 16, 16, ALM_JI);
+    font16.drawStringFast(tx, 236, String("宜"), ALM_PAPER, ALM_JI);
+    int xi = tx + 24;
+    for (int i = 0; i < 3; i++) { font16.drawStringFast(xi, 236, String(yi3[i]), ALM_DARK, ALM_PAPER); xi += font16.textWidth(String(yi3[i])) + 6; }
+    tft.fillRect(tx, 258, 16, 16, ALM_RED);
+    font16.drawStringFast(tx, 258, String("忌"), ALM_PAPER, ALM_RED);
+    xi = tx + 24;
+    for (int i = 0; i < 3; i++) { font16.drawStringFast(xi, 258, String(ji3[i]), ALM_DARK, ALM_PAPER); xi += font16.textWidth(String(ji3[i])) + 6; }
+  }
+  {
+    int lx = PX + PW - 14 - 130;
+    static const uint16_t lg[3] = {ALM_JI, ALM_WKND, ALM_RED};
+    static const char* nm[3] = {"平日", "周末", "节假日"};
+    for (int r = 0; r < 3; r++) {
+      int yy = 234 + r * 18;
+      tft.fillCircle(lx + 3, yy + 8, 3, lg[r]);
+      font16.drawStringFast(lx + 12, yy, String(nm[r]), lg[r], ALM_PAPER);
+    }
+  }
+  // moon (legend-right): icon + name
+  {
+    double mp = nl_moon_phase(y, m, d);
+    int mi = (int)(mp * 8.0 + 0.5) % 8;
+    drawMoonIcon(415, 250, 9, mp);
+    font16.drawStringFast(415 - font16.textWidth(nl_moon_text[mi]) / 2, 264, nl_moon_text[mi], 0xDE72, ALM_PAPER);
   }
 }
 
 void modeCalendar() {
   if (!modeDrawn[MODE_CALENDAR] || modeChanged) {
-    tft.fillRect(0, 0, 480, NAV_BAR_Y, COLOR_BG);
-    font24.drawString(160, 100, "万年历", TFT_CYAN, COLOR_BG);
+    drawCalendar();
     modeDrawn[MODE_CALENDAR] = true;
   }
+}
+
+// 年月选择弹层的点击�?��??
+void handlePickerTap(uint16_t tx, uint16_t ty);
+// 日历页点�?
+//  - 关闭�? 点月份标�?= 打开年月选择; 点某�?= 选中(显示其农�?; �?�?1/3 = 上一�?下一�?
+void handleCalendarTap(uint16_t tx, uint16_t ty) {
+  if (calAlmOpen) {          // 黄历弹层打开: 点任意处关闭 (无关闭按钮, 镜像 preview)
+    if (tx >= 24 && tx < 24 + 432 && ty >= 16 && ty < 16 + 272) {
+      calAlmOpen = false;
+      drawCalendar();
+      Serial.printf("almanac closed\n");
+    }
+    return;
+  }
+  if (calPickerOpen) {
+    handlePickerTap(tx, ty);
+    return;
+  }
+  if (ty < CAL_GRID_TOP) {
+    // 顶部标�?��?? 点中�?1/3 (月份标�??) 打开选择�? 左右 1/3 = 上一�?下一�?
+    if (tx < CAL_X1 / 3) {
+      calMon--;
+      if (calMon < 1) { calMon = 12; calYear--; }
+      drawCalendar();
+      Serial.printf("calendar -> %d-%d\n", calYear, calMon);
+    } else if (tx > (CAL_X1 * 2) / 3) {
+      calMon++;
+      if (calMon > 12) { calMon = 1; calYear++; }
+      drawCalendar();
+      Serial.printf("calendar -> %d-%d\n", calYear, calMon);
+    } else {
+      calPickY = calYear; calPickM = calMon;
+      calPickerOpen = true;
+      drawCalendar();
+    }
+    return;
+  }
+  // 日期网格�? 命中某天 -> 选中 (显示其农�?
+  if (ty >= CAL_GRID_TOP && ty < CAL_GRID_TOP + 6 * CAL_CELL_H && tx >= CAL_X0 && tx < CAL_X1) {
+    int c = (tx - CAL_X0) / CAL_CELL_W;
+    int r = (ty - CAL_GRID_TOP) / CAL_CELL_H;
+    int idx = r * 7 + c;                 // 0..41, 对应 1�?起算
+    int day = idx - calFirstW + 1;
+    if (day >= 1 && day <= calDim) {
+      unsigned long nowMs2 = millis();
+      bool isDbl = (calLastTapDay == day && calLastTapY == calYear && calLastTapM == calMon &&
+                    nowMs2 - calLastTapMs < 600);   // double-tap same day within 600ms -> almanac
+      calLastTapDay = day; calLastTapY = calYear; calLastTapM = calMon; calLastTapMs = nowMs2;
+      if (isDbl) {
+        calSelY = calYear; calSelM = calMon; calSelD = day;
+        calAlmOpen = true;
+        drawCalendar();                    // full redraw shows the almanac popup
+        Serial.printf("calendar almanac -> %d-%d-%d\n", calYear, calMon, day);
+      } else {
+        calSelY = calYear; calSelM = calMon; calSelD = day;   // single tap = select
+        time_t now2 = time(nullptr); struct tm tt2; localtime_r(&now2, &tt2);
+        redrawCalSelection(tt2.tm_year + 1900, tt2.tm_mon + 1, tt2.tm_mday);   // partial: no full flash
+        Serial.printf("calendar sel -> %d-%d-%d\n", calYear, calMon, day);
+      }
+    }
+    return;
+  }
+  // 底部信息�?"今日" 按钮: �?�?回到今�??(跳到今天�?在月 + 选中今天)
+  {
+    int stripTop = CAL_GRID_TOP + 6 * CAL_CELL_H + 8;
+    if (ty >= stripTop && ty < stripTop + 34) {
+      int btW = font16.textWidth("今日") + 16;
+      int btX = CAL_X1 - 8 - btW;
+      if (tx >= btX - 2 && tx < btX + btW + 2) {
+        time_t now = time(nullptr);
+        struct tm t;
+        localtime_r(&now, &t);
+        calYear = t.tm_year + 1900; calMon = t.tm_mon + 1;
+        calSelY = calYear; calSelM = calMon; calSelD = t.tm_mday;
+        drawCalendar();
+        Serial.printf("calendar -> today %d-%d-%d\n", calYear, calMon, calSelD);
+      }
+    }
+  }
+}
+
+// 年月选择弹层的点击�?��??
+void handlePickerTap(uint16_t tx, uint16_t ty) {
+  if (ty >= PICK_PT && ty <= PICK_PB && tx >= PICK_PANEL_X && tx < PICK_PANEL_X + PICK_PANEL_W) {
+    if (ty < PICK_PT + 40) return;   // 标�?��??("选择年月"), 点了不�?��??
+    // 年份步进�?(PICK_PT ~ 网格顶部): < �? > �?
+    if (ty >= PICK_PT + 40 && ty < PICK_MTOP) {
+      if (tx < 240) { calPickY--; if (calPickY < 2000) calPickY = 2000; }
+      else if (tx > 240) { calPickY++; if (calPickY > 2099) calPickY = 2099; }
+      drawCalendar();
+      return;
+    }
+    // 月份网格
+    if (ty >= PICK_MTOP && ty < PICK_MTOP + 2 * PICK_MROW_H && tx >= PICK_MGRID_X && tx < PICK_MGRID_X + 6 * PICK_MCOL_W) {
+      int mc = (tx - PICK_MGRID_X) / PICK_MCOL_W;
+      int mr = (ty - PICK_MTOP) / PICK_MROW_H;
+      int m = mr * 6 + mc + 1;
+      if (m >= 1 && m <= 12) { calPickM = m; drawCalendar(); }
+      return;
+    }
+    // 按钮�?
+    if (ty > PICK_PB - PICK_MROW_H) {
+      if (tx < 240) {   // 取消
+        calPickerOpen = false;
+        drawCalendar();
+      } else {          // �?�?
+        calYear = calPickY; calMon = calPickM;
+        calPickerOpen = false;
+        // 选中日默�? 今天�?在月 -> 今天; 否则 -> 1�?
+        time_t now = time(nullptr);
+        struct tm t;
+        localtime_r(&now, &t);
+        int ty = t.tm_year + 1900, tmn = t.tm_mon + 1, td = t.tm_mday;
+        if (ty == calYear && tmn == calMon) { calSelY = calYear; calSelM = calMon; calSelD = td; }
+        else { calSelY = calYear; calSelM = calMon; calSelD = 1; }
+        drawCalendar();
+        Serial.printf("picker -> %d-%d\n", calYear, calMon);
+      }
+      return;
+    }
+    return;   // 面板内但�?命中具体区�??(如标�?缝隙) -> 忽略, 不关�?
+  }
+  // 点面板�??: 关闭弹层
+  calPickerOpen = false;
+  drawCalendar();
 }
 
 void drawWeatherScreen() {
@@ -821,34 +2115,142 @@ void modeWeather() {
   }
 }
 
+// BUILD14: 收音机泵 + 看门狗 (全屏分支/列表分支 两处共用)
+// 看门狗: 流中途死亡 (库内部断连后 isRunning 掉) 连续 8s 未 running -> 自动 stopRadio,
+// 覆盖 "播一会儿自己断"。正常连流/缓冲期 isRunning 短暂为 false (连接超时上限 2s),
+// 8s 宽限足够不误伤。
+int radioFailCnt = 0;   // 起播连接失败计数 (3 次彻底停, 见 modeRadio 延迟起播处)
+uint32_t radioWasRunAt = 0;   // BUILD15: watchdog timer base; reset on each successful connect so a fresh
+                              // buffering stream is not killed by a stale/zero value (fixes silent no-response).
+void pumpRadio() {
+  if (audio.isRunning()) radioWasRunAt = millis();
+  else if (millis() - radioWasRunAt > 8000) {
+    stopRadio();
+    Serial.println("[RADIO] stream dead >8s -> stopped");
+    return;
+  }
+  // BUILD16: 2nd watchdog - "connected but silent".
+  // The library's isRunning() stays true even when it is stuck in its internal
+  // reconnect loop (e.g. a master-playlist URL that it misparses -> 404 ->
+  // reconnect every ~5s, forever, screen frozen). getTotalPlayingTime() only
+  // starts counting once the FIRST audio frame is actually decoded, so
+  // connected>30s with zero decoded audio = poison stream -> force stop.
+  if (millis() - radioWasRunAt > 30000 && audio.getTotalPlayingTime() == 0) {
+    stopRadio();
+    Serial.println("[RADIO] no audio output >30s after connect -> stopped");
+    return;
+  }
+  audio.loop();
+}
+
 void modeRadio() {
   if (!radioInited) return;
+
+  // 延迟起播刷入: 双击窗口(RADIO_DBL_MS)已关闭且未进入全屏 -> 真正连流。
+  // (若期间双击进了全屏, modeDrawn 被清, 此处不刷 -> 相当于取消起播)
+  if (pendingPlaySid >= 0 && !showingFullscreen && millis() - pendingPlayAt >= RADIO_PLAY_FLUSH_MS) {
+    int sid = pendingPlaySid; pendingPlaySid = -1;
+    Serial.printf("[DBG-T] FLUSH deferred play sid=%d (elapsed %lu ms)\n", sid, millis() - pendingPlayAt);
+    RadioStation* s = stn(sid);
+    if (s) {
+      String url = readURLForSid(sid);
+      if (url.length() > 0) {
+        if (radioPlaying) audio.stopSong();
+        // BUILD14 诊断: 起播前内部 RAM 余量 (HTTPS 电台 TLS 握手 esp-aes 需连续
+        // ~8-12KB; free/最低堆过小 -> 连接必失败 = "总是停" 根因, boot log 已见
+        // "esp-aes: Failed to allocate memory")
+        Serial.printf("[RADIO] heap free=%u max=%u url=%s\n",
+                      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), url.c_str());
+        // BUILD17: the decisive metric for HTTPS radio = largest contiguous internal-heap block
+        // (mbedTLS handshake needs one big block, ~48KB; fragmentation, not total, is the enemy).
+        // Before BUILD17: ~41KB (cap in bootcap40.log). After: should be ~200KB with clock bufs freed.
+        Serial.printf("[MEM] pre-connect: internalFree=%uKB maxBlock=%uKB dramFree=%uKB\n",
+                      (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                      (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+                      (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+        Serial.printf("Playing: %s\n", s->name);
+        bool ok = audio.connecttohost(url.c_str());
+        // BUILD14 看门狗: connecttohost 失败 (TLS OOM / 断网 / 源 404) 不再假播。
+        // 连败 3 次 = 彻底停 (清 radioPlaying/LED/当前台), 防止"点一下永远转圈"。
+        if (ok) {
+          radioPlaying = true; currentPlayingSid = sid;
+          radioFailCnt = 0;
+          radioWasRunAt = millis();          // BUILD15: arm the >8s dead-timer from connect time (fresh-stream grace)
+          listScrollDirty = true;            // BUILD15: redraw list+playbar so display matches the station now playing (fix desync)
+          digitalWrite(STATUS_LED_PIN, HIGH);
+        } else {
+          radioFailCnt++;
+          Serial.printf("[RADIO] connect FAILED (try %d/3)\n", radioFailCnt);
+          if (radioFailCnt >= 3) {
+            radioFailCnt = 0;
+            radioPlaying = false; currentPlayingSid = -1;
+            if (!musicPlaying) digitalWrite(STATUS_LED_PIN, LOW);
+            Serial.println("[RADIO] 3x connect failed -> stopped");
+          }
+          listScrollDirty = true;            // BUILD15: refresh playbar after a failed connect (show stopped / prior state)
+        }
+      }
+    }
+  }
 
   if (showingFullscreen) {
     if (!modeDrawn[MODE_RADIO]) {
       drawRadioHeader(); drawRadioRegionSidebar(); drawRadioList(); drawRadioPlayBar(); drawStationFullscreen();
       modeDrawn[MODE_RADIO] = true;
     }
-    if (radioPlaying) audio.loop();
+    if (radioPlaying) pumpRadio();
     return;
   }
 
   if (!modeDrawn[MODE_RADIO] || modeChanged) {
     tft.fillRect(0, 0, 480, NAV_BAR_Y, COLOR_BG);
     drawRadioHeader(); drawRadioRegionSidebar(); drawRadioList(); drawRadioPlayBar();
-    modeDrawn[MODE_RADIO] = true; listScrollDirty = false;
+    modeDrawn[MODE_RADIO] = true; listScrollDirty = false; sideScrollDirty = false;
   }
+
+  // 2026-09-27: 侧栏局部刷新 (只刷 70x260 左列), startWrite/endWrite 包整段 (硬件反模式 R1)
+  if (sideScrollDirty) { tft.startWrite(); drawRadioRegionSidebar(); tft.endWrite(); sideScrollDirty = false; }
 
   if (listScrollDirty) {
     drawRadioList(); drawRadioPlayBar(); listScrollDirty = false;
   }
 
-  if (radioPlaying) audio.loop();
+  if (radioPlaying) pumpRadio();
 }
 
 // ============================================================
-// 收音机数据加载
+// 收音机数�?加�??
 // ============================================================
+// ===== 收音机数据加载 + helpers (与 make_preview.load_radio 逐站逐序一致) =====
+static void truncCopy(char* dst, int n, const uint8_t* s, int len) {
+  if (len <= n - 1) { memcpy(dst, s, len); dst[len] = 0; return; }
+  memcpy(dst, s, n - 4); dst[n - 4] = '.'; dst[n - 3] = '.'; dst[n - 2] = '.'; dst[n - 1] = 0;
+}
+static uint16_t catColor565(const char* cat) {
+  for (int i = 0; i < (int)RADIO_CATN; i++) if (strcmp(RADIO_CATNAMES[i], cat) == 0) return RADIO_CATCOLS[i];
+  return RADIO_CATCOLS[1];   // 未匹配 -> 综合色
+}
+static RadioStation* stn(int sid) { return (sid >= 0 && sid < radioStnTotal) ? &radioStn[sid] : nullptr; }
+static RadioCat*     catv(int i)  { return (i >= 0 && i < radioCatCount) ? &radioCats[i] : nullptr; }
+static int  curCount() { RadioCat* c = catv(currentCat); return c ? c->count : 0; }
+static uint16_t curSidAt(int i) { RadioCat* c = catv(currentCat); return (c && i >= 0 && i < c->count) ? c->sids[i] : 0xFFFF; }
+static RadioStation* curStnAt(int i) { RadioCat* c = catv(currentCat); return (c && i >= 0 && i < c->count) ? stn(c->sids[i]) : nullptr; }
+static const char* catLabel(int i) { RadioCat* c = catv(i); return c ? c->label : ""; }
+static const char* regionNameOf(const RadioStation* s) { return s ? s->region : ""; }
+static const char* iconChar(const RadioStation* s) { return (s && s->name[0]) ? s->name : "?"; }
+static bool isFavSid(int sid) { for (int i = 0; i < favCount; i++) if (favSids[i] == sid) return true; return false; }
+String readURLForSid(int sid) {
+  RadioStation* s = stn(sid); if (!s) return "";
+  if (s->in_bin) {
+    File f = LittleFS.open("/stations.bin", "r"); if (!f) return "";
+    f.seek(s->url_offset);
+    uint8_t nl = f.read(); f.seek(f.position() + nl);
+    uint16_t ul = f.read() | (f.read() << 8);
+    uint8_t ub[257]; f.read(ub, min(ul, (uint16_t)256)); ub[min(ul, (uint16_t)256)] = 0;
+    f.close(); return String((char*)ub);
+  }
+  int ei = (int)s->url_offset; return (ei >= 0 && ei < extraUrlCount) ? String(extraUrl[ei]) : String();
+}
 bool loadRadioDB() {
   File f = LittleFS.open("/stations.bin", "r");
   if (!f) { Serial.println(F("stations.bin not found!")); return false; }
@@ -859,7 +2261,6 @@ bool loadRadioDB() {
   uint32_t regionIdxOffset = f.read() | (f.read() << 8) | (f.read() << 16) | (f.read() << 24);
   uint32_t stationRecordsOffset = f.read() | (f.read() << 8) | (f.read() << 16) | (f.read() << 24);
   f.read();
-  Serial.printf("stations.bin: %d regions, %lu stations\n", numRegions, numStations);
   f.seek(regionIdxOffset);
   regionEntries = new RegionEntry[numRegions];
   for (uint16_t i = 0; i < numRegions; i++) {
@@ -868,72 +2269,158 @@ bool loadRadioDB() {
     regionEntries[i].count = f.read() | (f.read() << 8);
     f.seek(f.position() + 6);
   }
-  regionCount = numRegions; curRegionIdx = 0;
-  loadRegionStations(curRegionIdx);
-  radioInited = true;
+  regionCount = numRegions;
+  Serial.printf("stations.bin: %d regions, %lu stations\n", numRegions, numStations);
   f.close(); return true;
 }
-
-void loadRegionStations(int regionIdx) {
-  if (regionIdx < 0 || regionIdx >= regionCount) return;
-  File f = LittleFS.open("/stations.bin", "r");
-  if (!f) return;
-  uint32_t offset = regionEntries[regionIdx].first_offset;
-  uint16_t count = regionEntries[regionIdx].count;
-  if (curRegionStations) { delete[] curRegionStations; curRegionStations = nullptr; }
-  curRegionStations = new StationView[count]; curRegionCount = count;
-  f.seek(offset);
-  for (int i = 0; i < count; i++) {
-    uint32_t recordStart = f.position();
-    uint8_t nameLen = f.read(); uint8_t rawName[61]; f.read(rawName, nameLen); rawName[nameLen] = 0;
-    if (nameLen <= 31) memcpy(curRegionStations[i].name, rawName, nameLen + 1);
-    else { memcpy(curRegionStations[i].name, rawName, 28); curRegionStations[i].name[28]=curRegionStations[i].name[29]=curRegionStations[i].name[30]='.'; curRegionStations[i].name[31]=0; }
-    uint16_t urlLen = f.read() | (f.read() << 8); f.seek(f.position() + urlLen);
-    curRegionStations[i].region_idx = f.read();
-    uint8_t catLen = f.read(); f.seek(f.position() + catLen);
-    uint8_t freqLen = f.read(); uint8_t rawFreq[21]; f.read(rawFreq, freqLen); rawFreq[freqLen] = 0;
-    if (freqLen <= 12) memcpy(curRegionStations[i].freq, rawFreq, freqLen + 1);
-    else { memcpy(curRegionStations[i].freq, rawFreq, 12); curRegionStations[i].freq[12] = 0; }
-    curRegionStations[i].r = f.read(); curRegionStations[i].g = f.read(); curRegionStations[i].b = f.read();
-    curRegionStations[i].bin_offset = recordStart;
+// ---- 定位省份(完整名) -> regionCat 键: geo::pinned() 非空则用之, 否则退回 RPINNED(兜底"广东")。
+// 注意: 键必须与 stations.bin 的完整省名一致(黑龙江/内蒙古), 显示 2 字缩写由 labelOf 负责。----
+static const char* radioPinnedKey() {
+  const char* p = geo::pinned();
+  return (p && p[0]) ? p : RPINNED;
+}
+// 重建收音机分类 (全部/收藏/历史/个人 + 地区)。地区顺序镜像 mobile getCategoryList():
+// RHEAD(4) -> 置顶省(若不在 RHEAD/RORDER 则插到 RHEAD 后) -> RORDER(跳过已置顶) -> RTAIL(2)。
+// 联网定位到省份后可再调一次重建, 让置顶省(完整名)正确出现在列表中 (与 preview 一致)。
+static void buildRadioCats() {
+  // 释放旧 sids (避免重复构建时 PSRAM 泄漏)
+  for (int i = 0; i < radioCatCount; i++) { if (radioCats[i].sids) heap_caps_free(radioCats[i].sids); }
+  radioCatCount = 0;
+  auto addCat = [&](const char* label, const char* key, bool meta, const uint16_t* seq, int n) {
+    if (radioCatCount >= RMAX_CATS) return;
+    RadioCat& c = radioCats[radioCatCount];
+    truncCopy(c.label, sizeof(c.label), (const uint8_t*)label, (int)strlen(label));
+    truncCopy(c.key, sizeof(c.key), (const uint8_t*)key, (int)strlen(key));
+    c.meta = meta; c.count = n;
+    c.sids = (n > 0) ? (uint16_t*)ps_malloc((size_t)n * 2) : nullptr;
+    if (c.sids && seq) memcpy(c.sids, seq, (size_t)n * 2);
+    radioCatCount++;
+  };
+  addCat(RLBL[0], RLBL[0], true, allSeq, allCount);
+  addCat(RLBL[1], RLBL[1], true, favSids, favCount);
+  addCat(RLBL[2], RLBL[2], true, histSids, histCount);
+  static uint16_t userSeq[16]; int userN = 0;
+  for (int e = 0; e < extraCount; e++) if (stn(radioBinTotal + e) && stn(radioBinTotal + e)->is_user) userSeq[userN++] = radioBinTotal + e;
+  addCat(RLBL[3], RLBL[3], true, userSeq, userN);
+  // 2 字缩写: 电视伴音->伴音 / 黑龙江->龙江 / 内蒙古->内蒙 (镜像 mobile labelMap)
+  auto labelOf = [](const char* key) -> const char* {
+    if (strcmp(key, "电视伴音") == 0) return "伴音";
+    if (strcmp(key, "黑龙江") == 0) return "龙江";
+    if (strcmp(key, "内蒙古") == 0) return "内蒙";
+    return key;
+  };
+  auto regionCat = [&](const char* key) {
+    static uint16_t rc[RMAX_ALL]; int n = 0;
+    for (int i = 0; i < radioBinTotal; i++) { RadioStation* s = stn(allSeq[i]); if (s && strcmp(s->region, key) == 0) rc[n++] = allSeq[i]; }   // 仅 channels(1652), 与 preview region_cats 一致
+    addCat(labelOf(key), key, false, rc, n);
+  };
+  const char* pinned = radioPinnedKey();
+  strlcpy(radioPinnedUsed, pinned, sizeof(radioPinnedUsed));   // 记录本次用的置顶省名, loop 比对用
+  for (int i = 0; i < 4; i++) regionCat(RHEAD[i]);
+  if (strcmp(pinned, RHEAD[0]) != 0 && strcmp(pinned, RHEAD[1]) != 0 && strcmp(pinned, RHEAD[2]) != 0 && strcmp(pinned, RHEAD[3]) != 0)
+    regionCat(pinned);
+  for (int i = 0; i < RORDER_N; i++) if (strcmp(RORDER[i], pinned) != 0) regionCat(RORDER[i]);
+  for (int i = 0; i < 2; i++) regionCat(RTAIL[i]);
+}
+bool loadRadioMeta() {
+  File f = LittleFS.open("/radio_meta.bin", "r");
+  if (!f) { Serial.println(F("radio_meta.bin not found")); return false; }
+  uint8_t magic[9]; f.read(magic, 8); magic[8] = 0;
+  if (strcmp((char*)magic, "ESP32RDT") != 0 || f.read() != 1) { Serial.println(F("radio_meta bad")); f.close(); return false; }
+  uint16_t binTotal   = f.read() | (f.read() << 8);
+  extraCount = f.read() | (f.read() << 8);   // 写入全局 extraCount, buildRadioCats() 用
+  f.read(); f.read();                 // userCount (skip)
+  uint16_t favCnt     = f.read() | (f.read() << 8);
+  uint16_t histCnt    = f.read() | (f.read() << 8);
+  uint16_t allCnt     = f.read() | (f.read() << 8);
+  f.read();                            // reserved (skip)
+  radioBinTotal = binTotal;
+  // PSRAM heap on this board is mapped near 0x3D9xxxxx (NOT 0x3C000000).
+  // heap_caps_malloc(MALLOC_CAP_SPIRAM) returns a valid PSRAM pointer (same path as fonts).
+  radioStn = (RadioStation*)heap_caps_malloc((size_t)RMAX_STN * sizeof(RadioStation), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!radioStn) {
+    Serial.printf("radioStn PSRAM alloc failed (need %uKB, free %uKB)\n",
+                  (unsigned)((size_t)RMAX_STN * sizeof(RadioStation)) / 1024,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+    f.close(); return false;
   }
+  uint16_t* all  = (uint16_t*)ps_malloc((size_t)allCnt * 2);
+  uint16_t* fav  = (uint16_t*)ps_malloc((size_t)favCnt * 2);
+  uint16_t* hist = (uint16_t*)ps_malloc((size_t)histCnt * 2);
+  if (!all || !fav || !hist) { f.close(); return false; }
+  for (int i = 0; i < allCnt; i++) all[i] = f.read() | (f.read() << 8);
+  for (int i = 0; i < favCnt; i++) fav[i] = f.read() | (f.read() << 8);
+  for (int i = 0; i < histCnt; i++) hist[i] = f.read() | (f.read() << 8);
+  radioStnTotal = 0;
+  for (uint16_t ri = 0; ri < regionCount && radioStnTotal < RMAX_STN; ri++) {
+    File sf = LittleFS.open("/stations.bin", "r"); if (!sf) break;
+    sf.seek(regionEntries[ri].first_offset);
+    for (uint16_t c = 0; c < regionEntries[ri].count && radioStnTotal < RMAX_STN; c++) {
+      uint32_t recStart = sf.position();
+      uint8_t nl = sf.read(); uint8_t rn[41]; sf.read(rn, nl); rn[nl] = 0;
+      uint16_t ul = sf.read() | (sf.read() << 8); sf.seek(sf.position() + ul);
+      uint8_t ridx = sf.read();
+      uint8_t cl = sf.read(); uint8_t rc[13]; sf.read(rc, cl); rc[cl] = 0;
+      uint8_t fl = sf.read(); uint8_t rf[21]; sf.read(rf, fl); rf[fl] = 0;
+      RadioStation& s = radioStn[radioStnTotal];
+      truncCopy(s.name, sizeof(s.name), rn, nl);
+      truncCopy(s.freq, sizeof(s.freq), rf, fl);
+      memcpy(s.region, regionEntries[ridx].name, 17);
+      truncCopy(s.cat, sizeof(s.cat), rc, cl);
+      s.r = sf.read(); s.g = sf.read(); s.b = sf.read();
+      s.is_user = false; s.in_bin = true; s.url_offset = recStart; radioStnTotal++;
+    }
+    sf.close();
+  }
+  for (int e = 0; e < extraCount && radioStnTotal < RMAX_STN; e++) {
+    uint8_t nl = f.read(); uint8_t rn[41]; f.read(rn, nl); rn[nl] = 0;
+    uint16_t ul = f.read() | (f.read() << 8); uint8_t ur[257]; f.read(ur, min(ul, (uint16_t)256)); ur[min(ul, (uint16_t)256)] = 0;
+    uint8_t rl = f.read(); uint8_t rr[18]; f.read(rr, rl); rr[rl] = 0;
+    uint8_t cl = f.read(); uint8_t rc[13]; f.read(rc, cl); rc[cl] = 0;
+    uint8_t fl = f.read(); uint8_t rf[17]; f.read(rf, fl); rf[fl] = 0;
+    uint8_t r = f.read(), g = f.read(), bb = f.read(); uint8_t isUser = f.read();
+    if (extraUrlCount < RMAX_EXTRA) { memcpy(extraUrl[extraUrlCount], (char*)ur, min(ul, (uint16_t)259)); extraUrlCount++; }
+    RadioStation& s = radioStn[radioStnTotal];
+    truncCopy(s.name, sizeof(s.name), rn, nl);
+    truncCopy(s.freq, sizeof(s.freq), rf, fl);
+    truncCopy(s.region, sizeof(s.region), rr, rl);
+    truncCopy(s.cat, sizeof(s.cat), rc, cl);
+    s.r = r; s.g = g; s.b = bb; s.is_user = (isUser != 0);
+    s.in_bin = false; s.url_offset = extraUrlCount - 1; radioStnTotal++;
+  }
+  memcpy(allSeq, all, (size_t)allCnt * 2); allCount = allCnt;
+  memcpy(favSids, fav, (size_t)favCnt * 2); favCount = favCnt;
+  memcpy(histSids, hist, (size_t)histCnt * 2); histCount = histCnt;
+  buildRadioCats();
   f.close();
+  Serial.printf("radio_meta: %d stn, %d cats, %d all, %d fav, %d hist\n", radioStnTotal, radioCatCount, allCount, favCount, histCount);
+  radioInited = true; return true;
 }
-
-String readStationURL(uint32_t binOffset) {
-  File f = LittleFS.open("/stations.bin", "r");
-  if (!f) return "";
-  f.seek(binOffset);
-  uint8_t nameLen = f.read(); f.seek(f.position() + nameLen);
-  uint16_t urlLen = f.read() | (f.read() << 8);
-  uint8_t urlBuf[257]; f.read(urlBuf, min(urlLen, (uint16_t)256));
-  urlBuf[min(urlLen, (uint16_t)256)] = 0; f.close();
-  return String((char*)urlBuf);
-}
-
-void playStationAt(int listIdx) {
-  if (listIdx < 0 || listIdx >= curRegionCount) return;
-  if (currentPlayingIdx == listIdx && radioPlaying) return;
-  String url = readStationURL(curRegionStations[listIdx].bin_offset);
+void playStationAt(int sid) {
+  RadioStation* s = stn(sid); if (!s) return;
+  if (currentPlayingSid == sid && radioPlaying) return;
+  String url = readURLForSid(sid);
   if (url.length() == 0) return;
-  if (radioPlaying) audio.stopSong();
+  // 延迟起播: 双击窗口(RADIO_DBL_MS)关闭后, 由 modeRadio() 真正连流(见下方刷入)。
+  // audio.connecttohost() 阻塞(连流要几秒), 若点下就立刻连会吞掉双击窗口,
+  // 使"双击正在播放的电台"的第二下被当成新单击, 打不开播放界面(全屏)。
   musicPlaying = false;               // 点电台 -> 停掉节日音乐 (收音机优先)
-  Serial.printf("Playing [%d]: %s\n", listIdx, curRegionStations[listIdx].name);
-  audio.connecttohost(url.c_str());
-  radioPlaying = true; currentPlayingIdx = listIdx;
-  digitalWrite(STATUS_LED_PIN, HIGH);
+  pendingPlaySid = sid; pendingPlayAt = millis();
 }
+void stopRadio() { audio.stopSong(); radioPlaying = false; currentPlayingSid = -1; digitalWrite(STATUS_LED_PIN, LOW); }
 
-void stopRadio() { audio.stopSong(); radioPlaying = false; digitalWrite(STATUS_LED_PIN, LOW); }
+
+
+
 
 // ============================================================
-// 节日/节气 音乐 (网络流, 与收音机同一路径, 不占 flash)
-// 注意: 与收音机共用同一个 audio 解码器, 二者互斥; 收音机始终优先。
+// 节日/节气 音乐 (网络�? 与收音机同一�?�?, 不占 flash)
+// 注意: 与收音机共用同一�?audio 解码�? 二�?�互�? 收音机�?�终优先�?
 // ============================================================
-// 音乐 URL 配置来自 LittleFS 文件 /festival.json (用 `pio run -t uploadfs`
-// 上传, 改配置无需重新编译固件, 改完上传后重启即可生效):
-//   { "festival_music": { "春节": "http://...", "冬至": "http://..." } }
-//   URL 为空 = 该事件不播音乐。文件缺失/损坏 = 不播 (显示不受影响)。
+// 音乐 URL 配置来自 LittleFS 文件 /festival.json (�?`pio run -t uploadfs`
+// 上传, 改配�?无需重新编译固件, 改完上传后重�?即可生�??:
+//   { "festival_music": { "春节": "http://...", "元旦": "http://..." } }
+//   URL 为空 = 该事件不�?音乐。文件缺�?损坏 = 不播 (显示不受影响)�?
 JsonDocument festivalDoc;
 
 void loadFestivalConfig() {
@@ -954,13 +2441,13 @@ static String festivalUrl(const char* name) {
   return String(v.as<String>());
 }
 
-// 当天事件名: 优先节日, 其次节气(仅节气当天), 无则空
+// 当天事件�? 优先节日, 其�?�节�?(仅节气当�?, 无则�?
 static String todayEventName(int year, int mon, int mday) {
   int ld[31]; nl_month_days(year, mon, ld);
   int v = ld[mday - 1];
   int lm = v / 100, ldn = v % 100;
   bool isLeap = (lm > 100); if (isLeap) lm -= 100;
-  int ly = year; if (lm >= 10 && mon <= 2) ly--;   // 春节前取前一年 (与 drawDateRow 一致)
+  int ly = nl_zodiac_year(year, mon, mday);   // 干支/生肖�?(按春节分�? �?drawDateRow �?�?
   char fest[16] = "";
   nl_festival(year, mon, mday, ly, lm, ldn, isLeap ? 1 : 0, fest, sizeof(fest));
   if (fest[0]) return String(fest);
@@ -970,7 +2457,7 @@ static String todayEventName(int year, int mon, int mday) {
   return String();
 }
 
-// 每天只跑一次: 有音乐配置且已联网且收音机未在播 -> 开播; 无事件则停掉昨天的流
+// 每天�?跑一�? 有音乐配�?且已联网且收音机�?在播 -> �?�? 无事件则停掉昨天的流
 void checkFestivalMusic(int year, int mon, int mday) {
   static int lastY = -1, lastM = -1, lastD = -1;
   if (year == lastY && mon == lastM && mday == lastD) return;
@@ -985,12 +2472,24 @@ void checkFestivalMusic(int year, int mon, int mday) {
     return;
   }
   String url = festivalUrl(ev.c_str());
-  if (url.length() == 0) return;      // 未配置该事件的音乐
+  if (url.length() == 0) return;      // �?配置该事件的音�??
   if (!wifiConnected) return;         // 离线不播 (显示不受影响)
-  if (radioPlaying) return;           // 收音机优先
+  if (radioPlaying) return;           // 收音机优�?
+  // BUILD14 失败重试: 开播失败(HTTPS TLS OOM 等) 15s 后再试, 最多 3 次, 跨日重置。
+  // 旧版失败一次就永远不播 (元旦是 HTTPS, 常因内部 RAM 紧张 esp-aes 分配失败)。
+  static unsigned long fmsAt = 0; static int fmsTries = 0; static int fmsKey = -100;
+  int key = year * 10000 + mon * 100 + mday;
+  if (key != fmsKey) { fmsKey = key; fmsTries = 0; fmsAt = 0; }
+  if (fmsTries >= 3 || (fmsAt && millis() - fmsAt < 15000)) return;
   audio.stopSong();
-  Serial.printf("Festival music: %s -> %s\n", ev.c_str(), url.c_str());
-  audio.connecttohost(url.c_str());
+  Serial.printf("Festival music: %s -> %s (try %d)\n", ev.c_str(), url.c_str(), fmsTries + 1);
+  bool fok = audio.connecttohost(url.c_str());
+  if (!fok) {
+    fmsTries++;
+    Serial.printf("[Fest] play FAILED (try %d/3)\n", fmsTries);
+    return;
+  }
+  fmsTries = 0; fmsAt = millis();
   musicPlaying = true;
   digitalWrite(STATUS_LED_PIN, HIGH);
 }
@@ -998,42 +2497,7 @@ void checkFestivalMusic(int year, int mon, int mday) {
 // ============================================================
 // 收藏
 // ============================================================
-void loadFavorites() {
-  File f = LittleFS.open("/favorites.bin", "r");
-  if (!f) { favoriteCount = 0; return; }
-  favoriteCount = 0;
-  while (f.available() && favoriteCount < MAX_FAVORITES) {
-    uint32_t off = f.read() | (f.read() << 8) | (f.read() << 16) | (f.read() << 24);
-    favorites[favoriteCount++] = off;
-  }
-  f.close();
-  Serial.printf("Loaded %d favorites\n", favoriteCount);
-}
 
-void saveFavorites() {
-  File f = LittleFS.open("/favorites.bin", "w");
-  if (!f) return;
-  for (int i = 0; i < favoriteCount; i++) {
-    uint32_t off = favorites[i];
-    f.write(off & 0xFF); f.write((off >> 8) & 0xFF); f.write((off >> 16) & 0xFF); f.write((off >> 24) & 0xFF);
-  }
-  f.close();
-}
-
-bool isFavorited(uint32_t binOffset) {
-  for (int i = 0; i < favoriteCount; i++) if (favorites[i] == binOffset) return true;
-  return false;
-}
-
-void toggleFavorite(uint32_t binOffset) {
-  for (int i = 0; i < favoriteCount; i++) {
-    if (favorites[i] == binOffset) {
-      for (int j = i; j < favoriteCount - 1; j++) favorites[j] = favorites[j+1];
-      favoriteCount--; saveFavorites(); return;
-    }
-  }
-  if (favoriteCount < MAX_FAVORITES) { favorites[favoriteCount++] = binOffset; saveFavorites(); }
-}
 
 // ============================================================
 // Audio 回调
@@ -1048,39 +2512,40 @@ void audio_showstreamtitle(const char* info) { Serial.printf("stream: %s\n", inf
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("ESP32-S3 Smart Radio Starting...");
+  Serial.println("ESP32-S3 Smart Radio Starting... BUILD23-YIJI-FEST");
 
-  // ================== 上电自检 (BOOT SELF-TEST) ==================
-  // 用 TFT_eSPI 内置字体(不依赖 LittleFS / 自定义 XFont)在屏幕上逐步显示,
-  // 这样在没有串口监视器时也能直接看出黑屏停在哪一步。
+  // ================== 上电�?�? (BOOT SELF-TEST) ==================
+  // �?TFT_eSPI 内置字体(不依�?LittleFS / �?定�??XFont)在屏幕上逐�?�显�?,
+  // 这样在没有串口监视器时也能直接看出黑屏停在哪�?步�??
   initTFT();
-  tft.setTextFont(2);                 // 内置 16px 字体 (User_Setup.h 中 LOAD_FONT2)
+  tft.setTextFont(2);                 // 内置 16px 字体 (User_Setup.h �?LOAD_FONT2)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(0, 0);
   tft.println("ESP32-S3 Radio");
   tft.println("Boot self-test...");
 
-  // 1) 文件系统 (黑屏最常见原因: 未烧录文件系统 uploadfs)
+  // 1) 文件系统 (黑屏�?常�?�原�?: �?烧录文件系�??uploadfs)
   bool fsOk = LittleFS.begin();
   Serial.printf("LittleFS: %s\n", fsOk ? "OK" : "FAIL");
   tft.print("FS: ");
   if (fsOk) tft.print(String(LittleFS.totalBytes() / 1024)); else tft.print("FAIL");
   tft.println(" KB");
 
-  // 1b) 节日/节气 音乐配置 (可选, 缺失/损坏则不播)
+  // 1b) 节日/节气 音乐配置 (�?�? 缺失/损坏则不�?
   if (fsOk) loadFestivalConfig();
 
-  // 1c) 时钟样式 (NVS 持久化: 翻页 / 指针, 点击时钟页可切换)
+  // 1c) 时钟样式 (NVS 持久�? 翻页 / 指针, 点击时钟页可切换)
   clockStyle = getClockStyle();
   Serial.printf("clock style: %s\n", clockStyle == STYLE_FLAP ? "flap" : "analog");
 
   // 2) 触摸
   initTouch();
 
-  // 3) 中文字库 (加载失败 -> 后续所有中文都是空白, 看起来像黑屏)
+  // 3) �?文字�? (加载失败 -> 后续�?有中文都�?空�?? 看起来像黑屏)
   bool f16 = font16.reInit("/font_simhei_16.font");
   bool f24 = font24.reInit("/font_simhei_24.font");
-  Serial.printf("font16: %s  font24: %s\n", f16 ? "OK" : "FAIL", f24 ? "OK" : "FAIL");
+  bool f32 = font32.reInit("/font_simhei_64.font");
+  Serial.printf("font16: %s  font24: %s  font32: %s\n", f16 ? "OK" : "FAIL", f24 ? "OK" : "FAIL", f32 ? "OK" : "FAIL");
   tft.print("Font16: "); tft.println(f16 ? "OK" : "MISSING");
   tft.print("Font24: "); tft.println(f24 ? "OK" : "MISSING");
 
@@ -1106,17 +2571,20 @@ void setup() {
     tft.println("FAIL");
   }
 
-  // 5) 电台数据库 (bad format / 内存不足时 new[] 会崩溃)
+  // 4b) 节假�?放假/补班) 同�??: 加载缓存; 联网后由 loop 里的 tick() 定时同�??
+  holiday::init();
+  geo::init();   // geo: IP-locate province for radio sidebar pin (cache read; tick() fetches after wifi)
+
+  // 5) 电台数据�?(bad format / 内存不足�?new[] 会崩�?
   Serial.println("Loading radio DB...");
   bool dbOk = loadRadioDB();
-  if (dbOk) tft.printf("%d reg / %d stn\n", regionCount, curRegionCount);
+  bool metaOk = loadRadioMeta();
+  if (dbOk && metaOk) tft.printf("%d cat / %d stn\n", radioCatCount, radioStnTotal);
   else tft.println("DB: MISSING");
-  Serial.printf("DB regions=%d\n", regionCount);
-
-  loadFavorites();
+  Serial.printf("DB cats=%d stn=%d\n", radioCatCount, radioStnTotal);
   audio.setPinout(I2S_BCK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
   audio.setBufsize(16384, 65536);
-  audio.setConnectionTimeout(200, 2000);
+  audio.setConnectionTimeout(2000, 2000);   // BUILD15: 200ms TCP-connect timeout was too short for cross-region radio servers (false "no response"); 2s for plain HTTP
 
   tft.println("READY - start main UI");
   Serial.println("Setup done.");
@@ -1125,101 +2593,106 @@ void setup() {
 
 void loop() {
   handleTouch();
+  holiday::tick();   // 节假�? 联网后�?��?�同�?+ �?24h + 浏�?�补同�??
+  geo::tick();   // geo: locate province after wifi; refresh every 24h (non-blocking fetch)
+  // Re-pin radio cats once the geolocated province becomes available / changes (mobile: pinnedProvince).
+  // Compare against the key used at last build; if different, rebuild cats + repaint both panes.
+  if (radioInited && currentMode == MODE_RADIO &&
+      strcmp(radioPinnedKey(), radioPinnedUsed) != 0) {
+    buildRadioCats();
+    if (currentCat >= radioCatCount) currentCat = 0;   // old index may be out of range after rebuild
+    tft.startWrite(); drawRadioRegionSidebar(); tft.endWrite();   // R1: wrap sidebar partial-refresh
+    drawRadioList(); drawRadioPlayBar();   // repaint right pane (list + playbar)
+  }
+
   switch (currentMode) {
     case MODE_CLOCK: modeClock(); break;
     case MODE_CALENDAR: modeCalendar(); break;
     case MODE_RADIO: modeRadio(); break;
     case MODE_WEATHER: modeWeather(); break;
   }
-  // 节日音乐在任意界面都继续播 (收音机只在 modeRadio 内泵送, 此处不重复)
-  if (musicPlaying) audio.loop();
+  // fix(2026-09-25): modeChanged 必须在每帧末尾清掉。旧版 loop() 忘了清
+  // -> 每个 mode 的 `if (!modeDrawn[i] || modeChanged)` 每帧(~1000+ FPS)都整页重绘
+  // -> 全屏闪烁(导航栏用 navDirty 不受影响)。与 preview 无关(预览整帧原子渲染)。
+  modeChanged = false;
+  // BUILD17: leaving the clock page -> free the active style's render buffers so the internal heap's
+  // largest contiguous block grows to ~200KB for the HTTPS radio TLS handshake. Re-alloc happens in
+  // modeClock's first-entry branch on return (one-shot, cheap). Guarded so we don't free every frame
+  // once everything is already null.
+  if (currentMode != MODE_CLOCK &&
+      (analogFace || analogFaceCache || cardSram || rollerSram || bandSram || bandBuf || flapTmp)) {
+    freeClockBufs();
+  }
+  // 节日音乐在任意界面都继续�?(收音机只�?modeRadio 内泵�? 此�?�不重�??
+  if (musicPlaying) {
+    if (!audio.isRunning()) {   // BUILD14: 节日流死 -> 停 (checkFestivalMusic 负责重试)
+      musicPlaying = false;
+      if (!radioPlaying) digitalWrite(STATUS_LED_PIN, LOW);
+    } else audio.loop();
+  }
 
-  // 只在 modeChanged 时重绘导航栏, 消除每帧重绘引起的闪烁
-  if (modeChanged) { drawNavBar(); modeChanged = false; }
+  // �?�?"导航选中项变�?(navDirty)时重绘�?�航�?: 既避免每帧重绘的�?�?, 也避免时钟样�?
+  // 切换(不改变�?�中�?时�??重绘导航栏�?�成的彩色撕裂竖条�??
+  if (navDirty) { drawNavBar(); navDirty = false; }
 }
 // ============================================================
 // handleRadioTap: 处理收音机模式的点击事件 (滚动已在 handleTouch 处理)
 // ============================================================
 void handleRadioTap(uint16_t tx, uint16_t ty) {
-  // 侧边栏分类
+  // 全屏: 点任意处关闭
+  if (showingFullscreen) { showingFullscreen = false; modeDrawn[MODE_RADIO] = false; return; }
+  // 侧边栏 (固定 4 行 + 可滚动地区行)
   if (tx < RADIO_SIDEBAR_W) {
-    int regionY = ty - RADIO_HEADER_H;
-    if (regionY >= 0) {
-      int clicked = regionScrollTop + (regionY / 18);
-      if (clicked >= 0 && clicked < regionCount && clicked != curRegionIdx) {
-        curRegionIdx = clicked;
-        loadRegionStations(curRegionIdx);
-        listScrollTop = 0;
-        listScrollDirty = true;
-        modeDrawn[MODE_RADIO] = false;
-      }
+    // 2026-09-27: 侧栏整列(固定4行+地区行)一起滚动, regionScrollTop = 像素偏移
+    int S = regionScrollTop;
+    int top = RADIO_HEADER_H - S;
+    int boundary = RADIO_REGION_TOP - S;   // 地区行顶端 (随滚动移动)
+    int idx = -1;
+    if (ty < boundary) {
+      if (ty >= top) idx = (ty - top) / RADIO_SPECIAL_H;
+    } else if (ty >= boundary) {
+      idx = RADIO_SPECIAL_CNT + (ty - boundary) / RADIO_ROW_H_SIDE;
+    }
+    if (idx >= 0 && idx < radioCatCount && idx != currentCat) {
+      currentCat = idx; listScrollTop = 0; modeDrawn[MODE_RADIO] = false;
     }
     return;
   }
-
-  // 播放栏按钮
+  // 播放栏 (三键: 上一 cx0-45 / 播放 cx0 / 下一 cx0+45, 各宽 ~44)
   if (ty >= RADIO_LIST_BOT && ty < NAV_BAR_Y) {
-    int barX = RADIO_LIST_X, barW = RADIO_LIST_W;
-    if (tx >= barX && tx < barX + barW) {
+    int barX = RADIO_LIST_X, cx0 = barX + RADIO_LIST_W / 2;
+    if (tx >= barX && tx < barX + RADIO_LIST_W) {
       int relX = tx - barX;
-      if (relX < 36) {
-        // 收藏
-        if (currentPlayingIdx >= 0) {
-          toggleFavorite(curRegionStations[currentPlayingIdx].bin_offset);
-          listScrollDirty = true;
-        }
-      } else if (relX < 76) {
-        // 上一台
-        if (currentPlayingIdx > 0) playStationAt(currentPlayingIdx - 1);
-      } else if (relX < 116) {
-        // 播放/暂停
-        if (radioPlaying) stopRadio();
-        else if (currentPlayingIdx >= 0) playStationAt(currentPlayingIdx);
-        listScrollDirty = true;
-      } else if (relX < 156) {
-        // 下一台
-        if (currentPlayingIdx < curRegionCount - 1) playStationAt(currentPlayingIdx + 1);
-      }
+      int pos = -1;
+      if (currentPlayingSid >= 0) for (int i = 0; i < curCount(); i++) if (curSidAt(i) == currentPlayingSid) { pos = i; break; }
+      if (relX >= cx0 - 68 && relX <= cx0 - 22 && pos > 0) playStationAt(curSidAt(pos - 1));      // 上一
+      else if (relX >= cx0 - 15 && relX <= cx0 + 15) { if (radioPlaying) stopRadio(); else if (pos >= 0) playStationAt(curSidAt(pos)); modeDrawn[MODE_RADIO] = false; }  // 播放/暂停
+      else if (relX >= cx0 + 22 && relX <= cx0 + 68 && pos >= 0 && pos < curCount() - 1) playStationAt(curSidAt(pos + 1));  // 下一
     }
     return;
   }
-
-  // 滚动条点击 → 跳转
-  if (ty >= RADIO_LIST_TOP && ty < RADIO_LIST_BOT &&
-      tx >= RADIO_LIST_X + RADIO_LIST_W && tx < RADIO_LIST_X + RADIO_LIST_W + RADIO_SCROLLBAR_W) {
-    int scrollRange = max(1, curRegionCount - RADIO_STATION_ROWS);
+  // 滚动条点击跳转
+  if (ty >= RADIO_LIST_TOP && ty < RADIO_LIST_BOT && tx >= RADIO_LIST_X + RADIO_LIST_W && tx < RADIO_LIST_X + RADIO_LIST_W + RADIO_SCROLLBAR_W) {
+    int count = curCount();
+    int scrollRange = max(1, count - RADIO_STATION_ROWS);
     int listH = RADIO_LIST_BOT - RADIO_LIST_TOP;
     int scrollPos = (ty - RADIO_LIST_TOP) * scrollRange / listH;
-    scrollPos = constrain(scrollPos, 0, max(0, curRegionCount - RADIO_STATION_ROWS));
-    if (scrollPos != listScrollTop) {
-      listScrollTop = scrollPos;
-      listScrollDirty = true;
-    }
+    scrollPos = constrain(scrollPos, 0, max(0, count - RADIO_STATION_ROWS));
+    if (scrollPos != listScrollTop) { listScrollTop = scrollPos; listScrollDirty = true; }
     return;
   }
-
-  // 全屏模式下点击 → 关闭
-  if (showingFullscreen) {
-    showingFullscreen = false;
-    modeDrawn[MODE_RADIO] = false;
-    return;
-  }
-
-  // 列表区域: 单击播放, 双击全屏
+  // 列表: 单击播放, 双击全屏
   if (ty >= RADIO_LIST_TOP && ty < RADIO_LIST_BOT && tx >= RADIO_LIST_X) {
     int listY = ty - RADIO_LIST_TOP;
-    int rowIdx = listScrollTop + (listY / RADIO_ROW_H);
-    if (rowIdx >= 0 && rowIdx < curRegionCount) {
+    int rowIdx = listScrollTop + listY / RADIO_ROW_H;
+    if (rowIdx >= 0 && rowIdx < curCount()) {
       unsigned long now = millis();
-      if (now - lastTapTime < 350 && lastTapRow == rowIdx) {
-        showingFullscreen = true;
-        modeDrawn[MODE_RADIO] = false;
-      } else {
-        playStationAt(rowIdx);
-        listScrollDirty = true;
-      }
-      lastTapTime = now;
-      lastTapRow = rowIdx;
+      if (now - lastTapTime < RADIO_DBL_MS && lastTapRow == rowIdx) {
+        showingFullscreen = true; pendingPlaySid = -1; modeDrawn[MODE_RADIO] = false;   // 双击 -> 播放界面, 取消延迟起播
+        Serial.printf("[DBG-T] DOUBLETAP row=%d dt=%lu -> fullscreen (pendingPlay cancelled)\n", rowIdx, now - lastTapTime);
+      } else { playStationAt(curSidAt(rowIdx)); listScrollDirty = true;
+        Serial.printf("[DBG-T] singletap row=%d dt=%lu lastRow=%d -> pendingPlay sid=%d\n", rowIdx, now - lastTapTime, lastTapRow, pendingPlaySid); }
+      lastTapTime = now; lastTapRow = rowIdx;
     }
     return;
   }
@@ -1227,251 +2700,238 @@ void handleRadioTap(uint16_t tx, uint16_t ty) {
 
 void drawRadioHeader() {
   tft.fillRect(0, 0, 480, RADIO_HEADER_H, 0x1042);
-
-  char title[40];
-  snprintf(title, sizeof(title), "收音机 · %s (%d台)",
-           regionEntries[curRegionIdx].name, curRegionCount);
+  const char* label = catLabel(currentCat);
+  int cnt = curCount();
+  char title[64];
+  snprintf(title, sizeof(title), "收音机· %s (%d)", label ? label : "无", cnt);
   font16.drawString(6, 6, title, TFT_WHITE, 0x1042);
-
   if (wifiConnected) {
     String ip = WiFi.localIP().toString();
     font16.drawString(470 - font16.textWidth(ip.c_str()), 6, ip.c_str(), COLOR_DIM, 0x1042);
   } else {
-    font16.drawString(470 - 48, 6, "未联网", TFT_RED, 0x1042);
+    font16.drawString(470 - 48, 6, "无网络", TFT_RED, 0x1042);
   }
-
-  tft.drawFastVLine(RADIO_SIDEBAR_W - 1, RADIO_HEADER_H, RADIO_LIST_BOT - RADIO_HEADER_H, 0x3186);
+  tft.drawFastVLine(RADIO_SIDEBAR_W - 1, RADIO_HEADER_H, NAV_BAR_Y - RADIO_HEADER_H, 0x3186);
 }
 
 void drawRadioRegionSidebar() {
-  int y = RADIO_HEADER_H;
-  int visibleCount = (RADIO_LIST_BOT - RADIO_HEADER_H) / 18;
-
-  tft.fillRect(0, RADIO_HEADER_H, RADIO_SIDEBAR_W, RADIO_LIST_BOT - RADIO_HEADER_H, 0x0821);
-
-  for (int i = 0; i < visibleCount && (regionScrollTop + i) < regionCount; i++) {
-    int idx = regionScrollTop + i;
-    const char* name = regionEntries[idx].name;
-    uint16_t bg = (idx == curRegionIdx) ? 0x210C : 0x0821;
-    uint16_t fg = (idx == curRegionIdx) ? TFT_YELLOW : COLOR_DIM;
-
-    tft.fillRect(0, y, RADIO_SIDEBAR_W - 1, 18, bg);
-    if (idx == curRegionIdx) {
-      tft.drawFastVLine(0, y, 18, TFT_YELLOW);
-    }
-    font16.drawString(4, y + 2, name, fg, bg);
-    y += 18;
+  // 2026-09-27: 侧栏整列(固定4行+地区行)一起滚动, 像素级; 行裁剪到视口 (28..288)。
+  tft.fillRect(0, RADIO_HEADER_H, RADIO_SIDEBAR_W, NAV_BAR_Y - RADIO_HEADER_H, 0x0821);
+  int S = regionScrollTop;                 // 像素偏移 (0..smax)
+  int top = RADIO_HEADER_H - S;
+  for (int i = 0; i < radioCatCount; i++) {
+    int rh = (i < RADIO_SPECIAL_CNT) ? RADIO_SPECIAL_H : RADIO_ROW_H_SIDE;
+    int base = (i < RADIO_SPECIAL_CNT) ? i * RADIO_SPECIAL_H
+                                       : RADIO_SPECIAL_CNT * RADIO_SPECIAL_H + (i - RADIO_SPECIAL_CNT) * RADIO_ROW_H_SIDE;
+    int ry = top + base;
+    int y0 = (ry > RADIO_HEADER_H) ? ry : RADIO_HEADER_H;
+    int fy1 = (ry + rh - 1 < NAV_BAR_Y - 1) ? ry + rh - 1 : NAV_BAR_Y - 1;
+    if (fy1 < y0) continue;
+    bool sel = (i == currentCat);
+    uint16_t bg = sel ? 0x210C : 0x0821;
+    uint16_t fg = sel ? TFT_RED : COLOR_DIM;
+    tft.fillRect(0, y0, RADIO_SIDEBAR_W - 2, fy1 - y0 + 1, bg);
+    if (sel) tft.drawFastVLine(0, y0, fy1 - y0 + 1, TFT_RED);
+    int tyy = ry + (rh - 16) / 2;
+    if (tyy >= y0 && tyy + 16 - 1 <= fy1)
+      font16.drawString(4, tyy, catLabel(i), fg, bg);
   }
-
-  tft.drawFastVLine(RADIO_SIDEBAR_W - 1, RADIO_HEADER_H, RADIO_LIST_BOT - RADIO_HEADER_H, 0x3186);
+  tft.drawFastVLine(RADIO_SIDEBAR_W - 1, RADIO_HEADER_H, NAV_BAR_Y - RADIO_HEADER_H, 0x3186);
+  // 侧栏滚动条 (右侧细条, 整列, 仅当总高 > 视口)
+  int totalH = RADIO_SPECIAL_CNT * RADIO_SPECIAL_H + max(0, radioCatCount - RADIO_SPECIAL_CNT) * RADIO_ROW_H_SIDE;
+  int viewH = NAV_BAR_Y - RADIO_HEADER_H;
+  if (totalH > viewH) {
+    int thumbH = max(12, viewH * viewH / totalH);
+    int smax = totalH - viewH;
+    int thumbY = RADIO_HEADER_H + (viewH - thumbH) * regionScrollTop / smax;
+    tft.fillRect(RADIO_SIDEBAR_W - 3, thumbY, 2, thumbH, TFT_WHITE);
+  }
+  tft.drawFastVLine(RADIO_SIDEBAR_W - 1, RADIO_HEADER_H, NAV_BAR_Y - RADIO_HEADER_H, 0x3186);
 }
-
-void drawRadioScrollbar() {
-  int listH = RADIO_LIST_BOT - RADIO_LIST_TOP;
-  int scrollRange = max(1, curRegionCount - RADIO_STATION_ROWS);
-
-  // 背景轨道
-  tft.fillRect(RADIO_LIST_X + RADIO_LIST_W, RADIO_LIST_TOP, RADIO_SCROLLBAR_W, listH, 0x1082);
-
-  // 滑块
-  int thumbH = max(20, listH * RADIO_STATION_ROWS / curRegionCount);
-  int thumbY = RADIO_LIST_TOP;
-  if (scrollRange > 0) {
-    thumbY = RADIO_LIST_TOP + (listH - thumbH) * listScrollTop / scrollRange;
-  }
-  tft.fillRect(RADIO_LIST_X + RADIO_LIST_W + 1, thumbY, RADIO_SCROLLBAR_W - 2, thumbH, 0xFFFF);
+static int utf8_next(const uint8_t* p, uint16_t* code) {
+  if (*p >= 0xF0) { *code = (((*p & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F)); return 4; }
+  if (*p >= 0xE0) { *code = (((*p & 0x0F) << 6) | (p[1] & 0x3F)); return 3; }
+  if (*p >= 0xC0) { *code = (((*p & 0x1F) << 6) | (p[1] & 0x3F)); return 2; }
+  *code = *p; return 1;
 }
-
-void drawRadioList() {
-  int listX = RADIO_LIST_X;
-  int listY = RADIO_LIST_TOP;
-  int listH = RADIO_LIST_BOT - RADIO_LIST_TOP;
-
-  tft.fillRect(listX, listY, RADIO_LIST_W, listH, COLOR_BG);
-
-  if (curRegionCount == 0) {
-    font24.drawString(listX + 50, listY + 50, "暂无电台", TFT_RED, COLOR_BG);
-    return;
-  }
-
-  int startRow = listScrollTop;
-  int endRow = startRow + RADIO_STATION_ROWS;
-  if (endRow > curRegionCount) endRow = curRegionCount;
-
-  for (int i = startRow; i < endRow; i++) {
-    int rowY = listY + (i - startRow) * RADIO_ROW_H;
-    bool playing = (i == currentPlayingIdx && radioPlaying);
-    drawStationRow(rowY, curRegionStations[i], playing);
-  }
-
-  drawRadioScrollbar();
+static const char* firstChar(const RadioStation* s) {
+  static char oc[4];
+  if (!s || !s->name[0]) return "?";
+  const uint8_t* p = (const uint8_t*)s->name;
+  uint16_t code; int n = utf8_next(p, &code);
+  if (n > 3) n = 3;
+  strlcpy(oc, (const char*)p, 4);   // copy the first UTF-8 char + NUL
+  return oc;
 }
-
-void drawStationRow(int rowY, StationView& st, bool playing) {
+static const char* stationCatLabel(const RadioStation* s) {
+  if (!s) return "";
+  if (s->cat[0] && strcmp(s->cat, "其它") != 0) return s->cat;   // 真实分类
+  return (s->freq[0]) ? s->freq : "";                              // 无分类 -> 频率 (与 preview _station_cat 一致)
+}
+// 圆角方形图标 (按分类取色) + 名首字 + 下方小字(分类名, 10px) -- 镜像 preview _draw_station_icon
+void drawStationIcon(int cx, int cy, RadioStation* st, int size) {
+  if (!st) return;
+  int half = size / 2;
+  const char* catl = stationCatLabel(st);
+  uint16_t col = catColor565(catl);
+  tft.fillRoundRect(cx - half, cy - half, size, size, 6, col);
+  const char* ch = firstChar(st);
+  int cw = font16.textWidth(ch);
+  font16.drawStringFast(cx - cw / 2, (cy - 1) - 8, ch, TFT_WHITE, col);
+  // 下方小字 (最多 4 字, 10px, 居中) -- 硬件用 drawScaledChar(16->10 面积平均, 带 AA)
+  char lbl[12]; int nl = 0;
+  { uint16_t cc; const uint8_t* pc = (const uint8_t*)catl; while (*pc && nl < 4) { int n = utf8_next(pc, &cc); memcpy(lbl + nl, pc, n); nl += n; pc += n; } lbl[nl] = 0; }
+  int nch = 0; { uint16_t cc; const uint8_t* q = (const uint8_t*)lbl; while (*q) { nch++; q += utf8_next(q, &cc); } }
+  int wpx = nch * 10, lx = cx - wpx / 2, ly = (cy + half + 3) - 5;
+  const uint8_t* rc = (const uint8_t*)lbl;
+  for (int i = 0; i < nch; i++) {
+    uint16_t code; int n = utf8_next(rc, &code);
+    font16.drawScaledChar(lx + i * 10, ly, code, 10, COLOR_DIM, 0x0821);
+    rc += n;
+  }
+}
+void drawStationRow(int rowY, RadioStation* st, bool playing, bool favorited) {
+  if (!st) return;
   int listX = RADIO_LIST_X;
   uint16_t bg = playing ? 0x1843 : COLOR_BG;
-
   tft.fillRect(listX, rowY, RADIO_LIST_W, RADIO_ROW_H, bg);
-
-  // 圆形图标
-  int iconCx = listX + 22;
-  int iconCy = rowY + RADIO_ROW_H / 2;
-  uint16_t col = ((uint16_t)st.r << 11) | ((uint16_t)(st.g >> 2) << 5) | (uint16_t)(st.b >> 3);
-  if (col == 0) col = 0xCCCC;
-  tft.fillCircle(iconCx, iconCy, 16, col);
-  tft.drawCircle(iconCx, iconCy, 17, 0xFFFF);
-
-  // 图标内文字
-  char iconText[5];
-  if (strlen(st.freq) >= 2) {
-    int flen = strlen(st.freq);
-    strncpy(iconText, st.freq + flen - 2, 2);
-    iconText[2] = 0;
-  } else if (strlen(st.name) > 0) {
-    int clen = (uint8_t)st.name[0] >= 0xE0 ? 3 : ((uint8_t)st.name[0] >= 0xC0 ? 2 : 1);
-    strncpy(iconText, st.name, clen);
-    iconText[clen] = 0;
-  } else {
-    strcpy(iconText, "?");
-  }
-  font16.drawString(iconCx - 8, iconCy - 8, iconText, TFT_WHITE, col);
-
-  // 电台名
+  // 圆角方形图标 (居中)
+  drawStationIcon(listX + 24, rowY + RADIO_ROW_H / 2, st, 20);
+  // 电台名 (上) + 频率·地区 (下) -- font16 去锯齿
   int nameX = listX + 46;
-  font16.drawString(nameX, rowY + 4, st.name, TFT_WHITE, bg);
-
-  // 频率/地区
+  font16.drawStringFast(nameX, rowY + 4, st->name, TFT_WHITE, bg);
   char info[40];
-  snprintf(info, sizeof(info), "%s · %s", st.freq, regionEntries[st.region_idx].name);
-  font16.drawString(nameX, rowY + 28, info, COLOR_DIM, bg);
-
-  // 播放/收藏图标
+  snprintf(info, sizeof(info), "%s · %s", st->freq, regionNameOf(st));
+  font16.drawStringFast(nameX, rowY + 28, info, COLOR_DIM, bg);
+  // 右侧: 播放中=绿三角 / 否则爱心
   if (playing) {
-    tft.fillTriangle(listX + RADIO_LIST_W - 14, rowY + 16,
-                     listX + RADIO_LIST_W - 6, rowY + 12,
-                     listX + RADIO_LIST_W - 6, rowY + 20, TFT_GREEN);
+    tft.fillTriangle(listX + RADIO_LIST_W - 14, rowY + 14,
+                     listX + RADIO_LIST_W - 6, rowY + 10,
+                     listX + RADIO_LIST_W - 6, rowY + 18, TFT_GREEN);
   } else {
-    // 爱心
-    uint16_t hc = isFavorited(st.bin_offset) ? TFT_RED : COLOR_DIM;
+    uint16_t hc = favorited ? TFT_RED : COLOR_DIM;
     int ax = listX + RADIO_LIST_W - 14;
     int ay = rowY + RADIO_ROW_H / 2 - 2;
-    // 简化爱心: 用两个圆 + 三角形
     tft.fillCircle(ax - 4, ay - 2, 4, hc);
     tft.fillCircle(ax + 4, ay - 2, 4, hc);
     tft.fillTriangle(ax - 8, ay, ax + 8, ay, ax, ay + 8, hc);
   }
-
-  // 行分隔线
   tft.drawFastHLine(listX, rowY + RADIO_ROW_H - 1, RADIO_LIST_W, 0x2104);
 }
-
-void drawRadioPlayBar() {
-  int barY = RADIO_LIST_BOT;
-  int barH = RADIO_PLAYBAR_H;
-  int barX = RADIO_LIST_X;
-  int barW = RADIO_LIST_W;
-
-  // 播放栏背景
-  tft.fillRect(barX, barY, barW, barH, 0x0821);
-  tft.drawFastHLine(barX, barY, barW, 0x3186);
-
-  if (currentPlayingIdx < 0 || currentPlayingIdx >= curRegionCount) {
-    font16.drawString(barX + 10, barY + 20, "点击电台开始播放", COLOR_DIM, 0x0821);
+void drawRadioList() {
+  int listX = RADIO_LIST_X, listY = RADIO_LIST_TOP;
+  int listH = RADIO_LIST_BOT - RADIO_LIST_TOP;
+  tft.fillRect(listX, listY, RADIO_LIST_W, listH, COLOR_BG);
+  int count = curCount();
+  if (count == 0) {
+    font16.drawStringFast(listX + 50, listY + 50, "暂无电台", TFT_RED, COLOR_BG);
     return;
   }
-
-  StationView& st = curRegionStations[currentPlayingIdx];
-
-  // 播放状态标签
-  uint16_t labelColor = radioPlaying ? 0x07E0 : 0xFBE0;
-  tft.fillRect(barX + 4, barY + 8, 28, 14, labelColor);
-  uint16_t labelFg = radioPlaying ? COLOR_BG : COLOR_BG;
-  font16.drawString(barX + 8, barY + 10, radioPlaying ? "LIVE" : "PAUSE", labelFg, labelColor);
-
-  // 当前电台名
-  font16.drawString(barX + 40, barY + 8, st.name, TFT_WHITE, 0x0821);
-  char info[40];
-  snprintf(info, sizeof(info), "%s · %s", st.freq, regionEntries[st.region_idx].name);
-  font16.drawString(barX + 40, barY + 26, info, COLOR_DIM, 0x0821);
-
-  // 右侧收藏按钮
-  bool fav = isFavorited(st.bin_offset);
-  uint16_t hc = fav ? TFT_RED : 0x5A5A;
-  int fx = barX + barW - 18;
-  int fy = barY + 30;
-  tft.fillCircle(fx - 4, fy - 2, 4, hc);
-  tft.fillCircle(fx + 4, fy - 2, 4, hc);
-  tft.fillTriangle(fx - 8, fy, fx + 8, fy, fx, fy + 8, hc);
-
-  // 控件按钮 (播放栏底部): 收藏 | 上 | 播放/暂停 | 下
-  int ctrlY = barY + 44;
-  tft.drawFastHLine(barX, ctrlY - 2, barW, 0x2104);
-
-  // 上一台
-  int px = barX + 40;
-  tft.fillTriangle(px + 8, ctrlY + 8, px + 24, ctrlY + 2, px + 24, ctrlY + 14, TFT_WHITE);
-  tft.fillRect(px + 22, ctrlY + 2, 4, 12, TFT_WHITE);
-
-  // 播放/暂停
-  int ppX = barX + 72;
-  int ppCx = ppX + 20;
-  int ppCy = ctrlY + 8;
-  uint16_t ppBg = radioPlaying ? 0xFBE0 : 0x07E0;
-  tft.fillCircle(ppCx, ppCy, 14, ppBg);
-  if (radioPlaying) {
-    // 暂停: 两竖条
-    tft.fillRect(ppCx - 6, ppCy - 5, 4, 10, COLOR_BG);
-    tft.fillRect(ppCx + 2, ppCy - 5, 4, 10, COLOR_BG);
-  } else {
-    // 播放: 三角形
-    tft.fillTriangle(ppCx - 4, ppCy - 7, ppCx + 6, ppCy, ppCx - 4, ppCy + 7, COLOR_BG);
+  int startRow = listScrollTop;
+  int endRow = startRow + RADIO_STATION_ROWS;
+  if (endRow > count) endRow = count;
+  for (int i = startRow; i < endRow; i++) {
+    int rowY = listY + (i - startRow) * RADIO_ROW_H;
+    bool playing = (curSidAt(i) == currentPlayingSid && radioPlaying);
+    bool favorited = isFavSid(curSidAt(i));
+    drawStationRow(rowY, curStnAt(i), playing, favorited);
   }
-
-  // 下一台
-  int nx = barX + 120;
-  tft.fillTriangle(nx + 8, ctrlY + 2, nx + 24, ctrlY + 8, nx + 8, ctrlY + 14, TFT_WHITE);
-  tft.fillRect(nx, ctrlY + 2, 4, 12, TFT_WHITE);
+  drawRadioScrollbar();
 }
-
+// 播放栏控件行 (≡ / 上一 / 播放暂停 / 下一 / 定时关闭 / 时间) -- 镜像 preview _draw_playbar_controls
+static void drawPlaybarControls(int barX, int cy, bool playing) {
+  int cx0 = barX + RADIO_LIST_W / 2;
+  // 播放列表 (≡)
+  tft.drawFastHLine(barX + 12, cy - 4, 12, TFT_WHITE);
+  tft.drawFastHLine(barX + 12, cy,     12, TFT_WHITE);
+  tft.drawFastHLine(barX + 12, cy + 4, 12, TFT_WHITE);
+  // 上一曲 ◀| (左指三角 + 左竖线)
+  int px = cx0 - 56;
+  tft.fillTriangle(px + 18, cy - 6, px + 18, cy + 6, px + 8, cy, TFT_WHITE);
+  tft.fillRect(px + 5, cy - 6, 3, 12, TFT_WHITE);
+  // 播放/暂停 (大圆按钮, 恒绿, 白色图标)
+  uint16_t ppBg = 0x07E0;
+  tft.fillCircle(cx0, cy, 15, ppBg);
+  if (playing) {
+    tft.fillRect(cx0 - 6, cy - 6, 3, 12, TFT_WHITE);
+    tft.fillRect(cx0 + 2, cy - 6, 3, 12, TFT_WHITE);
+  } else {
+    tft.fillTriangle(cx0 - 4, cy - 7, cx0 + 6, cy, cx0 - 4, cy + 7, TFT_WHITE);
+  }
+  // 下一曲 ▶|
+  int nx = cx0 + 38;
+  tft.fillTriangle(nx, cy - 6, nx, cy + 6, nx + 10, cy, TFT_WHITE);
+  tft.fillRect(nx + 10, cy - 6, 3, 12, TFT_WHITE);
+  // 定时关闭 (16px) + 时间 (右侧)
+  font16.drawStringFast(cx0 + 55, cy - 8, "定时关闭", COLOR_DIM, 0x0821);
+  font16.drawStringFast(barX + RADIO_LIST_W - 6 - font16.textWidth("00:00 / 00:00"), cy - 8, "00:00 / 00:00", COLOR_DIM, 0x0821);
+}
+void drawRadioPlayBar() {
+  int barX = RADIO_LIST_X, barY = RADIO_LIST_BOT;
+  int barW = RADIO_LIST_W, barH = RADIO_PLAYBAR_H;
+  tft.fillRect(barX, barY, barW, barH, 0x0821);
+  tft.drawFastHLine(barX, barY, barW, 0x3186);
+  RadioStation* st = (currentPlayingSid >= 0) ? stn(currentPlayingSid) : nullptr;
+  if (!st) {
+    // 未播放: 仅控件行 + 居中提示
+    drawPlaybarControls(barX, barY + barH / 2 - 14, false);
+    font16.drawStringFast(barX + 44, barY + 8, "点击电台开始播放", COLOR_DIM, 0x0821);
+    return;
+  }
+  // 行1: 图标(18) + 电台名(左, 截断) + "线路1 分类"(右)
+  drawStationIcon(barX + 18, barY + 18, st, 18);
+  const char* catl = stationCatLabel(st);
+  char right_lbl[32];
+  snprintf(right_lbl, sizeof(right_lbl), "线路1 %s", catl);
+  int nameX = barX + 38;
+  int rightW = font16.textWidth(right_lbl);
+  int nameMaxw = (barX + barW - 10) - rightW - 8 - nameX;
+  // 截断名到 nameMaxw + "…" (镜像 preview _fit)
+  String nm = String(st->name);
+  if (font16.textWidth(nm.c_str()) > nameMaxw) {
+    while (nm.length() > 1 && font16.textWidth((nm + "…").c_str()) > nameMaxw) nm = nm.substring(0, nm.length() - 1);
+    nm += "…";
+  }
+  font16.drawStringFast(nameX, barY + 10, nm, TFT_WHITE, 0x0821);
+  font16.drawStringFast(barX + barW - 10 - rightW, barY + 10, right_lbl, COLOR_DIM, 0x0821);
+  // 行2: 进度条 (占位, 40%)
+  tft.fillRect(barX + 4, barY + 34, barW - 9, 2, 0x1082);
+  tft.fillRect(barX + 4, barY + 34, (barW - 9) * 0.4, 2, TFT_GREEN);
+  // 行3: 控件
+  drawPlaybarControls(barX, barY + 52, radioPlaying);
+}
 void drawStationFullscreen() {
   int cx = 240, cy = 140;
-
-  // 半透明遮罩
   tft.fillRect(0, 0, 480, NAV_BAR_Y, 0x8000);
-
-  if (currentPlayingIdx < 0 || currentPlayingIdx >= curRegionCount) return;
-  StationView& st = curRegionStations[currentPlayingIdx];
-
-  // 卡片背景
+  RadioStation* st = (currentPlayingSid >= 0) ? stn(currentPlayingSid) : nullptr;
+  if (!st) return;
   tft.fillRoundRect(60, 40, 360, 200, 8, 0x1042);
-
-  // 大圆形图标
-  uint16_t col = ((uint16_t)st.r << 11) | ((uint16_t)(st.g >> 2) << 5) | (uint16_t)(st.b >> 3);
-  if (col == 0) col = 0xCCCC;
-  tft.fillCircle(cx, 80, 40, col);
-
-  char iconText[5];
-  if (strlen(st.freq) >= 2) {
-    int flen = strlen(st.freq);
-    strncpy(iconText, st.freq + flen - 2, 2);
-    iconText[2] = 0;
-  } else {
-    strcpy(iconText, "?");
-  }
-  font16.drawString(cx - 12, 72, iconText, TFT_WHITE, col);
-
-  // 电台名
-  font24.drawString(cx - font24.textWidth(st.name) / 2, 130, st.name, TFT_WHITE, 0x1042);
-
+  // 大圆角方形图标 (按分类取色)
+  uint16_t col = catColor565(stationCatLabel(st));
+  tft.fillRoundRect(cx - 40, 40, 80, 80, 12, col);
+  const char* ch = firstChar(st);
+  font16.drawStringFast(cx - font16.textWidth(ch) / 2, 72, ch, TFT_WHITE, col);
+  // 电台名 (16px 居中, 去锯齿)
+  font16.drawStringFast(cx - font16.textWidth(st->name) / 2, 122, st->name, TFT_WHITE, 0x1042);
   // 详细信息
-  char info[80];
-  snprintf(info, sizeof(info), "%s · %s", st.freq, regionEntries[st.region_idx].name);
-  font16.drawString(cx - font16.textWidth(info) / 2, 165, info, COLOR_DIM, 0x1042);
-
-  // 收藏按钮
-  bool fav = isFavorited(st.bin_offset);
-  font16.drawString(cx - 20, 195, fav ? "★ 已收藏" : "☆ 收藏", fav ? TFT_YELLOW : COLOR_DIM, 0x1042);
-
-  // 提示 (点任意处关闭)
-  font16.drawString(cx - 48, 225, "点屏幕任意处关闭", COLOR_DIM, 0x1042);
+  char info[64];
+  snprintf(info, sizeof(info), "%s · %s", st->freq, regionNameOf(st));
+  font16.drawStringFast(cx - font16.textWidth(info) / 2, 157, info, COLOR_DIM, 0x1042);
+  // 收藏
+  bool fav = isFavSid(currentPlayingSid);
+  font16.drawStringFast(cx - font16.textWidth(fav ? "★ 已收藏" : "☆ 收藏") / 2, 187, fav ? "★ 已收藏" : "☆ 收藏", fav ? TFT_YELLOW : COLOR_DIM, 0x1042);
+  font16.drawStringFast(cx - 48, 217, "点屏幕任意处关闭", COLOR_DIM, 0x1042);
 }
+void drawRadioScrollbar() {
+  int listH = RADIO_LIST_BOT - RADIO_LIST_TOP;
+  int count = curCount();
+  tft.fillRect(RADIO_LIST_X + RADIO_LIST_W, RADIO_LIST_TOP, RADIO_SCROLLBAR_W, listH, 0x1082);
+  if (count > 0) {
+    int scrollRange = max(1, count - RADIO_STATION_ROWS);
+    int thumbH = max(20, listH * RADIO_STATION_ROWS / count);
+    int thumbY = RADIO_LIST_TOP;
+    if (scrollRange > 0) thumbY = RADIO_LIST_TOP + (listH - thumbH) * listScrollTop / scrollRange;
+    tft.fillRect(RADIO_LIST_X + RADIO_LIST_W + 1, thumbY, RADIO_SCROLLBAR_W - 2, thumbH, TFT_WHITE);
+  }
+}
+

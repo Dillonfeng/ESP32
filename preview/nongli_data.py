@@ -247,7 +247,7 @@ SOLAR_FESTIVALS = {
     (4, 1): '愚人节', (5, 1): '劳动节', (5, 4): '青年节',
     (6, 1): '儿童节', (7, 1): '建党节', (8, 1): '建军节',
     (9, 10): '教师节', (10, 1): '国庆节', (12, 24): '平安夜',
-    (12, 25): '圣诞节',
+    (12, 25): '圣诞节', (10, 31): '万圣节', (11, 11): '光棍节',
 }
 # 农历固定节日: (月, 日) -> 名称 (日 11..20 用 "十", 21..29 用 "廿", 30 用 "三十")
 LUNAR_FESTIVALS = {
@@ -307,9 +307,21 @@ def festival_of(y, m, d, ly, lm, ldn, isleap):
     name = SOLAR_FESTIVALS.get((m, d))
     if name:
         return name
-    # 3) 浮动节日: 感恩节 / 复活节
+    # 3) 浮动节日: 感恩节 / 黑色星期五 / 母亲节 / 父亲节 / 复活节
     if d == thanksgiving(y).day and m == 11:
         return '感恩节'
+    bf = thanksgiving(y).day + 1   # 黑色星期五 = 美国感恩节次日(周五)
+    if d == bf and m == 11:
+        return '黑色星期五'
+    # 母亲节 = 5 月第 2 个周日 / 父亲节 = 6 月第 3 个周日
+    def nth_sun(y, m, nth):
+        first = datetime.date(y, m, 1)
+        off = (6 - first.weekday()) % 7
+        return 1 + off + (nth - 1) * 7
+    if m == 5 and d == nth_sun(y, 5, 2):
+        return '母亲节'
+    if m == 6 and d == nth_sun(y, 6, 3):
+        return '父亲节'
     if datetime.date(y, m, d) == easter(y):
         return '复活节'
     return ''

@@ -5,6 +5,7 @@
 
 #include "xfont.h"
 #include "esp_heap_caps.h"   // heap_caps_malloc_psram / heap_free_psram
+#include <string.h>          // memcpy (PSRAM alpha 中转)
 
 // ============================================================
 // 构造与析构
@@ -651,21 +652,27 @@ String XFont::getPixelData(const String& str)
 bool XFont::loadAA(const String& fontPath)
 {
     File f = LittleFS.open(fontPath, "r");
-    if (!f) return false;
+    if (!f) { Serial.printf("[XFont] loadAA: 打开失败 %s\n", fontPath.c_str()); return false; }
     uint32_t size = f.size();
     if (size < 8) { f.close(); return false; }
 
     // 整个文件载入 PSRAM
     uint8_t* blob = (uint8_t*)heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!blob) { f.close(); return false; }
+    if (!blob) { Serial.printf("[XFont] loadAA: PSRAM alloc %u B 失败\n", size); f.close(); return false; }
     f.read(blob, size);
     f.close();
 
-    uint16_t count = (uint16_t)(blob[6] | (blob[7] << 8));
-    if (size < 8u + (uint32_t)count * 259) { heap_caps_free(blob); return false; }
+    // 头/字段均为**大端** (与 gen_aa_font.py / gen_aa_font32.py / make_preview.py 一致: unicode(2,BE), n(2,BE))
+    uint16_t count = (uint16_t)((blob[6] << 8) | blob[7]);
+    // ver 决定单元格: ver1=16x16(256B), ver2=32x32(1024B); 步进 = unicode(2)+adv(1)+alpha
+    _aaSize = (blob[4] == 3) ? 64 : (blob[4] == 4) ? 24 : (blob[4] == 2) ? 32 : 16;   // ver1=16 ver2=32 ver3=64 ver4=24(1.5x超采样16px)
+    const uint32_t perGlyph = (uint32_t)(3 + _aaSize * _aaSize);
+    if (size < 8u + (uint32_t)count * perGlyph) {
+        Serial.printf("[XFont] loadAA: size %u < 8+%u*%u 不符\n", size, count, perGlyph);
+        heap_caps_free(blob); return false; }
 
     _isAA = true;
-    _fontSize = 16;
+    _fontSize = _aaSize;
     _totalFontCount = count;
     _aaBlob = blob;
     _aaPixels = blob + 8;
@@ -675,14 +682,14 @@ bool XFont::loadAA(const String& fontPath)
     _aaAdv = (uint8_t*)heap_caps_malloc(count, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!_aaUni || !_aaAdv) { clear(); return false; }
     for (uint16_t i = 0; i < count; i++) {
-        const uint8_t* g = _aaPixels + i * 259;
-        _aaUni[i] = (uint16_t)(g[0] | (g[1] << 8));
+        const uint8_t* g = _aaPixels + i * perGlyph;
+        _aaUni[i] = (uint16_t)((g[0] << 8) | g[1]);   // unicode 大端
         _aaAdv[i] = g[2];
     }
 
     _isInit = true;
-    Serial.printf("[XFont] AA 字库已加载: %s (%d 字, 16px, %u KB)\n",
-                  fontPath.c_str(), count, size / 1024);
+    Serial.printf("[XFont] AA 字库已加载: %s (%d 字, %dpx, %u KB)\n",
+                  fontPath.c_str(), count, _aaSize, size / 1024);
     return true;
 }
 
@@ -724,17 +731,110 @@ int XFont::textWidthAA(const String& str) const
 
 void XFont::compositeGlyph(int x, int y, int idx, uint16_t fg, uint16_t bg) const
 {
-    const uint8_t* a = _aaPixels + idx * 259 + 3; // 跳过 unicode(2)+adv(1)
+    const int S = _aaSize;                          // 原生单元格边长 (ver4=24 超采样 / ver1=16 / ver3=64)
+    const uint8_t* a = _aaPixels + idx * (3 + S * S) + 3;   // 跳过 unicode(2)+adv(1)
+    // ⚠️ 内部 RAM 中转: SxS 原生灰度面积平均降采样到 16x16 再逐通道 565 合成.
+    // 避免 ESP32-S3 八线 PSRAM DMA 突发读取错乱 (历史 bug 2026-09-22). 与 drawScaledChar 同款.
+    static uint8_t alphaBuf[64 * 64];               // S<=64 -> 4096B 内部 RAM
+    memcpy(alphaBuf, a, (size_t)S * S);
     int fr = fg >> 11, fb = fg & 0x1F, fm = (fg >> 5) & 0x3F;
     int br = bg >> 11, bb = bg & 0x1F, bm = (bg >> 5) & 0x3F;
-    for (int i = 0; i < 256; i++) {
-        uint8_t m = a[i];
-        // 与 blitDialNum 同款: out = (bg*(255-m) + fg*m) / 255
-        _buf[i] = (((br * (255 - m) + fr * m) / 255) << 11) |
-                  (((bm * (255 - m) + fm * m) / 255) << 5)  |
-                   ((bb * (255 - m) + fb * m) / 255);
+    for (int oy = 0; oy < 16; oy++) {
+        int sy0 = (oy * S) / 16, sy1 = ((oy + 1) * S) / 16;
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        for (int ox = 0; ox < 16; ox++) {
+            int sx0 = (ox * S) / 16, sx1 = ((ox + 1) * S) / 16;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            long sum = 0; int n = 0;
+            for (int sy = sy0; sy < sy1; sy++)
+                for (int sx = sx0; sx < sx1; sx++) { sum += alphaBuf[sy * S + sx]; n++; }
+            int m = (int)(sum / n);                 // 与 blitDialNum 同款: out = (bg*(255-m) + fg*m) / 255
+            _buf[oy * 16 + ox] = (((br * (255 - m) + fr * m) / 255) << 11) |
+                                  (((bm * (255 - m) + fm * m) / 255) << 5)  |
+                                  ((bb * (255 - m) + fb * m) / 255);
+        }
     }
     _tft->pushImage(x, y, 16, 16, _buf);
+}
+
+// 把一个 16x16 AA 灰度字形"缩小"绘制 (面积平均 + 逐通道 565 合成), 用于日历角标等
+// 需要比 16px 更小的中文场景。dst=目标边长 (如 12 => 12x12); 1px 源块映射到
+// ceil(16/dst) 个目标像素 (12 => 2x2, 平均后约 12.8px 视觉字号, 带抗锯齿)。
+// 合成公式与 compositeGlyph 一致: out = (bg*(255-m) + fg*m)/255。
+void XFont::drawScaledChar(int x, int y, uint16_t ch, int dst, uint16_t fg, uint16_t bg) const
+{
+    if (!dst) dst = 1;
+    if (dst > 16) dst = 16;
+    int idx = findAA(ch);
+    if (idx < 0) return;
+    const int S = _aaSize;                          // 原生单元格边长 (ver4=24 超采样)
+    const uint8_t* a = _aaPixels + idx * (3 + S * S) + 3;   // 跳过 unicode(2)+adv(1)
+    // ⚠️ 内部 RAM 中转: SxS 原生灰度面积平均缩放到 dst x dst 再逐通道 565 合成 (与 compositeGlyph 同款)
+    static uint8_t alphaBuf[64 * 64];
+    memcpy(alphaBuf, a, (size_t)S * S);
+    int fr = fg >> 11, fb = fg & 0x1F, fm = (fg >> 5) & 0x3F;
+    int br = bg >> 11, bb = bg & 0x1F, bm = (bg >> 5) & 0x3F;
+    static uint16_t sbuf[256];
+    for (int oy = 0; oy < dst; oy++) {
+        for (int ox = 0; ox < dst; ox++) {
+            int sy0 = (oy * S) / dst, sy1 = ((oy + 1) * S) / dst;   // 源行(y)
+            int sx0 = (ox * S) / dst, sx1 = ((ox + 1) * S) / dst;   // 源列(x)
+            if (sy1 <= sy0) sy1 = sy0 + 1;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            long sum = 0;
+            int n = 0;
+            for (int sy = sy0; sy < sy1; sy++)
+                for (int sx = sx0; sx < sx1; sx++) { sum += alphaBuf[sy * S + sx]; n++; }
+            int m = (int)(sum / n);
+            sbuf[oy * dst + ox] = (((br * (255 - m) + fr * m) / 255) << 11) |
+                                  (((bm * (255 - m) + fm * m) / 255) << 5)  |
+                                  ((bb * (255 - m) + fb * m) / 255);
+        }
+    }
+    _tft->pushImage(x, y, dst, dst, sbuf);
+}
+
+// 放大绘制一个中文大标题字符: 源 AA 灰度 (_aaSize x _aaSize, 16 或 32) 上采样到 dst x dst (dst 可达 40)。
+// 顶角最近邻取样 (sy=(oy*S)/dst, 与 preview big_glyph 逐像素一致) + 逐通道 565 合成 (out=(bg*(255-m)+fg*m)/255)。
+// 用内部 RAM 行/块缓冲中转 (alpha<=1024B, dst<=40 -> 1600px), 避免八线 PSRAM 直读花屏 (硬件反模式 R3)。
+// 仅用于黄历大字等比字库更大的中文; 16px 及以下仍走 drawScaledChar/compositeGlyph。
+void XFont::drawBigChar(int x, int y, uint16_t ch, int dst, uint16_t fg, uint16_t bg) const
+{
+    if (!dst) dst = 1;
+    if (dst > 40) dst = 40;
+    int idx = findAA(ch);
+    if (idx < 0) return;
+    int S = _aaSize;                       // 字库原生字形边长 (16 或 32)
+    const uint32_t perGlyph = (uint32_t)(3 + S * S);
+    const uint8_t* a = _aaPixels + (uint32_t)idx * perGlyph + 3;   // 跳过 unicode(2)+adv(1)
+    // ⚠️ 内部 RAM 中转 alpha (与 compositeGlyph 同款, 避免 PSRAM DMA 错乱)
+    static uint8_t alphaBuf[64 * 64];   // ver3=64x64=4096B (内部 RAM)
+    memcpy(alphaBuf, a, (size_t)S * S);
+    int fr = fg >> 11, fb = fg & 0x1F, fm = (fg >> 5) & 0x3F;
+    int br = bg >> 11, bb = bg & 0x1F, bm = (bg >> 5) & 0x3F;
+    static uint16_t bigBuf[40 * 40];   // dst<=40 -> 1600 px 内部 RAM
+    // 面积平均重采样 (与 preview big_glyph 同款): 每个目标像素平均其覆盖的源块 -> 边缘平滑 (非最近邻)
+    for (int oy = 0; oy < dst; oy++) {
+        int sy0 = (oy * S) / dst;
+        int sy1 = ((oy + 1) * S) / dst;
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy0 < 0) sy0 = 0; if (sy1 > S) sy1 = S;
+        for (int ox = 0; ox < dst; ox++) {
+            int sx0 = (ox * S) / dst;
+            int sx1 = ((ox + 1) * S) / dst;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx0 < 0) sx0 = 0; if (sx1 > S) sx1 = S;
+            int s = 0;
+            for (int yy = sy0; yy < sy1; yy++)
+                for (int xx = sx0; xx < sx1; xx++)
+                    s += alphaBuf[yy * S + xx];
+            int m = s / ((sy1 - sy0) * (sx1 - sx0));
+            bigBuf[oy * dst + ox] = (((br * (255 - m) + fr * m) / 255) << 11) |
+                                     (((bm * (255 - m) + fm * m) / 255) << 5)  |
+                                     ((bb * (255 - m) + fb * m) / 255);
+        }
+    }
+    _tft->pushImage(x, y, dst, dst, bigBuf);
 }
 
 void XFont::drawStringFastAA(int x, int y, const String& str, uint16_t fg, uint16_t bg) const

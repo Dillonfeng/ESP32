@@ -42,7 +42,7 @@ void drawNavBar() {
     if (sel) {
       tft.fillRect(x + 2, NAV_BAR_Y + 2, NAV_BTN_WIDTH - 4, NAV_BAR_HEIGHT - 4, COLOR_NAV_SEL);
     }
-    uint16_t tc = sel ? TFT_YELLOW : 0xC618;
+    uint16_t tc = sel ? TFT_YELLOW : TFT_WHITE;   // 选中=黄字, 未选=白字 (与 live preview 一致)
     int tw = font16.textWidth(navLabels[i]);
     font16.drawString(x + (NAV_BTN_WIDTH - tw) / 2, NAV_BAR_Y + 8, navLabels[i], tc, sel ? COLOR_NAV_SEL : COLOR_NAV_BG);
     if (i > 0) tft.drawFastVLine(x, NAV_BAR_Y + 2, NAV_BAR_HEIGHT - 4, 0x630C);
