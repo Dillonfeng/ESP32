@@ -82,6 +82,18 @@ CAL_NORM     = c565(0x31A6)   # 普通日期数字 (深灰)
 CAL_STRIP_L  = c565(0xEF9F)   # 底部信息条底色 (浅蓝灰)
 CAL_GOLD_L   = c565(0xCC21)   # 干支 (深金, 白底可读)
 HOL_WORK_L   = c565(0x01F4)   # 补班 (深蓝, 浅色日历底可读)
+# 天气页配色 (与 main.cpp W_* 完全一致)
+W_BG      = c565(0x0000)   # 黑 (COLOR_BG)
+W_PANEL   = c565(0x2104)   # 卡片底 深灰蓝
+W_EDGE    = c565(0x4208)   # 卡片描边
+W_TEXT    = c565(0xFFFF)   # 主文字 白
+W_DIM     = c565(0xBDF7)   # 次级文字 浅灰
+W_ACCENT  = c565(0x07FF)   # 强调 青
+W_SUN     = c565(0xFFE0)   # 太阳 黄
+W_CLOUD   = c565(0xFFFF)   # 云 白
+W_RAIN    = c565(0x4DDF)   # 雨 浅蓝
+W_SNOW    = c565(0x7DFF)   # 雪 淡蓝
+W_WARN    = c565(0xFD20)   # 闪电 橙黄
 # 年月选择弹层几何 (与 main.cpp PICK_* 一致)
 PICK_PANEL_X = 20
 PICK_PANEL_W = 440
@@ -1912,6 +1924,170 @@ def _draw_cal_picker(d, pick_ym):
 
 
 
+# ============================================================================
+# 天气页 (逐像素镜像 main.cpp drawWeatherScreen)
+# ============================================================================
+import wicons
+WEATHER_MOCK = {
+    "city": "广州", "date": "10-04 周日", "cond": "多云", "icon": 1,
+    "temp": 25, "feels": 27, "hi": 28, "lo": 22,
+    "humidity": 62, "windSpeed": 18, "windDir": "东南风", "windScale": 3,
+    "pressure": 1013, "uv": 5,
+    "sunrise": "06:12", "sunset": "18:34", "update": "15:30",
+    "day": ["今天", "明天", "周一", "周二", "周三", "周四", "周五"],
+    "dayIcon": [0, 1, 2, 4, 6, 4, 1],
+    "dayHi": [28, 27, 25, 23, 22, 24, 26],
+    "dayLo": [22, 21, 20, 19, 18, 20, 22],
+}
+
+def w_icon(d, type_, cx, cy, s, bg):
+    """镜像 main.cpp wIcon: 24x24 位图 (wicons.W_ICONS) 最近邻缩放到 s,
+    idx0=透明 -> bg, 其余按 W_ICON_PAL565 上色 (中心 cx,cy)。"""
+    type_ = max(0, min(7, type_))
+    g = wicons.W_ICONS[type_]
+    pal = {0: bg}
+    for k, v in wicons.W_ICON_PAL565.items():
+        if k != 0:
+            pal[k] = c565(v)
+    ox, oy = cx - s // 2, cy - s // 2
+    for dy in range(s):
+        sy = (dy * 24) // s
+        for dx in range(s):
+            sx = (dx * 24) // s
+            c = pal[g[sy][sx]]
+            if c:
+                d.point((ox + dx, oy + dy), fill=c)
+
+def _wmo(code):
+    """镜像 weather_sync.cpp codeToIconName: open-meteo WMO 码 -> (图标 0..7, 中文)。"""
+    m = {0: (0, "晴"), 1: (1, "晴间多云"), 2: (1, "多云"), 3: (2, "阴"),
+         45: (3, "雾"), 48: (3, "雾"),
+         51: (5, "毛毛雨"), 53: (5, "毛毛雨"), 55: (5, "毛毛雨"),
+         56: (5, "毛毛雨"), 57: (5, "毛毛雨"),
+         61: (4, "雨"), 63: (4, "雨"), 65: (4, "雨"), 66: (4, "雨"), 67: (4, "雨"),
+         71: (6, "雪"), 73: (6, "雪"), 75: (6, "雪"), 77: (6, "雪"),
+         80: (4, "阵雨"), 81: (4, "阵雨"), 82: (4, "阵雨"),
+         85: (6, "阵雪"), 86: (6, "阵雪"),
+         95: (7, "雷阵雨"), 96: (7, "雷雨伴冰雹"), 99: (7, "雷雨伴冰雹")}
+    return m.get(code, (2, "多云"))
+
+def _wind_dir(deg):
+    return ["北风", "东北风", "东风", "东南风", "南风", "西南风", "西风", "西北风"][int((deg + 22.5) / 45) % 8]
+
+def _wind_scale(kmh):
+    th = [1, 6, 12, 20, 29, 39, 50, 62, 75, 89, 103, 118]
+    for i in range(12):
+        if kmh < th[i]:
+            return i
+    return 12
+
+def fetch_weather_real(city="广州", lat=23.13, lon=113.26):
+    """镜像 weather_sync.cpp fetchAndCache: GET open-meteo (纯 HTTP), 返回 WEATHER_MOCK 同款 dict。
+    失败返回 None (调用方退回 mock)。"""
+    url = ("http://api.open-meteo.com/v1/forecast?latitude=%.2f&longitude=%.2f"
+           "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,"
+           "wind_speed_10m,wind_direction_10m,pressure_msl,uv_index"
+           "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset"
+           "&forecast_days=7&timezone=Asia%%2FShanghai") % (lat, lon)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "preview/1.0"})
+        doc = json.load(urllib.request.urlopen(req, timeout=8))
+    except Exception as e:
+        print("[Wx] fetch failed: %r" % e)
+        return None
+    cur = doc["current"]; daily = doc["daily"]
+    icon, cond = _wmo(int(cur["weather_code"]))
+    now = datetime.datetime.now()
+    wk = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+    day, dayIcon, dayHi, dayLo = [], [], [], []
+    for i in range(7):
+        if i == 0: day.append("今天")
+        elif i == 1: day.append("明天")
+        else: day.append(wk[(now.weekday() + 1 + i) % 7])
+        ic, _ = _wmo(int(daily["weather_code"][i]))
+        dayIcon.append(ic)
+        dayHi.append(int(daily["temperature_2m_max"][i]))
+        dayLo.append(int(daily["temperature_2m_min"][i]))
+    return {
+        "city": city,
+        "date": "%02d-%02d %s" % (now.month, now.day, wk[(now.weekday() + 1) % 7]),   # 镜像 C++ WK[tm_wday] (0=周日)
+        "cond": cond, "icon": icon,
+        "temp": round(cur["temperature_2m"]), "feels": round(cur["apparent_temperature"]),
+        "hi": int(daily["temperature_2m_max"][0]), "lo": int(daily["temperature_2m_min"][0]),
+        "humidity": int(cur["relative_humidity_2m"]),
+        "windSpeed": int(cur["wind_speed_10m"]),
+        "windDir": _wind_dir(float(cur["wind_direction_10m"])),
+        "windScale": _wind_scale(float(cur["wind_speed_10m"])),
+        "pressure": int(cur["pressure_msl"]), "uv": round(float(cur["uv_index"])),
+        "sunrise": daily["sunrise"][0][11:],
+        "sunset": daily["sunset"][0][11:],
+        "update": "%02d:%02d" % (now.hour, now.minute),
+        "day": day, "dayIcon": dayIcon, "dayHi": dayHi, "dayLo": dayLo,
+    }
+
+def draw_weather_scene(w=None):
+    """镜像 main.cpp drawWeatherScreen: 头部 + 主区(大温度/大图标/状况) + 4 卡片 + 7 天预报。"""
+    w = w or WEATHER_MOCK
+    img = Image.new("RGB", (480, 320), W_BG)
+    d = ImageDraw.Draw(img)
+    # 清场 0..NAV_Y-1
+    d.rectangle([0, 0, 479, NAV_Y - 1], fill=W_BG)
+
+    # ---- 头部: 城市 (左, 22px, 顶 y30) + 日期 + 更新时间 (右, 16px 顶 y36) ----
+    big_text(d, 10, 30, w["city"], 22, W_TEXT, W_BG)
+    hdr = w["date"] + "  " + w["update"]
+    hw = aa_text_width(hdr)
+    hw_text(d, 470 - hw, 36 + 8, hdr, W_DIM, W_BG, "lm")   # 硬件 top=36 -> 中心=44
+
+    # ---- 主区左: 大温度数字 (124x112, 顶 y52) + 度号 (x152, y60, 22px) ----
+    big = alm_big_number(w["temp"], 0xFFFF, 0x0000)   # fg=白 笔画, bg=黑 底
+    img.paste(big, (20, 52))
+    d = ImageDraw.Draw(img)
+    big_glyph(img, 152, 60, 0x00B0, 22, W_TEXT, W_BG)   # ° 紧跟数字右缘
+    d = ImageDraw.Draw(img)
+
+    # ---- 主区右: 大图标 (72px, 中心 402,108) ----
+    w_icon(d, w["icon"], 402, 108, 72, W_BG)
+
+    # ---- 主区中: 状况/体感/最高最低/湿度/风力 (16px, 左锚点 x165; 硬件 top=y) ----
+    hw_text(d, 165, 62 + 8,  w["cond"],                        W_TEXT,   W_BG, "lm")
+    hw_text(d, 165, 86 + 8,  "体感 %d°" % w["feels"],           W_DIM,    W_BG, "lm")
+    hw_text(d, 165, 110 + 8, "最高 %d°  最低 %d°" % (w["hi"], w["lo"]), W_TEXT, W_BG, "lm")
+    hw_text(d, 165, 134 + 8, "湿度 %d%%" % w["humidity"],        W_ACCENT, W_BG, "lm")
+    hw_text(d, 165, 158 + 8, "%s %d级" % (w["windDir"], w["windScale"]), W_TEXT, W_BG, "lm")
+
+    # ---- 卡片区: 4 张 (x=10,114,218,322, 宽 96, 高 50, y=178) ----
+    def card(x, label, value, vcol, unit):
+        d.rounded_rectangle([x, 178, x + 96 - 1, 178 + 50 - 1], radius=8, fill=W_PANEL, outline=W_EDGE, width=1)
+        hw_small(d, x + 8, 178 + 7, label, 12, W_DIM, W_PANEL, "l")          # 顶行 label (左)
+        if unit:
+            uw = aa_text_width(unit)
+            hw_text(d, x + 96 - 8 - uw, 178 + 7 + 8, unit, W_DIM, W_PANEL, "lm")  # 顶行 unit (右)
+        big_text(d, x + 96 // 2, 178 + 26, value, 24, vcol, W_PANEL, "c")    # value (居中 24px)
+    card(10,  "气压",   "%d" % w["pressure"], W_TEXT, "hPa")
+    card(114, "紫外线", "%.0f" % w["uv"],    W_SUN,  "UV")
+    card(218, "日出",   w["sunrise"],        W_TEXT, "")
+    card(322, "日落",   w["sunset"],         W_TEXT, "")
+
+    # ---- 7 天预报条 (y232 分隔线; 三行垂直居中; 每列中心 cx=40+i*68) ----
+    d.line([8, 232, 472, 232], fill=W_EDGE)
+    for i in range(7):
+        cx = 40 + i * 68
+        dc = W_ACCENT if i == 0 else W_TEXT
+        hw_small(d, cx, 234, w["day"][i], 14, dc, W_BG, "c")          # 行1 星期 (顶 y234)
+        w_icon(d, w["dayIcon"][i], cx, 262, 20, W_BG)                 # 行2 图标 (中心 y262)
+        hb = "%d°" % w["dayHi"][i]
+        lb = "%d°" % w["dayLo"][i]
+        hw2 = aa_text_width(hb); lw2 = aa_text_width(lb)
+        x0 = cx - (hw2 + 4 + lw2) // 2
+        hw_text(d, x0,           274 + 8, hb, W_TEXT, W_BG, "lm")     # 行3 高/低温 (顶 y274)
+        hw_text(d, x0 + hw2 + 4, 274 + 8, lb, W_DIM,  W_BG, "lm")
+
+    # 导航栏 (选中 天气=idx 3)
+    draw_nav(d, sel=3)
+    return img
+
+
 def scene(digits, flips=None, gears=True, white=True, gear_scroll=0.0):
     """flips: 每位的 (phase, progress, old_d); phase 0=稳态。None 时全稳态。
     gear_scroll: 齿轮累计滚动距离(px), 由调用方按翻页进度累加, 使齿轮与翻牌同步。"""
@@ -1961,6 +2137,14 @@ def main():
     # 万年历页面静态图
     cal = draw_calendar_scene(now.year, now.month)
     cal.save(OUT_DIR + "\\preview_calendar.png")
+    # 天气页静态图 (镜影 main.cpp drawWeatherScreen; mock 数据)
+    # 天气页: 优先拉取真实天气 (open-meteo, 纯 HTTP, 与固件同源); 失败退回 mock。
+    _wx = fetch_weather_real()
+    if _wx:
+        print("[Wx] preview using live open-meteo data: %s %dC %s" % (_wx["city"], _wx["temp"], _wx["cond"]))
+    else:
+        print("[Wx] preview using mock weather")
+    draw_weather_scene(_wx or WEATHER_MOCK).save(OUT_DIR + "\\preview_weather.png")
     # 黄历弹层示例图 (镜像 main.cpp drawAlmPopup): 今天 / 本周六 / 25号
     import calendar as _cald
     def _safe_dt(dt):

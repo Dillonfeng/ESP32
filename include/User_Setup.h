@@ -99,7 +99,10 @@
 // ##################################################################################
 
 // #define SPI_TOUCH_FREQUENCY  2500000
-#define SPI_TOUCH_FREQUENCY  2500000
+// BUILDV5-TOUCHSPEED: 2.5→8MHz。XPT2046 12-bit ADC 支持最高 ~10MHz SPI；
+// getTouch() 耗时从 ~92ms 降到 ~30ms → main loop 帧率 10-20fps → 25-30fps，
+// 配合高频泵(每帧10次 audio.loop) → HLS 下载 ≥150KB/s ≥ 播放消耗 110KB/s。
+#define SPI_TOUCH_FREQUENCY  8000000
 
 // Comment out the following to disable touch support
 #define SUPPORT_XPT2046

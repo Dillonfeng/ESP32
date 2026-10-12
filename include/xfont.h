@@ -31,6 +31,10 @@ public:
     void clear();
     bool isReady() { return _isInit; }
     int getFontSize() { return _fontSize; }
+    // BUILDV5-FONTF: 优先 Flash 直读模式 (AA 字库字形按需从 LittleFS 文件 seek+read,
+    // 不整文件载入 PSRAM)。用于低频大字号 (font32 64px, 黄历弹层), 释放 ~1.48MB PSRAM
+    // 给音频深缓冲 (InBuff 1.5MB 整片驻留 HLS 分片 → 零切换卡顿)。
+    void setFlashMode(bool f) { _preferFlash = f; }
 
     // ===== 绘制字符串（推荐） =====
     void drawString(int x, int y, const String& str, uint16_t color);
@@ -60,6 +64,8 @@ private:
     File _fontFile;
     bool _isInit;
     bool _isAA = false;         // 新版 AA 模式标志
+    bool _preferFlash = false;  // BUILDV5-FONTF: 优先 Flash 直读 (不整文件载 PSRAM)
+    bool _aaFlashMode = false;  // 当前处于 Flash 直读模式 (字形从 _aaFile seek+read)
     int  _aaSize = 16;          // AA 字库原生字形边长 (ver1=16 ver2=32 ver3=64 ver4=24超采样16px); 决定 compositeGlyph/drawScaledChar/drawBigChar 取样
 
     String _fontFilePath;
@@ -77,10 +83,11 @@ private:
     const char* _s64 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ@#*$";
 
     // ===== AA 模式数据 (PSRAM) =====
-    uint8_t*  _aaBlob   = nullptr;   // 整个文件 (PSRAM)
+    uint8_t*  _aaBlob   = nullptr;   // 整个文件 (PSRAM; Flash 直读模式下为 nullptr)
     uint16_t* _aaUni    = nullptr;   // unicode 数组 (sorted)
     uint8_t*  _aaAdv    = nullptr;   // advance 数组
-    const uint8_t* _aaPixels = nullptr; // 像素数据起点 (blob 内)
+    const uint8_t* _aaPixels = nullptr; // 像素数据起点 (blob 内; Flash 直读模式下为 nullptr)
+    mutable File _aaFile;            // BUILDV5-FONTF: Flash 直读模式常驻句柄 (mutable 供 const 绘制方法 seek+read)
     mutable uint16_t _buf[256] = {0}; // 16x16 合成缓冲 (const 方法内复用)
 
     // ===== 内部方法 =====
@@ -95,6 +102,7 @@ private:
 
     // AA 模式
     bool loadAA(const String& fontPath);
+    bool _readGlyph(int idx, uint8_t* buf) const;  // BUILDV5-FONTF: Flash 直读字形 (seek+read)
     int  findAA(uint16_t code) const;      // 二分查找 unicode
     int  textWidthAA(const String& str) const;
     void drawStringFastAA(int x, int y, const String& str, uint16_t fg, uint16_t bg) const;

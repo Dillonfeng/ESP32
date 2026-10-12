@@ -374,3 +374,56 @@
 ### 常规待办
 - 烧录验证：`pio run -t upload`（固件，真·翻页动画）+ `pio run -t uploadfs`（推 `data/festival.json` 等），看串口 `[Fest] festival.json loaded`；连硬件看翻页动画（上半新/下半旧 + 翻片带）、两间隙 3D 齿轮滚动、不闪不卡。
 - ~~填 `data/festival.json` 里 14 条真实节日音乐 URL~~ **✅ 已填（2026-09-21，复用 stations.json 同 CDN 已验证流；`清明` 键特殊）**。
+
+
+## 2026-10-11 编译通道修复（决定性，HLS 主线恢复的前置）
+- **根因**：pioarduino 6.2.0 自升级后，core deps 硬编码 tool-scons=4.11.1，但其分发的 scons 包是过滤版（缺 MSCommon/ninja/docbook），且每次编译 get_core_package_dir→install 都会重装并清理 packages\tool-scons → scons 引擎加载工具链报 `SCons.Tool.FortranCommon` 缺失 → 所有编译 40s 内 FAILED（此坑吞掉了 netTask 心跳与万年历修复的烧录）。
+- **解法（已生效，编译 SUCCESS 534.73s）**：
+  1. `D:\ESP32-S3\tools\tool-scons-full` = 用用户下载的 `C:\Users\fhaiy\Downloads\scons-local-4.11.1.tar.gz` 完整解压（含 FortranCommon；MSCommon/ninja 官方包本就排除，无需补）。
+  2. 改 `D:\ESP32-S3\.platformio\penv\Lib\site-packages\platformio\package\manager\core.py` 的 `get_core_package_dir`：`if name=="tool-scons" and isdir(r"D:\ESP32-S3\tools\tool-scons-full"): return r"D:\ESP32-S3\tools\tool-scons-full"`（绕过其包管理）。
+  3. `PLATFORMIO_DISABLE_UPDATE_NOTIFIER=1` 用户级环境变量已持久化（防再自升级）。
+- **编译命令**：`$env:PLATFORMIO_CORE_DIR='D:\ESP32-S3\.platformio'; $env:PLATFORMIO_PENV_DIR='D:\ESP32-S3\.platformio\penv'; $env:PLATFORMIO_DISABLE_UPDATE_NOTIFIER='1'; Start-Process 'D:\ESP32-S3\.platformio\penv\Scripts\platformio.exe' -ArgumentList 'run','-e','s3v5','-t','upload','--upload-port','COM4' -WorkingDirectory 'D:\ESP32-S3' -RedirectStandardOutput logs\build_*.log -RedirectStandardError logs\build_*_err.log -WindowStyle Hidden`。
+- **验证铁证**：`logs\scons_probe.txt`（scons.py 探针）：SConsFile=tool-scons-full\scons-local-4.11.1\SCons\__init__.py + FortranOK。`logs\build_probe3.log` = [SUCCESS] Took 534.73 秒，firmware.bin/firmware.factory.bin 已生成，**未烧录**（用户要求明天再烧）。
+- **探针残留**：tool-scons-full\scons.py 顶部有写 scons_probe.txt 的探针（无害，可留）；core.py 的 patch 是持久修复，勿回退。
+
+## 2026-10-11 待烧录/待验证清单（明天开始点）
+1. **烧录**（含 main.cpp netTask 心跳 [NET-BEAT]2s/[NET-BLK]>500ms + calendar_ui.cpp 万年历命中区修复）→ 抓 boot log（应无 crash）。
+2. **万年历验收**：切 2027 年 5 月点 30/31（log 应 `calendar sel -> 2027-5-30/31`）；10/27-31 也应可选。
+3. **HLS 主线**：播放环球资讯（sid 269），抓 60-90s log，看 [NET-BEAT]/[NET-BLK]——定位 28s 静默阻塞点（此前 cap_step3b_ts.log 铁证：44.5-72.7s 全静默含 touch 停扫 = 网络读阻塞卡死任务链）。
+4. **STEP4 双连接预取**（用户已认可方向）：播分片 N 并行预取 N+1，切换零断流。PSRAM 预算：heap free≈140KB、internalFree≈137KB、在线 PSRAM 余量~1.4MB；第二 NetworkClient 实现细节未定稿。NET-BLK 铁证对齐后实施。
+5. **编译速度**：用户质疑全量编译。本次 534s 含全量 IDF 组件；明天验证改 main.cpp 后是否增量（audioI2S 库不应全量重编）。
+6. **历史遗留**：指针时钟不显示（用户问能否放 PSRAM——秒针动态刷新需内部 RAM 或双缓冲策略）；右侧电台列表拖动整屏刷新 vs 左侧局部滚动不一致；SD 卡启用（GPIO6 与 PCM5102 共用，用户计划改 GPIO 后启用）。
+
+## 2026-10-11 晚 更新：指针时钟已显示（用户实机确认）
+- 烧录含指针时钟的固件后，用户确认**指针时钟已经显示**（主菜单可见、在走动）。历史遗留"指针时钟一直不显示"从待办中划掉。
+- 指针时钟实现注意（用户此前提问）：秒针动态刷新，画面不能放 PSRAM 直接推屏（octal PSRAM SPI-DMA 突发读花屏，R3）；当前实现应走内部 RAM 整帧合成 + 单次 pushImage（R2），保持该路线即可。
+
+
+## HLS 卡顿根治：死锁修复 + FIX11 双缓冲预取 + FIX12 AAC 风暴重同步 + FIX12b 采样率降噪（2026-10-12）
+- **用户铁律**：HLS 电台（环球资讯 sk.cri.cn 905.m3u8 / 经济之声 ngcdn002.cnr.cn jjzs/index.m3u8）"播放几秒即无声/周期性卡顿"必须根治；非 HLS 正常；log 铁证不臆测；反对 patch by patch；已接受双连接预取方向。
+- **死锁修复（BUILDV5-DEADLOCK-FIX，Audio.cpp L5577）**：InBuff 残留 17931B（差 69B 到 mb=18000）→ playAudioData isStream 循环 `bytesToDecode < getMaxBlockSize()` 永不满足 → sendBytes 永不被调 → 永不切 prefetch → 永久静默。门槛 18000→188（TS 包粒度）。修复后 90s 验证：prefetch↔InBuff 每 ~10s 循环、i2sBytes 持续。
+- **FIX11（L5224 预取目标 + L4062 轮询 3s）**：修复后暴露"每切换周期 1s 静默+5.5s 慢速爬升"——根因=第 3 分片被误写进 prefetch（与第 2 分片竞争）→ 切回 InBuff 时空。修法：prefetch 已有货时第 3 分片写 InBuff；轮询 10s→3s。修复后 90s 环球资讯：0 静默/0 切换/全程满速。
+- **FIX12（L6500 sendBytes 错误路径 + Audio.h m_aacErrStrike）**：分片边界 AAC 帧错位 → libfaad 逐帧喂垃圾试错（每失败跳 1 字节）→ 该秒吞吐降 31%。修法：连续 2 次解码错误 → 整段重扫 findNextSync（ns<0 返回 len 跳过整段 / ns>0 跳到 sync / 否则跳 1B）；成功复位计数；framesize==0 也纳入。修复后 90s 经济之声：0 静默但 60-71s 跨 2 分片 58 次错误风暴（54-60s 网络/解码完全正常铁证 → **cnr 流该时段内容畸形**，设备侧只能加速重同步无法消除）。
+- **FIX12b（L7053 setSampleRate）**：采样率不变时跳过日志+IIR 重算（原库每帧都调：AAC 解码成功路径每帧打日志+IIR 重算+50 行 D 日志；风暴时 58 次刷屏拖慢恢复）。IIR 系数仅依赖采样率，未变时旧系数有效，跳过安全。**编译烧录 SUCCESS（128s）后 90s 经济之声验证：setSampleRate 58→0、AAC 错误 88→23、i2sBytes 全程 382976-387072 满速、0 静默、0 dip、0 timeout（904 行 vs 上轮 1504 行）**——FIX12+FIX12b 已把设备侧压到极限。
+- **⚠️ 已知边界**：cnr 10s 大分片偶发整段畸形（60-71s 实证）是服务器内容问题，设备侧 FIX12/FIX12b 只能快速重同步；若听感仍明显需双连接预取+分片健康检查（跳过畸形分片）。环球资讯（3s 小分片）干净。
+
+
+
+## HLS 卡顿根治：死锁修复 + FIX11 双缓冲预取 + FIX12 AAC 风暴重同步 + FIX12b 采样率降噪（2026-10-12）
+- **用户铁律**：HLS 电台（环球资讯 sk.cri.cn 905.m3u8 / 经济之声 ngcdn002.cnr.cn jjzs/index.m3u8）"播放几秒即无声/周期性卡顿"必须根治；非 HLS 正常；log 铁证不臆测；反对 patch by patch；已接受双连接预取方向。
+- **死锁修复（BUILDV5-DEADLOCK-FIX，Audio.cpp L5577）**：InBuff 残留 17931B（差 69B 到 mb=18000）→ playAudioData isStream 循环 `bytesToDecode < getMaxBlockSize()` 永不满足 → sendBytes 永不被调 → 永不切 prefetch → 永久静默。门槛 18000→188（TS 包粒度）。修复后 90s 验证：prefetch↔InBuff 每 ~10s 循环、i2sBytes 持续。
+- **FIX11（L5224 预取目标 + L4062 轮询 3s）**：修复后暴露"每切换周期 1s 静默+5.5s 慢速爬升"——根因=第 3 分片被误写进 prefetch（与第 2 分片竞争）→ 切回 InBuff 时空。修法：prefetch 已有货时第 3 分片写 InBuff；轮询 10s→3s。修复后 90s 环球资讯：0 静默/0 切换/全程满速。
+- **FIX12（L6500 sendBytes 错误路径 + Audio.h m_aacErrStrike）**：分片边界 AAC 帧错位 → libfaad 逐帧喂垃圾试错（每失败跳 1 字节）→ 该秒吞吐降 31%。修法：连续 2 次解码错误 → 整段重扫 findNextSync（ns<0 返回 len 跳过整段 / ns>0 跳到 sync / 否则跳 1B）；成功复位计数；framesize==0 也纳入。修复后 90s 经济之声：0 静默但 60-71s 跨 2 分片 58 次错误风暴（54-60s 网络/解码完全正常铁证 → **cnr 流该时段内容畸形**，设备侧只能加速重同步无法消除）。
+- **FIX12b（L7053 setSampleRate）**：采样率不变时跳过日志+IIR 重算（原库每帧都调：AAC 解码成功路径每帧打日志+IIR 重算+50 行 D 日志；风暴时 58 次刷屏拖慢恢复）。IIR 系数仅依赖采样率，未变时旧系数有效，跳过安全。**编译烧录 SUCCESS（128s）后 90s 经济之声验证：setSampleRate 58→0、AAC 错误 88→23、i2sBytes 全程 382976-387072 满速、0 静默、0 dip、0 timeout（904 行 vs 上轮 1504 行）**——FIX12+FIX12b 已把设备侧压到极限。
+- **⚠️ 已知边界**：cnr 10s 大分片偶发整段畸形（60-71s 实证）是服务器内容问题，设备侧 FIX12/FIX12b 只能快速重同步；若听感仍明显需双连接预取+分片健康检查（跳过畸形分片）。环球资讯（3s 小分片）干净。
+
+
+
+## 播放中随机重启根治：TASK_WDT 复位 + netTask 豁免（2026-10-12）
+- **用户报告**："播放的时候设备重启了"（任意电台，播放中偶发）。
+- **根因（配置+代码铁证）**：`sdkconfig.s3v5` = `CONFIG_ESP_TASK_WDT_EN=y` + `CONFIG_ESP_TASK_WDT_TIMEOUT_S=5` + **`CONFIG_ESP_TASK_WDT_PANIC` 未设**（超时=直接复位芯片，非 panic）。netTask（Core 1，prio 2）泵 `audio.loop()` **从不喂狗**（`esp_task_wdt_reset` 无）——cnr 分片切换网络阻塞 7-9s（main.cpp L667/L804 已有注释实证）→ `audio.loop()` 单次调用 >5s → **TASK_WDT 复位 → 设备重启**。与"播放时重启"（netTask 只在 radioPlaying/musicPlaying 时泵 audio.loop）完全吻合。
+- **为何 90s 验证没抓到**：验证时段网络正常（分片切换 <500ms，NET-BLK=0），阻塞是 cnr 服务器偶发；用户实听时恰好遇到阻塞时段。
+- **修复（BUILDV5-TWDTRESET，main.cpp netTask 顶部 + include esp_task_wdt.h）**：`esp_task_wdt_delete(NULL)` 豁免 netTask 的 TASK_WDT——阻塞≠死锁，audio.loop 内部有网络超时会自行恢复，**宁可短暂无声/卡顿，绝不复位重启**。其他任务（main loop/touchScan）仍受 WDT 保护。
+- **验证**：编译烧录 SUCCESS（91s）；120s 经济之声（`logs\cap_hls_1_120.log`，1259 行）：**0 静默 / 0 重启痕迹 / NET-BEAT 60 次 dt=0-188ms（audio.loop 正常）/ heap=137KB 稳定 / AAC err 22（快速消化）**——正常播放完全不受影响；阻塞时段"不重启"由机制保证（已豁免），实听验证待用户。
+- **⚠️ 遗留**：豁免 WDT 只防重启，阻塞 7-9s 期间仍会短暂无声（该时段播放连接网络挂起）；根治需缩短 audio.loop 阻塞时长（HTTP read 超时收紧）或双连接预取（播放连接不阻塞）。
+
