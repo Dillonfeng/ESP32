@@ -33,6 +33,16 @@ char audioI2SVers[] = "\
 // → 11KB/s、点击十几秒无声）。双缓冲下 ready 阈值必须 < 分片大小：下载 90KB（<1s）
 // 即启动播放，分片切换断流由 prefetch 预取 N+1 无缝覆盖（业界 HLS 播放器标准架构）。
 constexpr size_t BUILDV5_HLS_BUF = 90000;
+// BUILDV5-FIX16 (2026-10-13): 预取目标水位 = 2 个 HLS 分片 ≈ 6s 缓冲（~218KB）。
+// 用户提议"延长预取"验证缓冲抗抖动：当前 prefetch 只装 1 分片(109KB≈3s)，
+// 网络时段性拥塞(下载 27KB/s vs 播放 110KB/s)时边界提前量不足 → in=0 pref=0 双空断流。
+// 提高水位 → prefetch 累积 2 分片(218KB≈6s) + InBuff 同样加深 → 总缓冲 ~12s 抗抖动，
+// 代价：内容延迟 ~6s（直播不实时，用户已接受）。先验证缓冲原理，再上真双连接。
+// BUILDV5-SCALE1 (2026-10-14): 单连接极限验证——目标 218K(6s)→400K(≈12s) + 轮询 3s→1s。
+// 根因（log 铁证）：分片粒度调度下缓冲零余量（分片 3s 播放 vs 轮询 3s 相位漂移 → 10s 周期断流）。
+// 加大预取目标 + 1s 轮询 → prefetch 累积 ~4 分片(12s)深缓冲 → 切换间隔拉长、相位问题消除。
+// 若 90s 抓包 dip 仍高 → 单连接天花板确认 → 上双连接（连接 B 独立持续下载）。
+constexpr size_t BUILDV5_PREFETCH_TARGET = 400000;
 // 下载水位 = InBuff 容量：永不触发 → 缓冲期 burst 狂填至 1.5MB 满（hlsbuf2 行为，
 // 曾证 100% 实时零低谷）。PSRAM 账：font32 Flash 直读已释放 1.48MB（BUILDV5-FONTF），
 // 播放中余量 1.48MB 实测安全（此前字体 2.5MB 占 PSRAM 时余量 78KB → libfaad ps_calloc NULL panic，
@@ -3892,6 +3902,7 @@ void Audio::cacheSamples() {
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::playChunk() {
     static uint32_t diagBytes = 0, diagT0 = 0; // BUILDV5: per-second I2S byte rate
+    static int32_t diagPeak = 0;               // BUILDV5-DIAG-PEAK: per-second I2S sample peak
     // BUILDV5-STEP3FIX: 热路径 DEBUG 每次 playChunk 调用都打（与 L5578 同为官方库
     // 无限制频刷屏源，串口被占满 → main loop 打印阻塞 → 触摸卡死）。生产模式注释。
     // AUDIO_LOG_DEBUG("playChunk entry: freeDesc={} filled={}", m_dmaFreeDesc.load(std::memory_order_acquire), SamplesBuff.bufferFilled()); // BUILDV5-DIAG
@@ -3941,6 +3952,15 @@ void Audio::playChunk() {
             // m_i2sWorkBuff -> I2S
             //--------------------------------------------------------------------------------------------------------
 
+            // BUILDV5-DIAG-PEAK (2026-10-13): 统计写入 I2S 的样本峰值——
+            // 用户报"首上电播放任何电台无声"但 log 显示 i2sBytes 满速。若 peak=0
+            // =数据静音(解码/音量路径)；peak>0 =DAC 不响应(物理/格式)。
+            for (size_t pi = 0; pi < readWords; pi++) {
+                int32_t pv = m_i2sWorkBuff.get()[pi];
+                if (pv < 0) pv = -pv;
+                if (pv > diagPeak) diagPeak = pv;
+            }
+
             size_t bytesConsumed = 0;
             if (continueI2S) {
                 // BUILDV5-FIX8: i2s_channel_write 非阻塞（ticks_to_wait 10→0）。
@@ -3979,8 +3999,8 @@ void Audio::playChunk() {
     uint32_t dtMs = nowMs - diagT0;
     if (dtMs >= 1000) { // BUILDV5-HLSFIX15: 1s 级——i2sBytes/s 是 DMA 实际送出字节 =
         // 扬声器真实输出；掉到 <200K 即播放卡顿（用户实测否决 10 分钟级采样）
-        AUDIO_LOG_INFO("BUILDV5: i2sBytes/s={} dt={}ms", diagBytes, dtMs);
-        diagBytes = 0; diagT0 = nowMs;
+        AUDIO_LOG_INFO("BUILDV5: i2sBytes/s={} dt={}ms peak={}", diagBytes, dtMs, diagPeak);
+        diagBytes = 0; diagT0 = nowMs; diagPeak = 0;
     }
     return;
 }
@@ -4059,7 +4079,7 @@ void Audio::loop() {
                         // AUDIO_LOG_DEBUG("wait");
                         break;
                     }
-                    if (m_f_stream) m_lVar.no_host_timer = millis() + 3000; // BUILDV5-FIX11: 10s→3s（匹配分片时长，第3分片播完前新列表已到，消除列表等待断流）
+                    if (m_f_stream) m_lVar.no_host_timer = millis() + 1000; // BUILDV5-SCALE1 (2026-10-14): 3s→1s——分片粒度调度下，列表轮询周期≈分片时长(3s) 造成相位漂移（每~9s轮询错过新分片→10s周期断流）。1s 轮询更快发现新分片→下载更连续→prefetch 更快累积。
                     httpPrint(m_m3u8_host.get());
                     m_dataMode = HTTP_RESPONSE_HEADER; // we have a new playlist now
                 }
@@ -5180,6 +5200,12 @@ nextRound:
                     // BUILDV5-DUALBUF: 下载目标 = prefetchActive ? prefetch : InBuff
                     // （分片 N 下载到 InBuff 播放；分片 N+1 预取到 prefetch，切换零断流）
                     AudioBuffer& dst = m_prefetchActive ? prefetch : InBuff;
+                    // BUILDV5-DIAG-DST (2026-10-14): 下载目标变化时打印（定位 preA 切换节奏）
+                    static AudioBuffer* lastDst = nullptr;
+                    if (&dst != lastDst) {
+                        AUDIO_LOG_INFO("BUILDV5-DIAG-DST: dst={} preA={} bc={} fsz={} pref={} in={}", (&dst == &prefetch) ? 1 : 0, (int)m_prefetchActive, m_pwsst.byteCounter, m_audioFileSize, prefetch.bufferFilled(), InBuff.bufferFilled());
+                        lastDst = &dst;
+                    }
                     size_t ws = dst.writeSpace();
                     if (ws >= m_pwsst.ts_packetLength) {
                         memcpy(dst.getWritePtr(), m_pwsst.ts_packet.get() + m_pwsst.ts_packetStart, m_pwsst.ts_packetLength);
@@ -5225,11 +5251,16 @@ nextRound:
                     // InBuff——cap_hls_2_90 铁证：列表 3 分片 1.42s 全下载完，2846（第3分片）
                     // 误写 prefetch（与 2845 竞争）→ 数据丢失 → switch back 后 InBuff 空 → 
                     // 5.5s 慢速爬升（i2sBytes=131072 dt=5562ms）。prefetch 有货时保持写 InBuff。
-                    if (!m_playingFromPrefetch && prefetch.bufferFilled() == 0) {
-                        m_prefetchActive = true; // prefetch 空 → 预取 N+1 到 prefetch
+                    // BUILDV5-FIX16 (2026-10-13): 预取触发水位 8192 → BUILDV5_PREFETCH_TARGET(218KB≈2分片≈6s)。
+                    // 目标 = 让 prefetch 累积多分片（缓冲加深验证）。prefetch 未达目标 → 继续预取；
+                    // 已达 → 回 InBuff 写 N+2（播放缓冲同样加深）。
+                    // BUILDV5-DIAG-PREA (2026-10-14): 分片完成时的 preA 决策现场（每分片 1 行，~3s/次）
+                    AUDIO_LOG_INFO("BUILDV5-DIAG-PREA: bc={} fsz={} pfp={} preA={} pref={} in={}", m_pwsst.byteCounter, m_audioFileSize, (int)m_playingFromPrefetch, (int)m_prefetchActive, prefetch.bufferFilled(), InBuff.bufferFilled());
+                    if (!m_playingFromPrefetch && prefetch.bufferFilled() < BUILDV5_PREFETCH_TARGET) {
+                        m_prefetchActive = true; // prefetch 未达目标水位 → 继续预取（N+1/N+2...到 218KB）
                         m_pendingPrefetch = true; // 重连(setDefaults)时保留 prefetch 状态（分片切换非用户切台）
                     } else {
-                        m_prefetchActive = false; // prefetch 已有货 → N+2 写 InBuff（播放缓冲）
+                        m_prefetchActive = false; // prefetch 已达目标 → N+2 写 InBuff（播放缓冲）
                     }
                     m_f_continue = true;
                     m_pwsst.byteCounter = 0;
@@ -5264,12 +5295,14 @@ nextRound:
         }
     }
     if (m_audioFileSize && m_pwsst.byteCounter == m_audioFileSize) {
-        // BUILDV5-DUALBUF: 分片 N 下载完 → 立即预取分片 N+1 到 prefetch（独立缓冲，切换零断流）。
-        // 根因（cap_fix8c/hlsbuf2r 实证）：网络下载 ~110KB/s ≈ HLS 流速率 112KB/s → 播放中
-        // 缓冲无法积累 → 单缓冲切换断流(1-4s)必低谷。双缓冲：N 播放期间 N+1 已提前下载，
-        // InBuff 播完 → 无缝切 prefetch（数据已就绪），下载目标回 InBuff（N+2）。
-        m_prefetchActive = true; // 下一分片写 prefetch
-        m_pendingPrefetch = true; // 重连(setDefaults)时保留 prefetch 状态（分片切换非用户切台）
+        // BUILDV5-FIX16: 分片完成兜底点——预取目标水位判断（与包循环内 L5243 统一）。
+        // prefetch 未达目标(218KB≈6s) → 下一分片写 prefetch；已达 → 写 InBuff（播放缓冲加深）。
+        if (!m_playingFromPrefetch && prefetch.bufferFilled() < BUILDV5_PREFETCH_TARGET) {
+            m_prefetchActive = true;
+            m_pendingPrefetch = true;
+        } else {
+            m_prefetchActive = false;
+        }
         m_f_continue = true;
         m_pwsst.byteCounter = 0;
         m_pwsst.ts_packetPtr = 0;
@@ -5279,9 +5312,14 @@ nextRound:
 
 chunkFinished:
     if (m_pwsst.f_chunkFinished) {
-        // BUILDV5-DUALBUF: 同上（分片下载完立即预取下一分片到 prefetch）
-        m_prefetchActive = true;
-        m_pendingPrefetch = true;
+        // BUILDV5-FIX16: chunkFinished 分支——预取目标水位判断（与 L5243/L5281 统一）。
+        // 无条件 preA=true 会使 prefetch 已满(218K)时仍抢占下载目标 → InBuff 饿死断流。
+        if (!m_playingFromPrefetch && prefetch.bufferFilled() < BUILDV5_PREFETCH_TARGET) {
+            m_prefetchActive = true;
+            m_pendingPrefetch = true;
+        } else {
+            m_prefetchActive = false;
+        }
         m_pwsst.f_chunkFinished = false;
         m_f_continue = true;
         m_pwsst.byteCounter = 0;
@@ -5544,7 +5582,9 @@ void Audio::playAudioData() {
                 // InBuff空+prefetch有 从未满足，需确认播放源/缓冲真实状态）
                 static uint32_t swCnt = 0;
                 if ((++swCnt % 600000) == 0) AUDIO_LOG_INFO("BUILDV5-SW: in={} pref={} pfp={}", InBuff.readSpace(), prefetch.readSpace(), (int)m_playingFromPrefetch);
-                if (InBuff.readSpace() == 0 && prefetch.readSpace() > 0) {
+                // BUILDV5-FIX13: 切换阈值 0→8192B——残量(<1帧)切换=切过去立即空→双空重爬
+                // (cap_hls_2_600 38.2s 深 dip 实证)。≥8192B 才切，保证切换后有实际播放余量。
+                if (InBuff.readSpace() == 0 && prefetch.readSpace() >= 8192) {
                     m_playingFromPrefetch = true;
                     m_prefetchActive = false; // 下载目标回 InBuff（N+2）
                     AUDIO_LOG_INFO("BUILDV5: switch to prefetch");

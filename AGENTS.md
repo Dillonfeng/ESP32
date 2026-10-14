@@ -427,3 +427,59 @@
 - **验证**：编译烧录 SUCCESS（91s）；120s 经济之声（`logs\cap_hls_1_120.log`，1259 行）：**0 静默 / 0 重启痕迹 / NET-BEAT 60 次 dt=0-188ms（audio.loop 正常）/ heap=137KB 稳定 / AAC err 22（快速消化）**——正常播放完全不受影响；阻塞时段"不重启"由机制保证（已豁免），实听验证待用户。
 - **⚠️ 遗留**：豁免 WDT 只防重启，阻塞 7-9s 期间仍会短暂无声（该时段播放连接网络挂起）；根治需缩短 audio.loop 阻塞时长（HTTP read 超时收紧）或双连接预取（播放连接不阻塞）。
 
+
+
+## 600s 长抓包分析（2026-10-12 晚，TWDTRESET+FIX12b 版）——明日待办：小修复列表轮询干扰
+- **背景**：用户实听 5 台切换（环球资讯 sk.cri.cn→经典音乐 cnr dszs→经济之声 cnr jjzs→环球资讯→河北新闻 hebxw→环球资讯→河北新闻），报告"切换电台时有偶尔卡顿、破音、打嘟噜"。抓 600s（`logs\cap_hls_2_600.log`，6498 行）。
+- **全局统计**：i2sBytes=0（完全静默）**0 次**；Writing timeout（I2S 欠载）**0 次**；AAC 解码错误 17 次（分散，FIX12 快速消化）；NET-BLK（>500ms 阻塞）1 次（3532ms）；吞吐 dip 21 次其中**深 dip 仅 2 次**。
+- **切换点（6 处）全部浅 dip、1s 内恢复**：97.9s→cnr(229376)、168.6s→cri(290816)、295.2s→hebtv(342016 几乎无感)、351.8s→cri(**79872** 切换点最深)、463.5s→hebtv(198656)。**切换本身不是主要问题**。
+- **深 dip 根因 ①（38.21s，i2sBytes=71680 dt=1397ms）**：InBuff+prefetch **双缓冲同时耗尽** → 37.93s 起重拉 m3u8 列表（readPlayListData 11 行）+ prepare_first_m3u8_url 移除旧分片 → 38.18s switch to prefetch → 38.22s 4ms 后 switch back（prefetch 也快空）→ 缓冲重爬。**疑似与 FIX11 的列表轮询 10s→3s 相关**：轮询触发新列表解析/旧分片移除，播放缓冲短暂被清。**明日小修复对象**（Audio.cpp 轮询逻辑，只动 L4062 附近 no_host_timer 分支，不动架构）。
+- **深 dip 根因 ②（268.84s，i2sBytes=67584 dt=4138ms）**：**HTTP chunked 读阻塞 3532ms**（`NET-BLK audio.loop took 3532ms`，268.61s 打印；阻塞段 266-268.6s 无任何心跳/吞吐日志 → audio.loop 卡在 getChunkSize/chunked 读挂起）→ 缓冲耗尽（st=0, in=1107）→ 恢复后重爬（guard in 12589→16000）。**根因在网络（服务器/CDN chunked 读挂起），设备不可控**——TWDTRESET 已保证此场景表现为卡顿而非重启。
+- **prefetch 机制验证（工作正常）**：pref 采样 590 次，最大 65535，非零 316 次；switch to prefetch 8 次 / switch back 8 次。**FIX11 双缓冲预取实际生效**（早前 90s 验证 0 静默 0 dip 与其一致）。
+- **破音/打嘟噜机制**：双缓冲耗尽 → I2S 输出中断恢复（PCM5102A 输出停→续 = 爆音/嘟噜）。两个深 dip 即用户听到的 2 次明显卡顿（其余 598s 基本满速）。
+- **双连接决策依据（未实施，待定）**：双连接可吸收 268s 型（网络阻塞，预取连接独立缓冲），但对 38s 型（列表轮询干扰）帮助有限；若阻塞是服务器侧，双连接两连接都可能堵。**当前证据不支撑立即上双连接**——600s 仅 2 个深 dip、0 静默、0 欠载。
+- **明日计划**：① 小修复 38s 型（列表轮询干扰，Audio.cpp 轮询逻辑）→ 编译烧录 → 抓 600s+ 长 log 对比 dip 次数；② 若深 dip 只剩 268s 型（网络阻塞），与用户确认是否可接受或评估双连接；③ 待办：实听确认 TWDTRESET 后不再重启。
+- **git 状态**：已本地提交 c385928（18 文件，Audio.cpp/Audio.h 强制入库）；push 失败（本机无法访问 github.com:443）；已生成 `patch_out/0001-...patch`（808KB）+ `patch_out/esp32-full.bundle`（7.3MB 完整历史）供跨机递交。
+
+
+## BUILD 流水（2026-10-13 晚，V5 双连接前夜）
+### FIX15 无声根治（用户已确认，2026-10-13）
+- **现象**：每次重启/上电后**第一次**点环球资讯(HLS 48k AAC)无声，切其他电台也无声；**先点"全部"里 500 华语经典(MP3 44.1k 直连)就有声**，之后任何电台正常；点复位可恢复。
+- **log 诊断链（全铁证）**：DECPEAK=1.3e9 → PEAKCHK 非零 → **GAIN 诊断 limL=1 limR=1 vc=1 iir=1 pre0=0** → POSTCHK=0 → peak=0。数据在 **IIR_filter 处被消零**。
+- **根因**：settings.IIR_FILTER=true（默认开 3-band EQ）但项目未用 EQ；biquad coeffs/pre_gain（结构体默认 0.0）只在 IIR_calculateCoefficients（= setSampleRate 采样率变化分支）计算。首播环球资讯 48kHz == 初始采样率 → 跳过 → coeffs=0、pre_gain=0 → biquad 输出恒 0 → 静音。先点 MP3(44.1k≠48k) 触发计算 → 之后有声。与用户实测 100% 吻合。
+- **修复（2 处）**：Audio.h IIR_FILTER=false；udiolib_structs.hpp pre_gain=1.0。testTone(串口'8'/'9' 1kHz 直写 I2S)证明物理链路 OK。
+
+### FIX16 预取加深（2026-10-13，验证缓冲原理——缓解有效，根治需双连接）
+- **改动**：BUILDV5_PREFETCH_TARGET=218000（≈2 分片≈6s）；三处预取触发点（包循环内/分片完成/chunkFinished）统一水位判断 !m_playingFromPrefetch && prefetch.bufferFilled() < BUILDV5_PREFETCH_TARGET。
+- **验证（环球资讯 90s 抓包）**：
+  - 网络较好（烧录后立即）：dip **17→7 次**（启动 2+真实 5），双缓冲 in=65535 pref=65535 双满——**缓冲加深有效，改善 70%**。
+  - 网络拥塞（用户听感无改善时，22:51）：dip **21 次，精确 ~10s 周期**（每 10s 深度 dip 110K→恢复 280K 对），且 **pref=0 恒空**。
+- **根因（单连接根本限制，决定性）**：预取触发依赖"分片下载完成"(yteCounter==fileSize)。拥塞时下载速率(27KB/s) < 播放消耗(110KB/s) → 分片永远完成不了 → 预取永不启动 → pref=0 → FIX16 目标形同虚设。**下载速率 ≤ 播放速率时缓冲无法积累——无论预取目标多深**。
+- **结论（明天起点）**：缓冲加深=缓解（已验证）；**根治=真双连接**（连接 B 独立并行下载 N+1，不受连接 A 拥塞拖累）。
+
+## 双连接改造小步规划（2026-10-14 起，每步编译烧录+90s 抓包验证）
+- **STEP0 基线**：FIX16 固件当前状态留档（cap_hls_x_90.log 21dip/10s 周期）；确认编译通道（scons 修复勿回退）。
+- **STEP1 预取连接基础设施**：新增 m_prefetchClient(WiFiClient) + prefetch 下载状态机最小框架（能开连接、能下载字节到 prefetch）。验证：编译过、不破坏现有播放。
+- **STEP2 并行下载验证**：prefClient 播放中持续下载下一分片到 prefetch（独立于主连接）。验证：log 显示双连接同时在下载（速率翻倍证据）、**拥塞时段 pref 也能累积**（单连接做不到的）。
+- **STEP3 零断流切换**：主连接分片 N 播完→无缝切 prefetch(N+1 就绪)→主连接下载目标切 N+2。验证：90s dip 目标=启动 2 + 0 真实。
+- **STEP4 分片序列管理**：预取 URL 从 playlist 顺序取；MEDIA-SEQUENCE 跳变处理。验证：10 分钟级播放零断流、无 AAC 错误风暴。
+- **STEP5 综合验证**：经济之声/经典音乐多台验证、30 分钟长抓包零 dip、预取深度/切换阈值参数调优、触摸/翻页时钟不受影响。
+- **风险**：PSRAM 余量 1.48MB（prefetch 1.12MB 已有，第二个 client 缓冲用既有 prefetch 不新增）；两个连接共享缓冲需现有 lock 互斥；netTask 内并行下载注意看门狗（TWDTRESET 已豁免）。
+
+## 当前文件状态（2026-10-13 22:52）
+- lib\ESP32-audioI2S\src\Audio.cpp = FIX11/12/12b/FIX13/FIX15/FIX16 + 每秒 peak 诊断（BUILDV5: i2sBytes/s=… peak=…）+ DIAG4/DIAG7/DIAGX 少量遗留。FIX14 已回滚。
+- lib\ESP32-audioI2S\src\Audio.h IIR_FILTER=false；udiolib_structs.hpp pre_gain=1.0。
+- .pio\build\s3v5\firmware.bin @22:24:33（FIX16）。
+- logs 关键：cap_hls_x_90.log(22:52, 21dip/10s 周期, pref=0)、cap_hls_2_90.log(22:30, 7dip, 双满)、uild_fix16.log(SUCCESS 117.2s)。
+- 串口键：'1'经济之声 '2'环球资讯 '3'经典音乐 '6'怀集(MP3) '8'/'9' testTone 'x'纯抓包 'C'触摸校准；抓包 scripts\_cap_hls.py <key> <dur> COM4（第三参必须显式 COM4）。
+- 编译模板（PowerShell 设 PLATFORMIO_CORE_DIR/PENV_DIR/DISABLE_UPDATE_NOTIFIER 后 Start-Process platformio.exe run -e s3v5 -t upload --upload-port COM4，RedirectStandardOutput logs\build_*.log -WindowStyle Hidden；SUCCESS 后核验 firmware.bin LastWriteTime）。
+### 双连接可行性 PC 探测（2026-10-13 23:00，拥塞时段，决定性）
+- **背景（用户关键质疑）**：说"拥塞下载 27KB/s"，但用户家网络是好的——是环球资讯服务器的问题吗？双连接能解决吗？不能靠猜，PC 实测。
+- **探测方法**（scripts\_probe_dual.py，PC 直连同网络）：拉 m3u8 取最新 3 分片，单连接顺序下载 vs 2 worker 并行下载，测合并速率 vs 播放需求 35.5KB/s。
+- **结果（铁证）**：
+  - PC 单连接 = **926KB/s**（远超播放需求 35.5KB/s）→ **服务器根本不慢/不限速**
+  - PC 双连接 = **1827KB/s = 1.97x** → 服务器 **per-connection 行为，双连接机制有效**
+- **设备端真实情况（cap_hls_x_90.log）**：now playing 分片切换**精确每 3.00s 一次**（t=1.574/4.576/7.580/10.582/...）→ **设备下载能力 ≥ 播放**，分片准时到——**也不是设备 WiFi/网络瓶颈**。
+- **卡顿根因（重新定性）**：不是网络/服务器/下载速率，是**预取调度失效**——断流时刻 in=24010 pref=0（缓冲只 0.7s）。机制：预取触发依赖"分片完成"(byteCounter==fileSize)，而列表轮询(FIX11 3s)每 3s 换新分片 → 预取目标永远在追 → **prefetch 恒空** → 每次分片切换撞缓冲临界 → 周期断流（10s = 3 分片）。
+- **双连接结论**：**可以解决**（下载能力足够 + 双连接让 N+1 独立并行下载 → pref 恒有货 → 切换零断流），但**前提**：连接 B 在设备上能真持续下载（不被主连接/轮询相位拖住）。**STEP0 必须先加"预取连接每秒下载字节"诊断实测**，确认连接 B 独立下载速率，再实施双连接——避免又靠猜。
+- 遗留疑问：InBuff bufferFilled 显示恒 65535（uint16 截断？还是真实上限？）——STEP0 一并确认（若 InBuff 容量被限 64KB，需检查 AudioBuffer 配置 DEFAULT_MAIN_BUFFER_SIZE=1000000 是否生效）。

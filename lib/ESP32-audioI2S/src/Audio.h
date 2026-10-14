@@ -523,7 +523,11 @@ class Audio {  private:
         uint16_t FREQ_PEAK_HZ = 1800;              // IIR Filter: peakingEQ
         uint16_t FREQ_HS_HZ = 6000;                // IIR Filter: highshelf
         float    QUALITY_SLOPE = 0.707;            // IIR Filter: quality (all shelfes)
-        bool     IIR_FILTER = true;                // IIR Filter: true -> IIR filter (highshelf, bandpass, lowshelf) are enabled
+        bool     IIR_FILTER = false;               // IIR Filter: true -> IIR filter (highshelf, bandpass, lowshelf) are enabled
+                                                    // BUILDV5-FIX15 (2026-10-13): 默认 false——3-band EQ 增益全 0 时 IIR 无作用；
+                                                    // 且 coeffs/pre_gain 仅在 IIR_calculateCoefficients（setSampleRate
+                                                    // 采样率变化分支）计算——首播 48k 电台跳过 → coeffs=0 → biquad 输出
+                                                    // 恒 0 → 全程静音（"上电首播无声"根因）。禁用 = 直通，无副作用。
         uint8_t  VU_BARS_ATTACK_STEP = 200;        // vu-meter:   bars rising steps
         uint8_t  VU_BARS_RELEASE_STEP = 30;        // vu-meter:   bars falling steps
         uint8_t  VU_BARS_HOLD_CYCLES = 1;          // vu-meter:   bars hold_cycles

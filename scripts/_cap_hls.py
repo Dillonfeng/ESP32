@@ -4,7 +4,7 @@ ALL serial lines for N seconds to logs\cap_hls_<key>_<dur>.log (no filtering).
 No device reset - just inject key and listen."""
 import serial, time, sys
 
-PORT = "COM8"
+PORT = sys.argv[3] if len(sys.argv) > 3 else "COM8"  # FIX13: 端口参数化（设备可在 COM4/COM8）
 KEY = sys.argv[1] if len(sys.argv) > 1 else "2"
 DUR = int(sys.argv[2]) if len(sys.argv) > 2 else 90
 OUT = r"D:\ESP32-S3\logs\cap_hls_%s_%d.log" % (KEY.replace(":", "h"), DUR)
