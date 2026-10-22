@@ -2,7 +2,7 @@
 
 基于 ESP32-S3 N16R8 的多功能桌面设备：机械翻页(split-flap)时钟、万年历（农历/干支/节气/节日）、网络收音机（HLS/MP3/AAC）、天气显示。
 
-> 本文档对应 BUILDV5 分支（当前 HEAD：BUILDV5 clean baseline，2026-10-14）。
+> 本文档对应 BUILDV5 分支（当前 HEAD：BUILDV5-CLKFIX-A，2026-10-20）。
 > 详细开发记忆见 `AGENTS.md`（含调试铁律、硬件反模式 R1-R5、AA 中文字库格式说明）。
 
 ## 硬件清单
@@ -23,6 +23,7 @@
 - 指针表盘样式（`include/dialnum.h`，12 个数字遮罩）
 - 两种样式通过触摸点击实时切换
 - 局部刷新 + 整帧合成（R2），时钟页干净无闪烁
+- **时钟缓冲 boot 常驻**（CLKFIX-A）：翻页/指针缓冲在 setup 最干净时一次性分配，播放期切时钟不再依赖新分配，根治切页空白/齿轮带缺失
 
 ### 📅 万年历 / 黄历
 - 农历、干支、节气、节日计算（`src/nongli.cpp`，17 位表 + 积日算法）
@@ -34,18 +35,19 @@
 - 电台库 `data/stations.bin`（1652 站 / 40 地区，纯 HTTP，设备无 TLS 能力故全站 http://）
 - 支持 HLS(m3u8) / MP3 / AAC 流，央视、CRI、地方台、网络音乐台
 - 多任务架构：`netTask` 独立下载泵 + `touchScanTask` 独立触摸任务 + 主 loop 显示
-- HLS 双缓冲预取（`src/hls_prefetch.cpp`，BUILDV5 HLS 阶段性成果）
+- 播放条带 ▶/暂停/静音按钮，音量百分比与 UI 状态同步（radioVolume）
 
 ### 🌤 天气显示
 - 和风天气 API（`src/weather_sync.cpp` + `src/weather_ui.cpp`）
 
 ### 🖱 触摸
 - 自写 XPT2046 驱动（`src/touch_driver.cpp`，PENIRQ 中断 + SPI 采样独立任务）
-- 引脚见下方接线图（TOUCH_CS=GPIO1 / TOUCH_IRQ=GPIO38，GPIO38 为 octal PSRAM SPICS1 复用脚，历史调试曾实验改 GPIO4）
+- PENIRQ-WAKE：XPT2046 复位后 GPIO38 卡死高电平时，SPI 初始化后手动拉低 GPIO38 + 发读 X 命令唤醒触摸控制器
+- 引脚见下方接线图（TOUCH_CS=GPIO1 / TOUCH_IRQ=GPIO38，GPIO38 为 octal PSRAM SPICS1 复用脚）
 
 ### 🈶 AA 中文字库
 - 16px 8-bit 灰度抗锯齿字库（`data/font_simhei_16.font`，XAAX 大端格式，~4088 字）
-- 24px/64px 大字号（`font_simhei_24/64.font`），64px 用于黄历大数字/节日框
+- 64px 大字号（`data/font_simhei_64.font`，Flash 直读，用于黄历大数字/节日框；原 24px `font_simhei_24.font` 已移除）
 - 生成器 `scripts/gen_aa_font.py` / `gen_aa_font32.py`（C:\Python314，需 PIL）
 
 ## 硬件接线
@@ -105,11 +107,10 @@ src/
 ├── main.cpp              # 主程序入口，多任务整合 (netTask 下载泵 + touchScanTask + 主loop)
 ├── clock_ui.cpp          # 时钟 UI（翻页/指针，buildAnalogFace 缓存 + 整帧合成）
 ├── calendar_ui.cpp       # 万年历 UI（月份表格/选中/黄历弹层）
-├── radio_ui.cpp          # 收音机 UI（地区/电台列表、播放条、滚动）
+├── radio_ui.cpp          # 收音机 UI（地区/电台列表、播放条 ▶/暂停/静音、滚动）
 ├── radio_db.cpp          # 电台数据库 (stations.bin 解析)
 ├── touch_driver.cpp      # 自写 XPT2046 驱动（PENIRQ 中断 + SPI 采样）
 ├── tft_touch.cpp         # TFT_eSPI 触摸封装（校准映射）
-├── hls_prefetch.cpp      # HLS 双缓冲预取 (BUILDV5)
 ├── holiday_sync.cpp      # 节假日离线缓存 (LittleFS)
 ├── weather_sync.cpp      # 天气同步 (和风 API)
 ├── weather_ui.cpp        # 天气显示
@@ -124,7 +125,6 @@ include/
 ├── User_Setup.h          # TFT_eSPI 配置 (TOUCH_CS=1 / TOUCH_IRQ=38)
 ├── tft_setup.h           # 屏幕初始化封装
 ├── touch_driver.h        # 触摸驱动头
-├── hls_prefetch.h        # HLS 预取头
 ├── digits.h / dialnum.h  # 翻页/表盘数字遮罩
 ├── almnum.h              # 黄历大数字遮罩 (62×112)
 ├── nongli.h              # 农历头
@@ -136,7 +136,7 @@ data/                     # LittleFS 文件
 ├── stations.json         # 电台 JSON (源数据)
 ├── festival.json         # 节日配置
 ├── holidays_2025/2026/2027.json  # 节假日缓存
-└── font_simhei_16/24/64.font     # AA 字库
+└── font_simhei_16/64.font        # AA 字库
 ```
 
 ## 构建与烧录 (PlatformIO)
@@ -157,7 +157,7 @@ pio run -e s3v5 -t monitor
 
 > 终端集成抽风时的可靠烧录法（脱离终端）：
 > ```powershell
-> Start-Process -FilePath "D:\ESP32-S3\.platformio\penv\Scripts\platformio.exe" `
+> Start-Process -FilePath "E:\Home PC\ESP32-S3\.platformio\penv\Scripts\platformio.exe" `
 >   -ArgumentList "run","-e","s3v5","-t","upload","--upload-port","COM4" -WindowStyle Hidden
 > ```
 > 或使用 `scripts/flash2.py`（内含端口清理 + 烧录 + 抓 boot log）。
@@ -174,13 +174,22 @@ pio run -e s3v5 -t monitor
 
 ## 版本历史
 
-### BUILDV5 (2026-10-14) — 当前
+### BUILDV5-CLKFIX-A (2026-10-20) — 当前
+- 时钟缓冲 boot 常驻（`allocClockBufsResident`）：setup 最干净时一次性分配翻页/指针缓冲，删除 `freeClockBufs` 调用（V5 全 HTTP 无 TLS，原 BUILD17 释放理由已过时），根治播放期切时钟页空白/齿轮带缺失
+- PENIRQ-WAKE：XPT2046 复位后 GPIO38 卡死高电平时，SPI 初始化后手动拉低 + 发读 X 命令唤醒
+- 删除 `font_simhei_24.font`（只保留 16px + 64px AA 字库）
+- 删除 `autoPlayOnceTask`（boot 自动播环球资讯与播放条暂停按钮冲突）
+- 删除 `hls_prefetch.*`（STEP1 临时双缓冲预取实验代码彻底清理）
+- 播放条加 ▶/暂停/静音按钮，音量状态 radioVolume 与 UI 同步
+- Audio.cpp/h 大改：v5 I2S1 + 连接/缓冲逻辑重构；touch_driver/clock_ui/radio_db 配套调整
+- esp_log 全关（NONE），只保留自有 Serial.printf；加 boot + 60s 节流内存基线打印
+
+### BUILDV5 clean baseline (2026-10-14)
 - 多任务拆分：netTask 独立下载泵（audio.loop 不再占 main loop）+ touchScanTask 独立触摸任务
 - 自写 XPT2046 驱动（PENIRQ 中断方案，替换 TFT_eSPI 轮询）
-- HLS 双缓冲预取（FIX11/12/12b）+ TWDTRESET 防网络阻塞复位（BUILDV5-TWDTRESET）
-- 全局 SPI 总线互斥 + 全局打印锁（BUILDV5-HLSFIX）
+- HLS 双缓冲预取（FIX11/12/12b）+ TWDTRESET 防网络阻塞复位
+- 全局 SPI 总线互斥 + 全局打印锁
 - 触摸 SPI 提速 2.5→8MHz（getTouch 92ms→30ms，帧率 25-30fps）
-- **已修复**：翻页时钟显示不全/不翻页（整帧合成）、黄历字体发虚（AA 字库）、指针时钟残影、万年历末行日期选不中、HLS 播几秒断流（阶段性）
 - **待解决**：HLS 长时卡顿（待双连接正式方案）、触摸漂移/单双击误判（低概率）
 
 ### BUILD23 (2026-10-02)
