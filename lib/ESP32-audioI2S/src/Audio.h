@@ -64,14 +64,7 @@ class AudioBuffer {
     // Configuration
     // ------------------------------------------------------------
 
-    // BUILDV5-HLSBUF: 720KB 装不下 10s HLS 分片(1.12MB) → 分片末尾缓冲趋近 0 → 切换卡顿。
-    // BUILDV5-DUALBUF: 双缓冲（分片预加载，业界 HLS 播放器标准）：
-    //   InBuff 1.0MB（播放缓冲）+ prefetch 1.12MB（预取下一分片）→ 切换零断流。
-    //   PSRAM 账：font32 已改 Flash 直读释放 1.48MB（BUILDV5-FONTF），双缓冲共 2.12MB，
-    //   播放中 PSRAM 余量 ~0.85MB 安全（此前 1.5MB + 字体 2.5MB 曾跌到 78KB → panic，已实证）。
-    static constexpr size_t DEFAULT_MAIN_BUFFER_SIZE = 1000000;
-    // BUILDV5-DUALBUF: 预取缓冲容量 = 一个 HLS 分片（10s × 112KB/s ≈ 1.12MB）
-    static constexpr size_t DEFAULT_PREFETCH_BUFFER_SIZE = 1120000;
+    static constexpr size_t DEFAULT_MAIN_BUFFER_SIZE = 2120000; // PIPE (2026-10-15): 2.12MB PSRAM 单环形缓冲（设计文档 §2.1，原 UINT16_MAX*10=655350B 浅水位不足）
     static constexpr size_t DEFAULT_RESERVE_BUFFER_SIZE = UINT16_MAX;
     // Maximum contiguous block returned by readSpace()/writeSpace().
     // All supported decoders use uint16_t (bytesLeft, bytesAvail, ...). Returning larger blocks has no benefit and would only increase decoder latency.
@@ -225,14 +218,10 @@ class RingBuffer {
 };
 
 //----------------------------------------------------------------------------------------------------------------------
-// BUILDV5-HLSFIX: 全局共享打印锁声明（main.cpp 定义并创建）。AUDIO_LOG_IMPL 是
-// 变参模板，static 局部锁每模板实例各一把 → netTask 与 audioTask 不同实例不互斥
-// → UART 竞争崩溃（cap_fix11 链B）。必须放类外（全局符号，所有实例共享）。
-extern SemaphoreHandle_t g_printMutex;
 
-class Audio {  private:
-    AudioBuffer InBuff;       // instance of input buffer (playback buffer)
-    AudioBuffer prefetch;     // BUILDV5-DUALBUF: HLS 分片预取缓冲（下一分片提前下载，切换零断流）
+class Audio {
+  private:
+    AudioBuffer InBuff; // instance of input buffer
     RingBuffer  SamplesBuff;
 
   public:
@@ -301,6 +290,9 @@ class Audio {  private:
     bool             connecttospeech(const char* speech, const char* lang);
     bool             connecttoFS(fs::FS& fs, const char* path, int32_t fileStartTime = -1);
     void             setConnectionTimeout(uint16_t timeout_ms, uint16_t timeout_ms_ssl);
+    // PIPE (2026-10-15): 时间水位字节换算（设计文档 §2.5）——targetBytes=min(延迟上限×码率, 容量×0.9)；readyBytes=READY_SEC×码率
+    size_t           targetBytes();
+    size_t           readyBytes();
     bool             setAudioPlayTime(uint16_t sec);
     bool             setTimeOffset(int sec);
     bool             setPinout(uint8_t BCLK, uint8_t LRC, uint8_t DOUT, int8_t MCLK = I2S_GPIO_UNUSED);
@@ -327,8 +319,6 @@ class Audio {  private:
     uint32_t         get_total_samples_in_file();
     uint32_t         getAudioFileDuration();
     uint32_t         getAudioCurrentTime();
-        bool testTone1k(int seconds, int align); // BUILDV5-TONE align: 0=right,1=left
-        static void toneTaskImpl(void* arg); // BUILDV5-TONE
     uint32_t         getAudioFilePosition();
     bool             setAudioFilePosition(uint32_t pos);
     uint32_t         inBufferFilled();  // returns the number of stored bytes in the inputbuffer
@@ -337,6 +327,9 @@ class Audio {  private:
     void             inBufferStatus() { InBuff.showStatus(); }
     void             samplesBufferStatus() { SamplesBuff.showStatus(); }
     void             setTone(float gainLowPass, float gainBandPass, float gainHighPass);
+    // BUILDV5-TONE (restored from backup_lib_dualbuf): emit 1kHz sine via the v4 i2s channel. align: 0=right,1=left
+    bool             testTone1k(int seconds, int align);
+    static void      toneTaskImpl(void* arg);
     void             setI2SCommFMT_LSB(bool commFMT);
     int              getCodec() { return m_codec; }
     const char*      getCodecname() { return codecname[m_codec]; }
@@ -523,11 +516,7 @@ class Audio {  private:
         uint16_t FREQ_PEAK_HZ = 1800;              // IIR Filter: peakingEQ
         uint16_t FREQ_HS_HZ = 6000;                // IIR Filter: highshelf
         float    QUALITY_SLOPE = 0.707;            // IIR Filter: quality (all shelfes)
-        bool     IIR_FILTER = false;               // IIR Filter: true -> IIR filter (highshelf, bandpass, lowshelf) are enabled
-                                                    // BUILDV5-FIX15 (2026-10-13): 默认 false——3-band EQ 增益全 0 时 IIR 无作用；
-                                                    // 且 coeffs/pre_gain 仅在 IIR_calculateCoefficients（setSampleRate
-                                                    // 采样率变化分支）计算——首播 48k 电台跳过 → coeffs=0 → biquad 输出
-                                                    // 恒 0 → 全程静音（"上电首播无声"根因）。禁用 = 直通，无副作用。
+        bool     IIR_FILTER = true;                // IIR Filter: true -> IIR filter (highshelf, bandpass, lowshelf) are enabled
         uint8_t  VU_BARS_ATTACK_STEP = 200;        // vu-meter:   bars rising steps
         uint8_t  VU_BARS_RELEASE_STEP = 30;        // vu-meter:   bars falling steps
         uint8_t  VU_BARS_HOLD_CYCLES = 1;          // vu-meter:   bars hold_cycles
@@ -545,11 +534,13 @@ class Audio {  private:
         bool     VOLUME_CONTROL = true;            // true: volume and balance control is enabled
         float    VOL_FADING_SPEED = 50.0;          // mute, volume fading 1.0f (fast) ... 100.0f (slow)
         uint32_t BUFFER_TRESHOLD_HLS = UINT16_MAX; // Level at which the HLS-TS stream starts and is reloaded
+        // PIPE (2026-10-15): 时间水位 TWB（设计文档 §2.5）。缓冲秒数=直播延迟秒数；卡顿频发→调大 DELAY_CAP，新闻准点→调小。最终值 S4 实测决定。
+        uint32_t PIPE_DELAY_CAP_SEC = 20;          // 延迟上限（缓冲深度上限秒数）
+        uint32_t PIPE_READY_SEC     = 3;           // 首播门控 + rebuffer 恢复水位
+        uint32_t PIPE_SWITCH_SEC    = 3;           // 预警线：缓冲剩 <3s 且下载未跟上 → [PIPE] alert（不触发切换——单 FIFO 无切换）
     } settings;
 
     std::atomic<uint32_t> m_dmaFreeDesc = 0;
-    std::atomic<uint32_t> m_dmaSentCount{0}; // BUILDV5-DIAG
-        int m_toneAlign = 0; // BUILDV5-TONE
 
   private:
     File                m_audiofile;
@@ -567,6 +558,9 @@ class Audio {  private:
     i2s_chan_handle_t m_i2s_tx_handle = {};
     i2s_chan_config_t m_i2s_chan_cfg = {}; // stores I2S channel values
     i2s_std_config_t  m_i2s_std_cfg = {};  // stores I2S driver values
+    int               m_toneAlign = 0;     // BUILDV5-TONE: 1kHz test tone slot alignment (0=right,1=left)
+    uint32_t          m_s2dbgPlayCnt  = 0; // S2DBG: playAudioData 诊断计数（每 N 次打一次水位）
+    uint32_t          m_s2dbgTsBytes  = 0; // S2DBG: processWebStreamTS 累计下载字节（每 32KB 打一次）
 
 #pragma GCC diagnostic pop
 
@@ -639,11 +633,22 @@ class Audio {  private:
     uint32_t m_avr_file_duration = 0;     // average duration in seconds, estimated
     uint32_t m_samples_since_start = 0;   //
 
-    int32_t  m_resumeFilePos = -1;       // the return value from stopSong(), (-1) is idle
-    int32_t  m_fileStartTime = -1;       // may be set in connecttoFS()
-    uint16_t m_m3u8_targetDuration = 10; //
-    uint32_t m_stsz_numEntries = 0;      // num of entries inside stsz atom (uint32_t)
-    uint32_t m_stsz_position = 0;        // pos of stsz atom within file
+    // DIAG 2026-10-16 [NET] segDone: 分片耗时分解（GET→头→body→间隔），纯观测不改行为
+    uint32_t m_diagSegT0 = 0;             // 本分片 GET 发起时刻
+    uint32_t m_diagSegHdr = 0;            // 本分片响应头完成时刻
+    uint32_t m_diagLastSegDone = 0;       // 上一分片读完时刻
+    // DIAG 2026-10-16 [PIPE]: 音频码率（分片字节/#EXTINF 时长）——TS 路径 m_avr_bitrate 被 TS 原始字节率(258KB/s)污染，用它折算 water/target/alert 全部失真
+    uint32_t m_pipeBitrate = 0;           //
+    float    m_pipeSegDurS = 0.0f;        // 最近 #EXTINF 分片时长(秒)，分片完成后算码率
+    // DIAG 2026-10-16 [OUT]: 播放输出连续性——缓冲耗尽(rebuffer 前兆)导致输出 gap 的计数，纯观测
+    uint32_t m_diagOutGapCnt = 0;         //
+    uint32_t m_diagOutGapStart = 0;       // 当前 gap 起始时刻(0=无 gap)
+
+    int32_t    m_resumeFilePos = -1;              // the return value from stopSong(), (-1) is idle
+    int32_t    m_fileStartTime = -1;              // may be set in connecttoFS()
+    uint16_t   m_m3u8_targetDuration = 10;        //
+    uint32_t   m_stsz_numEntries = 0;             // num of entries inside stsz atom (uint32_t)
+    uint32_t   m_stsz_position = 0;               // pos of stsz atom within file
 
     bool       m_f_haveNewFilePos = false;        // user changed the file position
     bool       m_f_I2S_init = false;              //
@@ -668,10 +673,6 @@ class Audio {  private:
     bool       m_f_rtsp = false;                  // set if RTSP is used (m3u8 stream)
     bool       m_f_m3u8data = false;              // used in processM3U8entries
     bool       m_f_continue = false;              // next m3u8 chunk is available
-    bool       m_prefetchActive = false;          // BUILDV5-DUALBUF: 下载目标 = prefetch（预取下一分片）
-    bool       m_playingFromPrefetch = false;     // BUILDV5-DUALBUF: 播放源 = prefetch（InBuff 播完无缝切换）
-    bool       m_pendingPrefetch = false;         // BUILDV5-DUALBUF: 分片切换重连(setDefaults)时保留 prefetch 状态
-    uint8_t    m_aacErrStrike = 0;                // BUILDV5-FIX12: 连续 AAC 解码错误计数（分片边界伪 sync 风暴 → 整段重扫）
     bool       m_f_ts = true;                     // transport stream
     bool       m_f_m4aID3dataAreRead = false;     // has the m4a-ID3data already been read?
     bool       m_f_psramFound = false;            // set in constructor, result of psramInit()
@@ -685,9 +686,8 @@ class Audio {  private:
     bool       m_f_audioTaskIsDecoding = false;   //
     bool       m_f_acceptRanges = false;          //
     bool       m_f_reset_m3u8Codec = true;        // reset codec for m3u8 stream
-    bool       m_f_connectionClose = false;       // set in parseHeaderLine
+    bool       m_f_connectionClose = false;       // set in parseHttpResponseHeader
     bool       m_f_i2s_channel_enabled = false;   // true if enabled
-    bool       m_f_alternative_user_agent = false;
     bool       m_f_mute = false;
     uint32_t   m_audioCurrentTime = 0;  // seconds
     uint32_t   m_audioDataStart = 0;    // in bytes
@@ -731,13 +731,13 @@ class Audio {  private:
     audiolib::fnsy_t       m_fnsy;
     audiolib::audioItems_t m_audio_items;
     // last inputs calculateVolumeLimits() ran against, so gain_ramp() can skip a repeat
-    bool                  m_limiterComputed = false;
-    float                 m_lastLimiterVolume = 0.0f;
-    float                 m_lastLimiterBalance = 0.0f;
-    audiolib::vu_items_t  m_vu_items;
-    audiolib::fft_items_t m_fft_items;
-    audiolib::i2s_items_t m_i2s_items;
-    audiolib::resampler_t m_resampler;
+    bool  m_limiterComputed    = false;
+    float m_lastLimiterVolume  = 0.0f;
+    float m_lastLimiterBalance = 0.0f;
+    audiolib::vu_items_t   m_vu_items;
+    audiolib::fft_items_t  m_fft_items;
+    audiolib::i2s_items_t  m_i2s_items;
+    audiolib::resampler_t  m_resampler;
 
     struct info_queue_t {
         std::deque<audiolib::InfoItem> queue;
@@ -828,10 +828,7 @@ class Audio {  private:
         switch (e) {
             case evt_image: txt.assignf("APIC found at pos {}", v[0]); break;
             case evt_vu: txt.assignf("l: {:03}, r: {:03}, pl: {:03}, pr: {:03}", v[0], v[1], v[2], v[3]); break;
-            case evt_spectrum:
-                txt.assignf("0...14: {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
-                            v[9], v[10], v[11], v[12], v[13], v[14]);
-                break;
+            case evt_spectrum: txt.assignf("0...14: {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}, {:03}", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14]); break;
             default: txt.assign("???"); break;
         }
         return enqueueInfo(instance, e, std::move(txt), 0, 0, std::vector<uint32_t>(v), std::vector<uint32_t>(p));
@@ -870,13 +867,6 @@ class Audio {  private:
         else
             return;
 
-        // BUILDV5-HLSFIX: 全局共享打印锁——AUDIO_LOG_IMPL 是变参模板，static 局部锁
-        // 每个模板实例各一把 → netTask 与 audioTask 用不同实例 → 锁不互斥 → UART
-        // 竞争崩溃（cap_fix11 链B 实证 readPlayListData log_i 崩）。改全局 g_printMutex
-        // （main.cpp 定义），所有打印路径共用一把。main 侧常规打印已删除（生产模式）。
-        if (!g_printMutex) return; // FreeRTOS 未就绪时静默跳过
-        xSemaphoreTake(g_printMutex, portMAX_DELAY);
-
         int add_len = std::snprintf(nullptr, 0, fmt, std::forward<Args>(args)...);
         if (add_len > 0) {
             logStr.appendf(fmt, std::forward<Args>(args)...); // <-- neue appendf()
@@ -904,14 +894,14 @@ class Audio {  private:
                 log_v("%s", logStr.c_get());
         }
         logStr.reset();
-        xSemaphoreGive(g_printMutex);
     }
 
 // Macro for comfortable calls
-#define AUDIO_LOG_ERROR(fmt, ...) AUDIO_LOG_IMPL(1, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
-#define AUDIO_LOG_WARN(fmt, ...)  AUDIO_LOG_IMPL(2, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
-#define AUDIO_LOG_INFO(fmt, ...)  AUDIO_LOG_IMPL(3, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
-#define AUDIO_LOG_DEBUG(fmt, ...) AUDIO_LOG_IMPL(4, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define AUDIO_LOG_ERROR(fmt, ...) do {} while (0)  // 临时关所有 ERROR 打印（调试触摸用）
+#define AUDIO_LOG_WARN(fmt, ...)  do {} while (0)
+#define AUDIO_LOG_INFO(fmt, ...)  do {} while (0)
+// S2-1 (2026-10-15): DEBUG 级日志全部静默——原厂 8786 条/180s 刷屏实测拖慢 audioTask（~350ms/s 串口占用）
+#define AUDIO_LOG_DEBUG(fmt, ...)  do {} while (0)
 };
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 // 📌📌📌  D E C O D E R  📌📌📌

@@ -95,20 +95,23 @@ extern uint8_t clockStyle;
 uint8_t getClockStyle();
 void saveClockStyle(uint8_t v);
 
-#define RADIO_SIDEBAR_W    70
-#define RADIO_HEADER_H     28
-#define RADIO_PLAYBAR_H    80
-#define RADIO_LIST_X       70
-#define RADIO_LIST_W       390
-#define RADIO_SCROLLBAR_W  8
-#define RADIO_LIST_TOP     (RADIO_HEADER_H)
+// 2026-10-20 UI 重构 (对齐 doubao app_17g7jt0w5v1 设计稿, 浅色主题):
+// 状态栏 24px | 左列 150px 分类 | 右列 330px (小标题 24 + 电台行 48×4) | 播放条 48px
+#define RADIO_SIDEBAR_W    150
+#define RADIO_HEADER_H     24
+#define RADIO_SUBHDR_H     24
+#define RADIO_PLAYBAR_H    48
+#define RADIO_LIST_X       (RADIO_SIDEBAR_W)
+#define RADIO_LIST_W       (480 - RADIO_SIDEBAR_W)
+#define RADIO_SCROLLBAR_W  5
+#define RADIO_LIST_TOP     (RADIO_HEADER_H + RADIO_SUBHDR_H)
 #define RADIO_LIST_BOT     (NAV_BAR_Y - RADIO_PLAYBAR_H)
 #define RADIO_LIST_H       (RADIO_LIST_BOT - RADIO_LIST_TOP)
 #define RADIO_SPECIAL_CNT  4
-#define RADIO_SPECIAL_H    22
-#define RADIO_ROW_H_SIDE   24
+#define RADIO_SPECIAL_H    28
+#define RADIO_ROW_H_SIDE   26
 #define RADIO_REGION_TOP   (RADIO_HEADER_H + RADIO_SPECIAL_CNT * RADIO_SPECIAL_H)
-#define RADIO_ROW_H        45
+#define RADIO_ROW_H        48
 #define RADIO_STATION_ROWS 4
 #define RADIO_FULLSCREEN   1
 #define RADIO_DBL_MS       500
@@ -156,9 +159,7 @@ extern char extraUrl[RMAX_EXTRA][260]; extern int extraUrlCount;
 static const char* RADIO_CATNAMES[] = { "交通","综合","经济","新闻","文艺","音乐","体育","农村","影视","教育","生活" };
 static const uint16_t RADIO_CATCOLS[] = { 0x34DB, 0x324B, 0xF4E2, 0xE267, 0xE3E4, 0x9AD6, 0x2E6E, 0x256C, 0xD2A0, 0x2C17, 0x1DF3 };
 #define RADIO_CATN (sizeof(RADIO_CATNAMES) / sizeof(RADIO_CATNAMES[0]))
-static const char* RLBL[] = { "全部", "收藏", "历史", "个人" };
-static const char* RHEAD[] = { "全国", "中央", "电视伴音", "国际" };
-static const char* RTAIL[] = { "海外", "其它" };
+static const char* RLBL[] = { "全国", "收藏", "历史", "个人" };
 #define RPINNED "广东"
 extern char radioPinnedUsed[18];
 static const char* RORDER[] = { "山东","浙江","河北","江苏","河南","吉林","四川","安徽","山西","辽宁","湖北","云南","新疆","黑龙江","湖南","江西","广西","内蒙古","贵州","福建","北京","陕西","青海","上海","香港","重庆","宁夏","甘肃","台湾","海南","西藏","天津","澳门" };
@@ -168,6 +169,8 @@ extern int currentPlayingSid;
 extern bool radioPlaying;
 extern bool radioInited;
 extern int radioVolume;
+extern bool radioMuted;          // 播放条静音 (点按音量区切换)
+extern uint16_t g_vuL, g_vuR;    // audio_process_i2s 钩子采样 L/R 峰值 (0..32767)
 extern bool musicPlaying;
 extern int regionScrollTop;
 extern int listScrollTop;
@@ -200,6 +203,7 @@ void drawNavBar();
 void handleTouch();
 void modeClock();
 void allocClockBufs();
+void allocClockBufsResident();  // BUILDV5-CLKFIX-A: boot 常驻分配(永不释放, 根治播放期切时钟空白)
 void freeClockBufs();
 void modeCalendar();
 void drawCalendar();
@@ -213,7 +217,6 @@ void pumpRadio();
 void handleRadioTap(uint16_t tx, uint16_t ty);
 void drawRadioHeader();
 void drawRadioRegionSidebar();
-void drawStationIcon(int cx, int cy, RadioStation* st, int size);
 void drawStationRow(int rowY, RadioStation* st, bool playing, bool favorited);
 void drawRadioList();
 void drawRadioPlayBar();
@@ -224,6 +227,11 @@ bool loadRadioMeta();
 String readURLForSid(int sid);
 void playStationAt(int sid);
 void stopRadio();
+void radioPause();               // 暂停 (保留 currentPlayingSid, 播放条可续播)
+void radioToggleMute();          // 静音切换
+void radioToggleFav(int sid);    // 星标收藏/取消 (NVS 持久化 + 收藏分类实时同步)
+void radioPushHist(int sid);     // 成功起播后自动记历史 (保留最近 30 个, NVS 持久化)
+void radioNvsLoad();             // 开机读回 NVS 收藏/历史
 void buildRadioCats();
 const char* radioPinnedKey();
 RadioStation* stn(int sid);

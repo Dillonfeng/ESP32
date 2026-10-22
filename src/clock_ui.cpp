@@ -8,6 +8,18 @@ static uint16_t *bandSram = nullptr;
 static uint16_t *bandBuf = nullptr;
 static uint16_t *flapTmp = nullptr;
 static uint16_t *analogFaceCache = nullptr;
+// BUILDV5-CLKFIX-B (2026-10-17): 时钟缓冲池——FLAP/ANALOG 共享一块 boot 常驻内部 RAM 池。
+// 根因(240s 抓包铁证): 样式切换(点击时钟页)走 allocClockBufs 样式互斥分支, free 旧样式缓冲后再
+// 分配新样式; 播放期内部堆碎片化 maxBlock=40KB < analogFace 42.6KB → 切回指针失败 → fallback 大字
+// ("指针时钟又没了")。修法 = boot 一次性分配 58.5KB 池(内部 RAM), FLAP 三缓冲 / ANALOG analogFace
+// 都指向池内偏移, 样式切换只改偏移+重建内容, 零 malloc/free → 与碎片完全无关, 切换永远成功。
+// 代价: 播放期内部空闲 81KB→66KB(池按 FLAP 最大需求常驻), 实施后抓包验证播音不受影响(验收标准)。
+static uint16_t *clockPool = nullptr;   // 内部 RAM 池
+// 池内偏移(元素) —— 数值对应 BAND_W=166,CARD_SRAM_H=123,CARD_W=56,ROLLER_W=16,CARD_H=120(宏在下方定义,此处用字面量)
+static const size_t OFF_BAND   = 0;
+static const size_t OFF_CARD   = (size_t)(166 * 123);              // bandSram 区 = 166*123 = 20418
+static const size_t OFF_ROLLER = OFF_CARD + (size_t)(56 * 123);    // +cardSram 56*123 → 27306
+static const size_t CLOCK_POOL_ELEMS = OFF_ROLLER + (size_t)(16 * 120); // +rollerSram 16*120 → 29226 (=58452B)
 static bool     analogFaceBuilt = false;
 struct FlipState {
   bool     flipping;
@@ -377,7 +389,7 @@ static void drawRollerBand(float scroll) {
 // 每帧驱动: 6 位数字两相翻�?+ 齿轮滚动量累�?(�?preview live_preview.Sim.tick �?�?
 static float rollLast = -1e6f;
 static void tickFlapClock(const char *target) {
-  if (!bandSram || !bandBuf || !flapTmp || !cardSram || !rollerSram) return;   // BUILD17: guard (alloc failed)
+  if (!cardSram || !rollerSram || !bandBuf || !flapTmp) return;   // CLKFIX 2026-10-16: bandSram 缺失=降级(齿轮带空白, 数字翻页正常), 不再整体不翻页
   uint32_t now = millis();
   float scroll = 0.0f;
   for (int i = 0; i < 6; i++) {
@@ -761,53 +773,61 @@ static void drawDateRow(int year, int mon, int mday, int wday) {
 // changes -- only where the buffers come from.
 static bool clockBufsReady = false;   // BUILD17: buffers for the current style are allocated
 void allocClockBufs() {
-  // CRITICAL: force MALLOC_CAP_INTERNAL. A plain malloc() (=MALLOC_CAP_DEFAULT) would route the
-  // ~40KB buffers (bandSram / analogFace / analogFaceCache) into octal PSRAM when internal is tight,
-  // and tft.pushImage() reading PSRAM => "rainbow screen" (anti-pattern R3). These display buffers
-  // MUST stay in internal RAM; the internal heap is large enough now that the .bss copy is gone.
-  if (clockStyle == STYLE_FLAP) {
-    // style-mutex: drop the analog buffers, keep/alloc the flap buffers
-    heap_caps_free(analogFace);      analogFace      = nullptr;
-    heap_caps_free(analogFaceCache); analogFaceCache = nullptr;
-    analogFaceBuilt = false;
-    if (!cardSram)   cardSram   = (uint16_t *)heap_caps_malloc((size_t)CARD_W * CARD_SRAM_H * 2, MALLOC_CAP_INTERNAL);
-    if (!rollerSram) rollerSram = (uint16_t *)heap_caps_malloc((size_t)ROLLER_W * CARD_H * 2, MALLOC_CAP_INTERNAL);
-    if (!bandSram)   bandSram   = (uint16_t *)heap_caps_malloc((size_t)BAND_W * CARD_SRAM_H * 2, MALLOC_CAP_INTERNAL);
-    if (!bandBuf)    bandBuf    = (uint16_t *)heap_caps_malloc((size_t)CARD_W * (CARD_H / 2) * 2, MALLOC_CAP_INTERNAL);
-    if (!flapTmp)    flapTmp    = (uint16_t *)heap_caps_malloc((size_t)CARD_W * (CARD_H / 2) * 2, MALLOC_CAP_INTERNAL);
-    if (cardSram && rollerSram && bandSram && bandBuf && flapTmp) clockBufsReady = true;
-    else { clockBufsReady = false; Serial.println("[MEM] BUILD17 flap buffer alloc FAILED (internal)"); }
-  } else {
-    heap_caps_free(cardSram);   cardSram   = nullptr;
-    heap_caps_free(rollerSram); rollerSram = nullptr;
-    heap_caps_free(bandSram);   bandSram   = nullptr;
-    heap_caps_free(bandBuf);    bandBuf    = nullptr;
-    heap_caps_free(flapTmp);    flapTmp    = nullptr;
-    // BUILD70: analogFaceCache is a memcpy SOURCE ONLY (never pushImage'd), so PSRAM is safe
-    // (R3 forbids PSRAM as direct pushImage source, not memcpy). Moving it to PSRAM cuts the
-    // internal-RAM requirement from 85KB (two 42.6KB blocks) to 42.6KB - fits the 71KB max
-    // contiguous internal block while audio is running (free internal ~84KB). Fixes blank
-    // analog clock page ("analog buffer alloc FAILED").
-    if (!analogFace) analogFace = (uint16_t *)heap_caps_malloc(146 * 146 * 2, MALLOC_CAP_INTERNAL);
-    if (!analogFaceCache) {
-      analogFaceCache = (uint16_t *)heap_caps_malloc(146 * 146 * 2, MALLOC_CAP_SPIRAM);
-      if (!analogFaceCache)  // PSRAM exhausted: fall back to internal (may fail as before)
-        analogFaceCache = (uint16_t *)heap_caps_malloc(146 * 146 * 2, MALLOC_CAP_INTERNAL);
-    }
-    if (analogFace && analogFaceCache) { clockBufsReady = true; analogFaceBuilt = false; }
-    else { clockBufsReady = false; Serial.println("[MEM] BUILD17 analog buffer alloc FAILED (internal)"); }
+  // CLKFIX-B: 池方案——boot 一次性分配 58.5KB 内部 RAM 池 + PSRAM 辅助缓冲(analogFaceCache/
+  // bandBuf/flapTmp)常驻; 样式切换只改池内偏移, 零 malloc/free → 播放期切样式/切页面永远成功。
+  if (!clockPool) {
+    clockPool = (uint16_t *)heap_caps_malloc(CLOCK_POOL_ELEMS * 2, MALLOC_CAP_INTERNAL);
+    Serial.printf("[MEM] clock pool alloc %uB -> %p (internalFree=%uKB maxBlock=%uKB)\n",
+                  (unsigned)(CLOCK_POOL_ELEMS * 2), (void*)clockPool,
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
   }
+  // PSRAM 辅助缓冲 boot 常驻（FLAP/ANALOG 共用，样式切换不动）
+  if (!analogFaceCache) analogFaceCache = (uint16_t *)heap_caps_malloc(146 * 146 * 2, MALLOC_CAP_SPIRAM);
+  if (!bandBuf) bandBuf = (uint16_t *)ps_malloc((size_t)CARD_W * (CARD_H / 2) * 2);
+  if (!flapTmp) flapTmp = (uint16_t *)ps_malloc((size_t)CARD_W * (CARD_H / 2) * 2);
+  if (!clockPool) {
+    clockBufsReady = false;
+    Serial.printf("[MEM] clock pool alloc FAILED: internalFree=%uKB maxBlock=%uKB\n",
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+    return;
+  }
+  // 样式 = 池内布局切换（零分配/释放）
+  if (clockStyle == STYLE_FLAP) {
+    bandSram   = clockPool + OFF_BAND;                 // 166*123 齿轮带
+    cardSram   = clockPool + OFF_CARD;                 // 56*123 整卡
+    rollerSram = clockPool + OFF_ROLLER;               // 16*120 齿轮
+    analogFace = nullptr;                              // 池被 FLAP 占用, ANALOG 指针逻辑置空(不 free!)
+    analogFaceBuilt = false;
+    clockBufsReady = (cardSram && rollerSram && bandBuf && flapTmp);
+  } else {
+    analogFace = clockPool;                            // 146*146 ≤ 池, 用池首部
+    bandSram   = nullptr; cardSram = nullptr; rollerSram = nullptr;  // 逻辑置空(不 free!)
+    analogFaceBuilt = false;
+    clockBufsReady = (analogFace && analogFaceCache);
+  }
+  Serial.printf("[MEM] allocClockBufs style=%d af=%p afc=%p bs=%p cs=%p rs=%p ready=%d\n",
+                clockStyle, (void*)analogFace, (void*)analogFaceCache,
+                (void*)bandSram, (void*)cardSram, (void*)rollerSram, clockBufsReady ? 1 : 0);
 }
 void freeClockBufs() {
-  heap_caps_free(analogFace);      analogFace      = nullptr;
-  heap_caps_free(analogFaceCache); analogFaceCache = nullptr;
-  heap_caps_free(cardSram);        cardSram        = nullptr;
-  heap_caps_free(rollerSram);      rollerSram      = nullptr;
-  heap_caps_free(bandSram);        bandSram        = nullptr;
-  heap_caps_free(bandBuf);         bandBuf         = nullptr;
-  heap_caps_free(flapTmp);         flapTmp         = nullptr;
-  analogFaceBuilt = false;
-  clockBufsReady = false;
+  // CLKFIX-B: 缓冲全部常驻(池), 无独立块可释放。保留空实现防其他引用。
+  Serial.printf("[MEM] freeClockBufs called (pool resident, no-op) af=%p\n", (void*)analogFace);
+}
+
+// BUILDV5-CLKFIX-A (2026-10-17): 时钟缓冲 boot 常驻——根治"播放期切时钟空白"。
+// 依据: V5 已全 HTTP 无 TLS, BUILD17"离开时钟页释放缓冲给 TLS handshake"的理由已过时
+// (main.cpp loop 的 freeClockBufs() 调用已删)。setup 末尾内存最干净时一次分配、永不释放
+// → 播放期切时钟直接用常驻缓冲, 与内部 RAM 碎片(maxBlock 40KB)无关。
+// allocClockBufs 本身幂等(判空才分配), 此处只调用 + 打 log(在 setup 单线程阶段, 无并发打印)。
+void allocClockBufsResident() {
+  allocClockBufs();
+  Serial.printf("[MEM] clock buf resident style=%s internalFree=%uKB maxBlock=%uKB ready=%d\n",
+                clockStyle == STYLE_FLAP ? "FLAP" : "ANALOG",
+                (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+                clockBufsReady ? 1 : 0);
 }
 
 void modeClock() {
@@ -829,7 +849,8 @@ void modeClock() {
       snprintf(cur, sizeof(cur), "%02d%02d%02d", h, m, s);
       flapInit();                              // 预渲染半�?齿轮 (PSRAM); 失败则�??�?
       for (int i = 0; i < 6; i++) {
-        if (!(flapReady && (i == 2 || i == 3))) drawCard(i, cur[i], false);  // �?,3 由齿�?带渲�?
+        // CLKFIX 2026-10-16: bandSram 缺失(降级)时 i=2/3 也走 drawCard, 避免中间两牌空白（原逻辑依赖齿轮带渲染）
+        if (!(flapReady && bandSram && (i == 2 || i == 3))) drawCard(i, cur[i], false);
         fstate[i].flipping = false;
         fstate[i].shown = cur[i]; fstate[i].newD = cur[i];
         fstate[i].clicks = 0; fstate[i].redrawn = true; fstate[i].startMs = 0;
@@ -838,7 +859,16 @@ void modeClock() {
       if (flapReady) drawRollerBand(0.0f);   // 两齿�?+ �?间两�? (2,3) �?次原子推�?(稳�??
       drawModeHint(STYLE_FLAP);
     } else {
-      drawAnalogClock(h, m, s);
+      // CLKFIX 2026-10-17: 仅当 analogFace 缺失(内部 RAM 不足)时首帧才画静态大字时间 fallback。
+      // 原实现漏了 if 判断无条件画绿字(0x4FE3) → analogFace 正常时首帧绿字残留,
+      // 表盘(146px)只覆盖中心, 左右两侧绿色时间残影残留 = 用户报告"指针时钟页面绿色时间小字"。
+      if (!analogFace || !analogFaceCache) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+        int tw = font32.textWidth(buf);
+        font32.drawStringFast(240 - tw / 2, 96, buf, 0x4FE3, COLOR_BG);
+        Serial.println("[CLK] analog fallback first-frame");
+      }
     }
     // 日期�?(农历/干支/节气/月相 均在 drawDateRow 内�?��??
     // 注意: 不画 "NTP OK" �?preview (make_preview.scene / draw_analog_scene) 均不显示,
@@ -851,6 +881,18 @@ void modeClock() {
   }
 
   if (clockStyle == STYLE_ANALOG) {
+    if (!analogFace || !analogFaceCache) {
+      // CLKFIX 2026-10-16: internal RAM low (analogFace 42.6KB alloc failed) -> degrade to static big text time (no second hand)
+      static uint32_t fbkLast = 0;
+      if (millis() - fbkLast >= 1000) {
+        fbkLast = millis();
+        Serial.printf("[CLK] analog fallback tick af=%p afc=%p style=%d\n", (void*)analogFace, (void*)analogFaceCache, clockStyle);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+        int tw = font32.textWidth(buf);
+        font32.drawStringFast(240 - tw / 2, 96, buf, 0x4FE3, COLOR_BG);
+      }
+    } else {
     // 指针样式: 秒针平滑�?�?, 每帧重绘表盘�?
     // �?ANALOG_FRAME_MS(�?0 FPS) 门控: loop() 无节�? 若每�?~1000+ FPS)都重绘整�?
     // (~40KB) 会把 20MHz SPI 打满 -> 整面�?�?/撕�?��?�限�?~30 FPS, 秒针 6°/s 仍平滑�??
@@ -862,6 +904,7 @@ void modeClock() {
       tft.startWrite();
       drawAnalogClock(h, m, s);
       tft.endWrite();
+    }
     }
   } else {
     // 翻页样式: 驱动两相 split-flap (非阻�? + 齿轮滚动。稳态时几乎不重绘�??

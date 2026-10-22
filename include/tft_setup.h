@@ -98,8 +98,14 @@
 //
 // ##################################################################################
 
-// #define SPI_TOUCH_FREQUENCY  2500000
-#define SPI_TOUCH_FREQUENCY  8000000   // BUILDV5: XPT2046 @8MHz (2.5MHz made getTouch ~14ms/loop -> 52Hz global loop limit)
+// SPI_TOUCH_FREQUENCY：8MHz（CALFIX-SPI25 验证无效已回退 2026-10-17：
+//   2.5MHz 下跳变依旧（raw rx 3072/raw ry 672 固定错误值），跳变与 SPI 频率无关，
+//   根因是按下瞬间 XPT2046 接触未稳的采样漂移，由 touchScanTask 延迟稳定采样解决）。
+// CALFIX-SPI25（2026-10-17）：2.5MHz + 一致性检查组合实验。
+// 依据（log 铁证）：cap_seq3（2.5MHz）5/5 全准含 28=(246,175)；
+// cap_seq7（8MHz+一致性）单击 8/8 全准但双击 28 仍跳（y 239）。
+// 两组件各自独立有效，组合验证是否同时解决单击全准 + 双击 28。
+#define SPI_TOUCH_FREQUENCY  2500000
 
 // Comment out the following to disable touch support
 #define SUPPORT_XPT2046

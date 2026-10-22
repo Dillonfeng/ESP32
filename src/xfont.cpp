@@ -674,9 +674,13 @@ bool XFont::loadAA(const String& fontPath)
         _aaUni = (uint16_t*)heap_caps_malloc(count * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         _aaAdv = (uint8_t*)heap_caps_malloc(count, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!_aaUni || !_aaAdv) { if (_aaUni) heap_caps_free(_aaUni); if (_aaAdv) heap_caps_free(_aaAdv); _aaUni = nullptr; _aaAdv = nullptr; f.close(); return false; }
-        // 索引区段 = 8 字节头 + count*(unicode 2 + adv 1)：一次性读完解析
+        // 索引区段 = 每个 glyph 开头(unicode 2 + adv 1)。⚠️ CLKFIX-FONTFIX (2026-10-17):
+        // 必须按 perGlyph 步进 seek——文件布局是 count×[unicode(2)+adv(1)+alpha(4096)],
+        // 原实现连续 f.read(g,3) 会把 alpha 字节流当成 unicode 表 → _aaUni 全垃圾 →
+        // findAA 失败 → hasGlyph=false → 黄历小字回退 16px 源 → 发虚 (cap_fontdg4 铁证)。
         for (uint16_t i = 0; i < count; i++) {
             uint8_t g[3];
+            if (!f.seek(8 + (uint32_t)i * perGlyph)) { heap_caps_free(_aaUni); heap_caps_free(_aaAdv); _aaUni = nullptr; _aaAdv = nullptr; f.close(); return false; }
             if (f.read(g, 3) != 3) { heap_caps_free(_aaUni); heap_caps_free(_aaAdv); _aaUni = nullptr; _aaAdv = nullptr; f.close(); return false; }
             _aaUni[i] = (uint16_t)((g[0] << 8) | g[1]);   // unicode 大端
             _aaAdv[i] = g[2];

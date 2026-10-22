@@ -40,8 +40,8 @@ const char* radioPinnedKey() {
   const char* p = geo::pinned();
   return (p && p[0]) ? p : RPINNED;
 }
-// 重建收音机分类 (全部/收藏/历史/个人 + 地区)。地区顺序镜像 mobile getCategoryList():
-// RHEAD(4) -> 置顶省(若不在 RHEAD/RORDER 则插到 RHEAD 后) -> RORDER(跳过已置顶) -> RTAIL(2)。
+// 重建收音机分类。2026-10-20 对齐设计稿左列顺序:
+//   全国·中央·国际·海外(固定4) -> 置顶省 -> 省市(RORDER) -> 其它 -> 伴音 -> 收藏 -> 历史 -> 个人
 // 联网定位到省份后可再调一次重建, 让置顶省(完整名)正确出现在列表中 (与 preview 一致)。
 void buildRadioCats() {
   // 释放旧 sids (避免重复构建时 PSRAM 泄漏)
@@ -57,12 +57,7 @@ void buildRadioCats() {
     if (c.sids && seq) memcpy(c.sids, seq, (size_t)n * 2);
     radioCatCount++;
   };
-  addCat(RLBL[0], RLBL[0], true, allSeq, allCount);
-  addCat(RLBL[1], RLBL[1], true, favSids, favCount);
-  addCat(RLBL[2], RLBL[2], true, histSids, histCount);
-  static uint16_t userSeq[16]; int userN = 0;
-  for (int e = 0; e < extraCount; e++) if (stn(radioBinTotal + e) && stn(radioBinTotal + e)->is_user) userSeq[userN++] = radioBinTotal + e;
-  addCat(RLBL[3], RLBL[3], true, userSeq, userN);
+  addCat(RLBL[0], RLBL[0], true, allSeq, allCount);   // 全国
   // 2 字缩写: 电视伴音->伴音 / 黑龙江->龙江 / 内蒙古->内蒙 (镜像 mobile labelMap)
   auto labelOf = [](const char* key) -> const char* {
     if (strcmp(key, "电视伴音") == 0) return "伴音";
@@ -75,13 +70,19 @@ void buildRadioCats() {
     for (int i = 0; i < allCount; i++) { RadioStation* s = stn(allSeq[i]); if (s && strcmp(s->region, key) == 0) rc[n++] = allSeq[i]; }   // 仅 channels(1652), 与 preview region_cats 一致
     addCat(labelOf(key), key, false, rc, n);
   };
+  // 设计稿顶部固定 4 分类: 全国已在 cat0, 这里接 中央/国际/海外
+  regionCat("中央"); regionCat("国际"); regionCat("海外");
   const char* pinned = radioPinnedKey();
   strlcpy(radioPinnedUsed, pinned, sizeof(radioPinnedUsed));   // 记录本次用的置顶省名, loop 比对用
-  for (int i = 0; i < 4; i++) regionCat(RHEAD[i]);
-  if (strcmp(pinned, RHEAD[0]) != 0 && strcmp(pinned, RHEAD[1]) != 0 && strcmp(pinned, RHEAD[2]) != 0 && strcmp(pinned, RHEAD[3]) != 0)
+  if (strcmp(pinned, "中央") != 0 && strcmp(pinned, "国际") != 0 && strcmp(pinned, "海外") != 0)
     regionCat(pinned);
   for (int i = 0; i < RORDER_N; i++) if (strcmp(RORDER[i], pinned) != 0) regionCat(RORDER[i]);
-  for (int i = 0; i < 2; i++) regionCat(RTAIL[i]);
+  regionCat("其它"); regionCat("电视伴音");
+  static uint16_t userSeq[16]; int userN = 0;
+  for (int e = 0; e < extraCount; e++) if (stn(radioBinTotal + e) && stn(radioBinTotal + e)->is_user) userSeq[userN++] = radioBinTotal + e;
+  addCat(RLBL[1], RLBL[1], true, favSids, favCount);   // 收藏
+  addCat(RLBL[2], RLBL[2], true, histSids, histCount); // 历史
+  addCat(RLBL[3], RLBL[3], true, userSeq, userN);      // 个人
 }
 bool loadRadioMeta() {
   File f = LittleFS.open("/radio_meta.bin", "r");
@@ -152,10 +153,70 @@ bool loadRadioMeta() {
   memcpy(allSeq, all, (size_t)allCnt * 2); allCount = allCnt;
   memcpy(favSids, fav, (size_t)favCnt * 2); favCount = favCnt;
   memcpy(histSids, hist, (size_t)histCnt * 2); histCount = histCnt;
+  radioNvsLoad();          // 2026-10-20: NVS 里用户运行时点亮的收藏/历史优先于离线 meta
   buildRadioCats();
   f.close();
   Serial.printf("radio_meta: %d stn, %d cats, %d all, %d fav, %d hist\n", radioStnTotal, radioCatCount, allCount, favCount, histCount);
   radioInited = true; return true;
+}
+// ---- 收藏/历史 运行时更新 + NVS 持久化 (设计稿: 星标实时同步, 历史自动记 30 个) ----
+#define RNVS_NS      "rmeta"
+#define RNVS_HISTMAX 30
+bool radioMuted = false;
+static void radioNvsSaveFH() {
+  nvs_handle_t h;
+  if (nvs_open(RNVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_set_blob(h, "fav", favSids, (size_t)favCount * 2);
+  nvs_set_blob(h, "hist", histSids, (size_t)histCount * 2);
+  nvs_commit(h); nvs_close(h);
+}
+void radioNvsLoad() {
+  nvs_handle_t h;
+  if (nvs_open(RNVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+  size_t sz = 0;
+  if (nvs_get_blob(h, "fav", NULL, &sz) == ESP_OK && sz > 0 && sz <= sizeof(favSids) && sz % 2 == 0)
+    if (nvs_get_blob(h, "fav", favSids, &sz) == ESP_OK) favCount = (int)(sz / 2);
+  sz = 0;
+  if (nvs_get_blob(h, "hist", NULL, &sz) == ESP_OK && sz > 0 && sz <= sizeof(histSids) && sz % 2 == 0)
+    if (nvs_get_blob(h, "hist", histSids, &sz) == ESP_OK) histCount = (int)(sz / 2);
+  nvs_close(h);
+}
+void radioToggleFav(int sid) {
+  if (sid < 0 || sid >= radioStnTotal) return;
+  int idx = -1;
+  for (int i = 0; i < favCount; i++) if (favSids[i] == sid) { idx = i; break; }
+  if (idx >= 0) {                       // 取消收藏
+    for (int i = idx; i < favCount - 1; i++) favSids[i] = favSids[i + 1];
+    favCount--;
+  } else {                              // 收藏 (满则挤掉最旧)
+    if (favCount >= RMAX_FAV) favCount = RMAX_FAV - 1;
+    for (int i = favCount; i > 0; i--) favSids[i] = favSids[i - 1];
+    favSids[0] = (uint16_t)sid; favCount++;
+  }
+  radioNvsSaveFH();
+  buildRadioCats();                     // 收藏分类实时同步
+  Serial.printf("[RADIO] fav toggle sid=%d -> %d favs\n", sid, favCount);
+}
+void radioPushHist(int sid) {
+  if (sid < 0 || sid >= radioStnTotal) return;
+  int idx = -1;
+  for (int i = 0; i < histCount; i++) if (histSids[i] == sid) { idx = i; break; }
+  if (idx >= 0) { for (int i = idx; i < histCount - 1; i++) histSids[i] = histSids[i + 1]; histCount--; }
+  if (histCount >= RNVS_HISTMAX) histCount = RNVS_HISTMAX - 1;   // 设计稿: 保留最近 30 个
+  for (int i = histCount; i > 0; i--) histSids[i] = histSids[i - 1];
+  histSids[0] = (uint16_t)sid; histCount++;
+  radioNvsSaveFH();
+  buildRadioCats();                     // 历史分类实时同步
+}
+void radioPause() {   // 暂停: 停流但保留 currentPlayingSid, 播放条 ▶ 可续播同一台
+  radioPlaying = false;
+  audio.stopSong();
+  digitalWrite(STATUS_LED_PIN, LOW);
+}
+void radioToggleMute() {
+  radioMuted = !radioMuted;
+  audio.setVolume(radioMuted ? 0 : (uint8_t)radioVolume);
+  Serial.printf("[RADIO] mute -> %d (vol=%d)\n", radioMuted, radioVolume);
 }
 void playStationAt(int sid) {
   RadioStation* s = stn(sid); if (!s) return;

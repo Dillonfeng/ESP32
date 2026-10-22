@@ -27,6 +27,10 @@ void touchDriverInit() {
   s_spi = &tft.getSPIinstance();      // 与显示共用 FSPI 总线（不同 CS），bus lock 互斥
   pinMode(TOUCH_CS, OUTPUT);
   digitalWrite(TOUCH_CS, HIGH);       // 触摸片选默认释放
+  // CALFIX-PENIRQ（2026-10-17，硬件信号方案）：GPIO38 = XPT2046 PENIRQ（按下拉低/抬起拉高）。
+  //   PENIRQ 开漏输出 → 内部上拉。按下/抬起由硬件信号判定（替代 Z2 压力采样），
+  //   XY 采样前永远没有 0xC0(Z2) 事务 → 彻底绕开已证实的残留污染链。
+  pinMode(TOUCH_IRQ, INPUT_PULLUP);
   // BUILDV5-CALIB: 读取 NVS 校准（校准模式写入，重启后自动生效）
   Preferences pref;
   if (pref.begin("tcal", true)) {
@@ -40,8 +44,33 @@ void touchDriverInit() {
   }
 }
 
+// CALFIX-PENIRQ: 原始 ADC → 屏幕坐标（抽取自原 touchDriverRead 内联块，PENIRQ 采样与校准共用）
+static bool convertRawXY(uint16_t rx, uint16_t ry, uint16_t* scrX, uint16_t* scrY) {
+  uint16_t x0 = s_touchCalib[0], x1 = s_touchCalib[1];
+  uint16_t y0 = s_touchCalib[2], y1 = s_touchCalib[3];
+  uint8_t fl = s_touchCalib[4];
+  int32_t a, b;                       // 防下溢用有符号
+  if (fl & 0x01) {                    // rotate: ry→屏幕X, rx→屏幕Y
+    a = (fl & 0x02) ? (int32_t)(x0 + x1) - ry : (int32_t)ry - x0;   // inv_x
+    b = (fl & 0x04) ? (int32_t)(y0 + y1) - rx : (int32_t)rx - y0;   // inv_y
+  } else {                            // 直连: rx→屏幕X, ry→屏幕Y
+    a = (fl & 0x02) ? (int32_t)(x0 + x1) - rx : (int32_t)rx - x0;   // inv_x
+    b = (fl & 0x04) ? (int32_t)(y0 + y1) - ry : (int32_t)ry - y0;   // inv_y
+  }
+  if (a < 0) a = 0; if (b < 0) b = 0;
+  uint16_t xx = (uint16_t)(((uint32_t)a * 480u) / x1);
+  uint16_t yy = (uint16_t)(((uint32_t)b * 320u) / y1);
+  if (xx >= 480 || yy >= 320) return false;
+  *scrX = xx;
+  *scrY = yy;
+  return true;
+}
+
 // 单次 Z1 压力采样（简化自 TFT_eSPI getTouchRawZ，只读一次转换）
 // XPT2046：无触摸时 Z 开路 → 4095；触摸时下降（数百~数千）。
+// CALFIX-PD 已回退（2026-10-17）：PD=01 假设被 TFT_eSPI 原版源码推翻
+//   （.pio/libdeps/s3v5/TFT_eSPI/Extensions/Touch.cpp 原版即用 0xB0/0xD0/0x90
+//   PD=00 且稳定工作）。跳变根因另查（两次采样一致性检查缺失，见 touchScanTask）。
 static uint16_t touchReadZ() {
   uint8_t cmds[3] = {0xB0, 0x00, 0x00};
   uint8_t rx[3];
@@ -71,7 +100,7 @@ static uint16_t touchReadZ2() {
 }
 
 // 原始 X/Y 采样（逐字节复制 TFT_eSPI getTouchRaw 的 17 字节全双工序列：
-// 4 次 X 采样取最后一次 → 4 次 Y 采样取最后一次）
+// 4 次 X 采样取最后一次 → 4 次 Y 采样取最后一次；0xD0/0x90 与 TFT_eSPI 原版一致）
 static void touchReadRawXY(uint16_t* x, uint16_t* y) {
   static const uint8_t cmds[17] = {0xD0,0,0xD0,0,0xD0,0,0xD0,0,0x90,0,0x90,0,0x90,0,0x90,0,0};
   uint8_t rx[17];
@@ -87,90 +116,93 @@ static void touchReadRawXY(uint16_t* x, uint16_t* y) {
 
 bool touchDriverRead(uint16_t* scrX, uint16_t* scrY, uint16_t* z) {
   if (!s_spi) return false;
-  // BUILDV5-BASE1: 裸读（无锁）——SPI 总线互斥是【并发调用方】的职责：
-  //  - 单任务基线：main loop 单线程调用，无并发，天然安全；
-  //  - 多任务模式：调用方（touchScanTask）自行包 g_spiMutex。
-  // 锁放任务层而不是驱动内，避免 main loop 已在 g_spiMutex 内调用时重复取锁死锁。
-  // BUILDV5-STEP3-TFIX5（决定性，log 铁证）：触摸判定从 z1>400 改为 z2>500。
-  //   实测：无触摸 z1=63/z2=0；按"全国"(上半部轻压) z1=384/z2=3072；按侧栏 z1=448/z2=3072。
-  //   原 z1>400 阈值使"全国"位置差 16 被拒 → "上半屏点不中"。z2 裕量 6 倍，全区域统一可靠。
-  uint16_t z1 = touchReadZ();
-  uint16_t z2 = touchReadZ2();
-  if (z) *z = z1;
-  if (z2 <= 500) return false; // 无触摸 z2≈0；触摸 z2≈3072
+  // CALFIX-PENIRQ（2026-10-17，硬件信号方案，取代 SEPXY-P）：
+  //   按下/抬起 = GPIO38 PENIRQ 电平（低=按下），不再做 Z1/Z2 压力采样。
+  //   采样完成后重读 PENIRQ 确认（转换期间 PENIRQ 可能短暂抖动）。
+  bool irqLow = (digitalRead(TOUCH_IRQ) == LOW);
+  if (!irqLow) return false;   // 抬起/无触摸
 
-  uint16_t rx, ry;
-  touchReadRawXY(&rx, &ry);
-  g_touchRawRX = rx; g_touchRawRY = ry; // BUILDV5-CALIB: 原始值供坐标校准诊断
-
-  // convertRawXY 按 s_touchCalib + flags 换算（BUILDV5-CALIB 可配置版；
-  // 默认值与原 hardcode 等价 {194,3767,174,3844,0x01} rotate 无 invert）
-  uint16_t x0 = s_touchCalib[0], x1 = s_touchCalib[1];
-  uint16_t y0 = s_touchCalib[2], y1 = s_touchCalib[3];
-  uint8_t fl = s_touchCalib[4];
-  int32_t a, b;                       // 防下溢用有符号
-  if (fl & 0x01) {                    // rotate: ry→屏幕X, rx→屏幕Y
-    a = (fl & 0x02) ? (int32_t)(x0 + x1) - ry : (int32_t)ry - x0;   // inv_x
-    b = (fl & 0x04) ? (int32_t)(y0 + y1) - rx : (int32_t)rx - y0;   // inv_y
-  } else {                            // 直连: rx→屏幕X, ry→屏幕Y
-    a = (fl & 0x02) ? (int32_t)(x0 + x1) - rx : (int32_t)rx - x0;   // inv_x
-    b = (fl & 0x04) ? (int32_t)(y0 + y1) - ry : (int32_t)ry - y0;   // inv_y
+  // MEDIAN-FILTER（2026-10-18）：采样 5 次，去掉最大值和最小值，取中间 3 次的平均值
+  // 业界标准做法（野火/战舰/INAIRSPACE）：过滤偶发跳变噪声（如 raw X=3072/0xC00）
+  const int N = 5;
+  uint16_t xs[N], ys[N];
+  for (int i = 0; i < N; i++) {
+    touchReadRawXY(&xs[i], &ys[i]);
   }
-  if (a < 0) a = 0; if (b < 0) b = 0;
-  uint16_t xx = (uint16_t)(((uint32_t)a * 480u) / x1);
-  uint16_t yy = (uint16_t)(((uint32_t)b * 320u) / y1);
-  if (xx >= 480 || yy >= 320) return false;
+  // 采样后再确认（CS 拉高后等 PENIRQ 稳定 ~10µs 再读，避免转换释放瞬间误判抬起）
+  delayMicroseconds(10);
+  int irqAfter = digitalRead(TOUCH_IRQ);
+  if (irqAfter != LOW) {
+    Serial.printf("[TS-DBG] sampled 5x but GPIO38 went HIGH (irqAfter=%d) -> reject\n", irqAfter);
+    return false;   // 抖动/已抬起 → 无效
+  }
 
-  *scrX = xx;
-  *scrY = yy;
+  // 排序 X 和 Y（简单冒泡，N=5 足够快）
+  for (int i = 0; i < N - 1; i++) {
+    for (int j = i + 1; j < N; j++) {
+      if (xs[i] > xs[j]) { uint16_t t = xs[i]; xs[i] = xs[j]; xs[j] = t; }
+      if (ys[i] > ys[j]) { uint16_t t = ys[i]; ys[i] = ys[j]; ys[j] = t; }
+    }
+  }
+  // 去掉最大值和最小值（xs[0]/ys[0] 和 xs[4]/ys[4]），取中间 3 次平均（xs[1..3]/ys[1..3]）
+  uint16_t rx = (uint16_t)((xs[1] + xs[2] + xs[3]) / 3);
+  uint16_t ry = (uint16_t)((ys[1] + ys[2] + ys[3]) / 3);
+  g_touchRawRX = rx; g_touchRawRY = ry; // BUILDV5-CALIB: 原始值供坐标校准诊断
+  if (z) *z = 0;   // PENIRQ 方案无 Z 读数（按下/抬起由硬件信号判定）
+  if (!convertRawXY(rx, ry, scrX, scrY)) return false;
   return true;
 }
 
-// 触摸扫描任务：80ms 采样（单次 <1ms，SPI 8MHz；BUILDV5-HLSFIX: 40→80ms 减半
-// 跨核唤醒频率 → 压 IDF5.5 crosscore ISR/systimer 竞态异常（cap_fix14 40次/300s）；
-// 12.5Hz 采样对拖动/点击足够），写共享状态。
-// 不碰 TFT_eSPI 的 getTouch/绘制（绕开其 FreeRTOS spi_mutex）→ 无断言崩溃风险。
+// 触摸扫描任务：CALFIX-PENIRQ（2026-10-17）——5ms 轮询 GPIO38 PENIRQ 电平判定
+// 按下/抬起（低=按下，硬件信号），按下时采样 XY（无 Z 前置 → 干净）。
+// 写共享状态；不碰 TFT_eSPI 的 getTouch/绘制（绕开其 FreeRTOS spi_mutex）→ 无断言崩溃风险。
+// ⚠️ 任何 Z(0xB0/0xC0) 采样都会污染其后 ≤5ms 的 XY（残留 >3ms 铁证）——本任务内
+// 不再做 Z 采样；校准/touchDiag 也改用 PENIRQ 判定（见下）。
 void touchScanTask(void* arg) {
   touchDriverInit();
-  uint32_t lastDbg = 0;
+  int lastIrq = digitalRead(TOUCH_IRQ);
+  uint32_t lastBeat = 0;
+  Serial.printf("[PENIRQ] boot initial GPIO38=%d\n", lastIrq);
   while (true) {
+    // 边沿触发诊断：GPIO38 电平任何变化立即打印（不做 1Hz 轮询错过窗口）。
+    // 判据：按下应变 0、松开应变 1；全程无任何 [EDGE] = 信号物理未到达 GPIO38。
+    int curIrq = digitalRead(TOUCH_IRQ);
+    if (curIrq != lastIrq) {
+      Serial.printf("[PENIRQ-EDGE] %d -> %d @%lums\n", lastIrq, curIrq, millis());
+      lastIrq = curIrq;
+    }
     // BUILDV5-BASE1: 锁归并发调用方——采样任务包 g_spiMutex 与 main loop 显示互斥
     if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
     uint16_t sx, sy, sz;
     bool down = touchDriverRead(&sx, &sy, &sz);
     if (g_spiMutex) xSemaphoreGive(g_spiMutex);
     s_touchDown = down;
-    if (down) { s_touchX = sx; s_touchY = sy; }
-    // BUILDV5-STEP3-TFIX4: 1Hz 压力诊断（Z1+Z2+差值，含被 400 阈值拒绝的触摸——
-    // 验证"上半屏点不中"：面板上半部 z1 弱（63-115），改用 z1-z2 差值判断
-    // 是否足够区分触摸/无触摸）
-    if (millis() - lastDbg >= 1000) {
-      lastDbg = millis();
-      if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
-      uint16_t z1d = touchReadZ();
-      uint16_t z2d = touchReadZ2();
-      if (g_spiMutex) xSemaphoreGive(g_spiMutex);
-      int zd = (int)z1d - (int)z2d;
-      Serial.printf("[TOUCH-SCAN] z1=%u z2=%u dz=%d down=%d%s\n", z1d, z2d, zd,
-                    down ? 1 : 0, down ? "" : " (rejected)");
+    if (down) {
+      s_touchX = sx; s_touchY = sy;
+      Serial.printf("[TS] press(%u,%u) raw(%u,%u)\n", sx, sy, g_touchRawRX, g_touchRawRY);
     }
-    vTaskDelay(80 / portTICK_PERIOD_MS);
+    // 100ms 心跳（高频打印 GPIO38 电平，验证我们读的是不是对的）
+    if (millis() - lastBeat >= 100) {
+      lastBeat = millis();
+      Serial.printf("[PENIRQ-BEAT] GPIO38=%d down=%d\n", digitalRead(TOUCH_IRQ), down ? 1 : 0);
+    }
+    // 2ms 轮询（边沿捕捉 + 快速点击/双击不丢；无触摸时只读 GPIO 不触发 SPI）
+    vTaskDelay(2 / portTICK_PERIOD_MS);
   }
 }
 
-// BUILDV5-STEP3-TFIX4: 原始触摸数据转储（串口键 'T'）——无触摸基线 vs 触摸对照，
-// 用于确定可靠的压力/坐标判定方案（Z1 读数异常时改用 X/Y 有效范围判触摸）。
+// BUILDV5-STEP3-TFIX4: 原始触摸数据转储（串口键 'T'）——无触摸基线 vs 触摸对照。
+// CALFIX-PENIRQ（2026-10-17）：改用 GPIO38 PENIRQ 判定，删除 Z 采样（污染 XY）。
 void touchDiag(int seconds) {
   Serial.println("[DIAG] touch raw dump: keep still 2s, then tap 全国, then tap center");
   uint32_t t0 = millis();
   while (millis() - t0 < (uint32_t)seconds * 1000) {
     if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
-    uint16_t z1 = touchReadZ();
-    uint16_t z2 = touchReadZ2();
+    bool irqLow = (digitalRead(TOUCH_IRQ) == LOW);
     uint16_t rx = 0, ry = 0;
-    touchReadRawXY(&rx, &ry);
+    touchReadRawXY(&rx, &ry);   // 无 Z 前置，采样干净
     if (g_spiMutex) xSemaphoreGive(g_spiMutex);
-    Serial.printf("[DIAG] z1=%u z2=%u dz=%d rx=%u ry=%u\n", z1, z2, (int)z1 - (int)z2, rx, ry);
+    Serial.printf("[DIAG] irq=%d rx=%u ry=%u\n", irqLow ? 1 : 0, rx, ry);
     delay(400);
   }
   Serial.println("[DIAG] dump done");
@@ -185,6 +217,9 @@ void touchDiag(int seconds) {
 // 等待用户在 (tx,ty) 目标处点击并采样（BUILDV5-CALIB2 重写）：
 //   按下即开始累积原始 ADC，抬手即完成（≥3 个采样即可）；每次采样画一个
 //   绿色进度点（底部），用户看到反馈就知道在采。不再要求"按住 1 秒"。
+// CALFIX-PENIRQ（2026-10-17）：按下/抬起判定改用 GPIO38 PENIRQ（低=按下），
+//   删除 z2 采样——Z(0xC0) 会污染紧接的 XY(0xD0)（残留 >3ms 铁证）→ 校准原始
+//   值不再被污染（此前校准可能在跳变值上拟合）。
 static bool calibSampleCorner(uint16_t* outRX, uint16_t* outRY) {
   uint32_t sumX = 0, sumY = 0;
   int n = 0;
@@ -192,19 +227,17 @@ static bool calibSampleCorner(uint16_t* outRX, uint16_t* outRY) {
   uint32_t t0 = millis();
   while (millis() - t0 < 15000) {
     if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
-    uint16_t z1 = touchReadZ();
-    uint16_t z2 = touchReadZ2();
-    uint16_t rx = 0, ry = 0;
-    // BUILDV5-STEP3-TFIX5: 与运行判定一致改用 z2>500（无触摸 z2≈0，触摸 ≈3072）
-    if (z2 > 500) {
-      touchReadRawXY(&rx, &ry);
+    bool irqLow = (digitalRead(TOUCH_IRQ) == LOW);   // PENIRQ 低 = 按下
+    if (irqLow) {
+      uint16_t rx = 0, ry = 0;
+      touchReadRawXY(&rx, &ry);                       // 无 Z 前置，采样干净
       sumX += rx; sumY += ry;
       n++;
       wasDown = true;
       if (n <= 20) tft.fillCircle(30 + n * 20, 300, 5, TFT_GREEN); // 进度点
     }
     if (g_spiMutex) xSemaphoreGive(g_spiMutex);
-    if (wasDown && z2 <= 500) break;   // 按过且已抬手 → 完成本次点击
+    if (wasDown && !irqLow) break;   // 按过且已抬手 → 完成本次点击
     if (n >= 20) break;
     delay(5);
   }
@@ -214,9 +247,9 @@ static bool calibSampleCorner(uint16_t* outRX, uint16_t* outRY) {
   uint32_t up0 = millis();
   while (millis() - up0 < 800) {
     if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
-    uint16_t zz = touchReadZ2();
+    bool irqLow = (digitalRead(TOUCH_IRQ) == LOW);
     if (g_spiMutex) xSemaphoreGive(g_spiMutex);
-    if (zz <= 500) break;
+    if (!irqLow) break;
     delay(20);
   }
   if (n < 3) { Serial.printf("[CALIB] corner: only %d samples, retry\n", n); return false; }

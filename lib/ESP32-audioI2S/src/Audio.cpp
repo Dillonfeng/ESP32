@@ -4,8 +4,8 @@
 
     Created on: 28.10.2018                                                                                                  */
 char audioI2SVers[] = "\
-    Version 4.0.0v                                                                                                                         ";
-/*  Updated on: Oct 05, 2026
+    Version 4.0.0o                                                                                                                         ";
+/*  Updated on: Sep 06, 2026
 
     Author: Wolle (schreibfaul1)
     Audio library for ESP32, ESP32-S3 or ESP32-P4
@@ -25,32 +25,6 @@ char audioI2SVers[] = "\
 #include "wav_decoder/wav_decoder.h"
 
 // constants
-// BUILDV5-HLSBUF: HLS TS 流 stream-ready / 分片切换水位。
-// BUILDV5-DUALBUF 决定性修正（cap_dualbuf/cap_net1 实证）：600K 深缓冲设计依赖单缓冲
-// （InBuff 1.5MB 连续 burst 填满 → 播放开始 13s 深缓冲），但双缓冲改造后分片写完即切
-// prefetch（cap_diag3：分片 fileSize=109416B），InBuff 每分片只到 ~109KB → total 最大
-// 218KB < 600K → m_f_stream 永不置 true → 播放死锁（notready 刷屏、下载每包等 16ms
-// → 11KB/s、点击十几秒无声）。双缓冲下 ready 阈值必须 < 分片大小：下载 90KB（<1s）
-// 即启动播放，分片切换断流由 prefetch 预取 N+1 无缝覆盖（业界 HLS 播放器标准架构）。
-constexpr size_t BUILDV5_HLS_BUF = 90000;
-// BUILDV5-FIX16 (2026-10-13): 预取目标水位 = 2 个 HLS 分片 ≈ 6s 缓冲（~218KB）。
-// 用户提议"延长预取"验证缓冲抗抖动：当前 prefetch 只装 1 分片(109KB≈3s)，
-// 网络时段性拥塞(下载 27KB/s vs 播放 110KB/s)时边界提前量不足 → in=0 pref=0 双空断流。
-// 提高水位 → prefetch 累积 2 分片(218KB≈6s) + InBuff 同样加深 → 总缓冲 ~12s 抗抖动，
-// 代价：内容延迟 ~6s（直播不实时，用户已接受）。先验证缓冲原理，再上真双连接。
-// BUILDV5-SCALE1 (2026-10-14): 单连接极限验证——目标 218K(6s)→400K(≈12s) + 轮询 3s→1s。
-// 根因（log 铁证）：分片粒度调度下缓冲零余量（分片 3s 播放 vs 轮询 3s 相位漂移 → 10s 周期断流）。
-// 加大预取目标 + 1s 轮询 → prefetch 累积 ~4 分片(12s)深缓冲 → 切换间隔拉长、相位问题消除。
-// 若 90s 抓包 dip 仍高 → 单连接天花板确认 → 上双连接（连接 B 独立持续下载）。
-constexpr size_t BUILDV5_PREFETCH_TARGET = 400000;
-// 下载水位 = InBuff 容量：永不触发 → 缓冲期 burst 狂填至 1.5MB 满（hlsbuf2 行为，
-// 曾证 100% 实时零低谷）。PSRAM 账：font32 Flash 直读已释放 1.48MB（BUILDV5-FONTF），
-// 播放中余量 1.48MB 实测安全（此前字体 2.5MB 占 PSRAM 时余量 78KB → libfaad ps_calloc NULL panic，
-// 已实证 RESET_REASON=4 + EXCVADDR=0x2）。水位限流（1.0MB）反而造成 10s 分片周期低谷，禁用。
-constexpr size_t BUILDV5_HLS_WATERMARK = 1500000;
-// 700K ≈ 6.25 秒：分片下载完时缓冲 < 此值才立即预取下一分片（无缝），
-// 否则等播放消耗到 700K 再切换（断流 4 秒仍剩 2.25 秒缓冲）。
-constexpr size_t BUILDV5_HLS_SWITCH = 700000;
 constexpr size_t m_frameSizeWav = 4096;
 constexpr size_t m_frameSizeMP3 = 18000;         //  more than one icy-metaint
 constexpr size_t m_frameSizeAAC = 18000;         //  more than one icy-metaint
@@ -60,7 +34,7 @@ constexpr size_t m_frameSizeVORBIS = UINT16_MAX; // OGG length is normally 4080 
 constexpr size_t m_outbuffSize = 4608 * 2;
 constexpr size_t m_resamplesBuffSize = m_outbuffSize * 8; // SRmin: 6KHz -> SRmax: 48K
 
-constexpr size_t AUDIO_STACK_SIZE = 4000;
+constexpr size_t AUDIO_STACK_SIZE = 3700;
 
 // static allocations for Audio task
 StaticTask_t __attribute__((unused)) xAudioTaskBuffer;
@@ -77,7 +51,6 @@ __attribute__((weak)) void audio_process_raw_samples(int32_t* outBuff, int16_t v
 static bool IRAM_ATTR i2s_tx_sent_callback(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx) {
     Audio* audio = static_cast<Audio*>(user_ctx);
     audio->m_dmaFreeDesc.fetch_add(1);
-    audio->m_dmaSentCount.fetch_add(1); // BUILDV5-DIAG
     return false; // keine höhere Task geweckt
 }
 
@@ -790,11 +763,6 @@ void Audio::initInBuff() {
         size_t size = InBuff.init();
         if (size > 0) { info(*this, evt_info, "inputBufferSize: {} bytes", size - 1); }
     }
-    // BUILDV5-DUALBUF: 预取缓冲（HLS 下一分片提前下载）。PSRAM 1.12MB = 一个分片。
-    if (!prefetch.isInitialized()) {
-        size_t psize = prefetch.init();
-        if (psize > 0) { info(*this, evt_info, "prefetchBufferSize: {} bytes", psize - 1); }
-    }
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 esp_err_t Audio::I2Sstart() {
@@ -823,29 +791,26 @@ void Audio::zeroI2Sbuff() {
     i2s_channel_preload_data(m_i2s_tx_handle, buff, 2, &bytes_loaded);
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+// PIPE (2026-10-15): 时间水位字节换算（设计文档 §2.5）——缓冲秒数=直播延迟秒数
+// targetBytes = min(DELAY_CAP_SEC×码率, 容量×0.9)：前者延迟有界、后者物理上限（容量/码率×0.9 秒×码率=容量×0.9，与码率无关）
+// 码率未知（首分片解码前）用 36000B/s fallback（环球资讯实测 36.6KB/s），解码后 m_pipeBitrate 自动接管（分片字节/#EXTINF 时长）
+// 2026-10-16 S4: 改用 m_pipeBitrate（音频码率）——原 m_avr_bitrate 在 TS 路径是 TS 原始字节率(258KB/s)，target 1.9MB≈52s 音频却显示 7s、alert 恒误报
+size_t Audio::targetBytes() {
+    uint32_t br = m_pipeBitrate ? m_pipeBitrate : 36000;
+    size_t   cap = (size_t)settings.PIPE_DELAY_CAP_SEC * br;        // 延迟上限
+    size_t   phys = (size_t)(AudioBuffer::DEFAULT_MAIN_BUFFER_SIZE * 0.9); // 物理上限 90%
+    return min(cap, phys);
+}
+size_t Audio::readyBytes() {
+    uint32_t br = m_pipeBitrate ? m_pipeBitrate : 36000;
+    return (size_t)settings.PIPE_READY_SEC * br;
+}
+
 void Audio::setDefaults() {
-    // BUILDV5-DUALBUF: 分片切换（m_pendingPrefetch=true，非用户切台）时保留
-    // InBuff/stream/prefetch 状态——双缓冲无缝续播。用户切台/停止时全清。
-    // 根因（cap_fix1 实证）：无条件 InBuff.reset()+m_f_stream=false → 分片切换后
-    // prefetch 有 N+1 数据却不消费（stream=false guard）、InBuff 空且不下载 →
-    // 90K 永不 ready → 播放 3 秒即停 + 下载掉到 1.3KB/s → 周期性卡顿。
-    // BUILDV5-HLSFIX17-REVERT: 曾尝试分片切换跳过 stopSong（keepBuf 轻量断流），
-    // 实证失败（cap_fix17：initDecoder 重建/m_f_stream 清/缓冲从 0 累积/1 分钟都播不了）
-    // ——库的重连路径（connecttohost→setDefaults）绕不过全清。回退到无条件 stopSong，
-    // 恢复 fix16 可用状态（能连续播，分片切换 ~1s 卡顿由最终方案双连接预取根治）。
-    bool keepBuf = m_pendingPrefetch;
     stopSong();
     initInBuff(); // initialize InputBuffer if not already done
 
-    if (!keepBuf) InBuff.reset();
-    // BUILDV5-DUALBUF: 用户切台/停止时清 prefetch；分片切换重连（m_pendingPrefetch=true）保留
-    AUDIO_LOG_INFO("BUILDV5-DIAG: setDefaults pendingPrefetch={} prefActive={} playFromPref={}", m_pendingPrefetch, m_prefetchActive, m_playingFromPrefetch);
-    if (!m_pendingPrefetch) {
-        prefetch.reset();
-        m_prefetchActive = false;
-        m_playingFromPrefetch = false;
-    }
-    m_pendingPrefetch = false;
+    InBuff.reset();
     SamplesBuff.reset();
     m_streamTitle.reset();
     m_streamURL.reset();
@@ -896,7 +861,7 @@ void Audio::setDefaults() {
     m_f_ts = false;
     m_f_ogg = false;
     m_f_m4aID3dataAreRead = false;
-    if (!keepBuf) m_f_stream = false;   // BUILDV5-DUALBUF: 分片切换保留 stream（双缓冲无缝续播）
+    m_f_stream = false;
     m_f_decode_ready = false;
     m_f_eof = false;
     m_f_ID3v1TagFound = false;
@@ -905,7 +870,6 @@ void Audio::setDefaults() {
     m_f_connectionClose = false;
     m_f_allDataReceived = false;
     m_f_haveNewFilePos = false;
-    m_f_alternative_user_agent = false;
 
     m_codec = CODEC_NONE;
     m_dataMode = AUDIO_NONE;
@@ -1126,6 +1090,7 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
     } // max length in Chrome DevTools
 
     const char* user_agent = "Mozilla/5.0 (X11; Linux x86_64) Chrome/146.0.0.0 Safari/537.36";
+    // const char* user_agent = "VLC/3.0.21 LibVLC/3.0.21 AppleWebKit/537.36 (KHTML, like Gecko)";
 
     bool     res = false;   // return value
     uint16_t port = 0;      // port number
@@ -1198,7 +1163,13 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
     m_client->setTimeout(m_f_ssl ? m_timeout_ms_ssl : m_timeout_ms);
 
     info(*this, evt_info, "connect to: \"{}\" on port {} path \"/{}\"", hwoe.get(), port, path.get());
-    res = m_client->connect(hwoe.get(), port);
+    // S2-2 (2026-10-15): TCP connect 必须带超时。实测铁证：sk.cri.cn DNS 解析成功但 SYN 无响应时，
+    // 两参 connect() 无限等待（lwip 阻塞）→ connecttohost 永不返回 → 主任务卡死（切台无反应/UI 无响应/
+    // keep-alive 失效）。对照：非 HLS (qingting.fm) 0.6s 连上播放；PC 同网访问 CRI 0.1s 正常。
+    // S2-2 实测：5s 超时传入后 select 未按超时返回（240s 无失败日志）——S2DBG 取证卡点。
+    AUDIO_LOG_ERROR("S2DBG connecttohost: calling connect timeout=5000 host={}", hwoe.get());
+    res = m_client->connect(hwoe.get(), port, 5000);
+    AUDIO_LOG_ERROR("S2DBG connect returned res={} dt={}ms", res, millis() - timestamp);
 
     m_expectedCodec = CODEC_NONE;
     m_expectedPlsFmt = FORMAT_NONE;
@@ -1290,7 +1261,7 @@ bool Audio::httpPrint(const char* host) {
     }
 
     const char* user_agent = "Mozilla/5.0 (X11; Linux x86_64) Chrome/146.0.0.0 Safari/537.36";
-    if(m_f_alternative_user_agent) user_agent = "VLC/3.0.21 LibVLC/3.0.21 AppleWebKit/537.36 (KHTML, like Gecko)";
+    // const char* user_agent = "VLC/3.0.21 LibVLC/3.0.21 AppleWebKit/537.36 (KHTML, like Gecko)";
 
     rqh.assignf("GET /{}", path);
     rqh.append(" HTTP/1.1\r\n");
@@ -1317,13 +1288,14 @@ bool Audio::httpPrint(const char* host) {
         }
         if (f_equal) info(*this, evt_info, "The host has disconnected, reconnecting");
 
-        if (!m_client->connect(hwoe.get(), port)) {
+        if (!m_client->connect(hwoe.get(), port, 5000)) { // S2-2 延续 (2026-10-15): httpPrint 重试路径同样带 5s 超时（原两参无超时——CRI SYN 无响应时无限卡死）
             AUDIO_LOG_ERROR("connection lost {}", c_host.c_get());
             stopSong();
             return false;
         }
     }
     m_currentHost = c_host;
+    m_diagSegT0 = millis(); // DIAG [NET] segDone: GET 发起时刻
     m_client->print(rqh.get());
 
     if (extension.ends_with_icase(".mp3"))
@@ -3720,7 +3692,6 @@ uint32_t Audio::stopSong() {
         m_dataMode = AUDIO_NONE;
         m_streamType = ST_NONE;
         m_playlistFormat = FORMAT_NONE;
-        m_pendingPrefetch = false; // BUILDV5-DUALBUF: 用户主动停止/切台，后续 setDefaults 必须清 prefetch
         destroy_decoder();
     }
     xSemaphoreGive(mutex_audioTaskIsDecoding);
@@ -3863,6 +3834,7 @@ uint32_t Audio::resampleI2Soutput(audiolib::resampler_t& rs, int32_t* input, uin
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::cacheSamples() {
+
     if (m_f_firstCacheSamplesCall) {
         m_f_firstCacheSamplesCall = false;
         m_caSa.sourceWordsConsumed = 0;
@@ -3901,11 +3873,6 @@ void Audio::cacheSamples() {
 
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::playChunk() {
-    static uint32_t diagBytes = 0, diagT0 = 0; // BUILDV5: per-second I2S byte rate
-    static int32_t diagPeak = 0;               // BUILDV5-DIAG-PEAK: per-second I2S sample peak
-    // BUILDV5-STEP3FIX: 热路径 DEBUG 每次 playChunk 调用都打（与 L5578 同为官方库
-    // 无限制频刷屏源，串口被占满 → main loop 打印阻塞 → 触摸卡死）。生产模式注释。
-    // AUDIO_LOG_DEBUG("playChunk entry: freeDesc={} filled={}", m_dmaFreeDesc.load(std::memory_order_acquire), SamplesBuff.bufferFilled()); // BUILDV5-DIAG
     if (SamplesBuff.bufferFilled() == 0) return; // nothing to do
 
     if (m_f_firstChunkCall) {
@@ -3919,15 +3886,7 @@ void Audio::playChunk() {
     if (SamplesBuff.bufferFilled()) {
         if (m_dmaFreeDesc.load(std::memory_order_acquire) > settings.DMA_DESC_NUM) m_dmaFreeDesc = 0; // empty run
 
-        // BUILDV5-FIX8: i2s_channel_write 非阻塞（ticks_to_wait 10→0）+ 取消限流 3 块。
-        // cap_fix7diag 实证：阻塞写(10 ticks) + 限流3块 = audioTask 42x/s × 1536words = 写速 60% < 播放 96000 words/s
-        // → SamplesBuff 净增长涨满 → m_validSamples 残留 → L5280 挡 1/3 tick → i2sBytes 60% 死锁闭环。
-        // 非阻塞：driver 缓冲有空位立即写，满则返回 ESP_ERR_TIMEOUT → L3906 break，DMA 85ms 存量防欠载。
-        // playChunk ~1ms → audioTask ~160x/s → 解码 160帧/s >> 47 ✓；写速由 DMA ISR 放行节流 = 100% 播放速率。
-        int freeDescNow = (int)m_dmaFreeDesc.load(std::memory_order_acquire);
-        if (freeDescNow > 16) m_dmaFreeDesc = 16; // 上限 = DMA 总描述符数，防计数漂移
-        while (freeDescNow > 0 && SamplesBuff.bufferFilled() > 0) {
-            freeDescNow--;
+        while (m_dmaFreeDesc.load(std::memory_order_acquire) > 0) { // m_dmaFreeDesc is atomic!
 
             //------------------------------------------------------------------------------------------------------
             // RingBuffer -> m_i2sWorkBuff
@@ -3952,38 +3911,22 @@ void Audio::playChunk() {
             // m_i2sWorkBuff -> I2S
             //--------------------------------------------------------------------------------------------------------
 
-            // BUILDV5-DIAG-PEAK (2026-10-13): 统计写入 I2S 的样本峰值——
-            // 用户报"首上电播放任何电台无声"但 log 显示 i2sBytes 满速。若 peak=0
-            // =数据静音(解码/音量路径)；peak>0 =DAC 不响应(物理/格式)。
-            for (size_t pi = 0; pi < readWords; pi++) {
-                int32_t pv = m_i2sWorkBuff.get()[pi];
-                if (pv < 0) pv = -pv;
-                if (pv > diagPeak) diagPeak = pv;
-            }
-
             size_t bytesConsumed = 0;
             if (continueI2S) {
-                // BUILDV5-FIX8: i2s_channel_write 非阻塞（ticks_to_wait 10→0）。
-                // 阻塞写(10 ticks)使 playChunk 每 tick 等 DMA 播完 ~21ms → audioTask ≤43x/s → 解码 42帧/s = 60%。
-                // 非阻塞：driver TX 缓冲有空位即瞬时写入，满则 ESP_ERR_TIMEOUT → L3906 break 等下次 tick。
-                // DMA 16 块缓冲 = 85ms 播放存量防欠载；写速由 DMA ISR 放行节流 = 播放速率 100%。
-                m_plCh.err = i2s_channel_write(m_i2s_tx_handle, m_i2sWorkBuff.get(), readWords * sizeof(int32_t), &bytesConsumed, 0);
+                m_plCh.err = i2s_channel_write(m_i2s_tx_handle, m_i2sWorkBuff.get(), readWords * sizeof(int32_t), &bytesConsumed, 10);
             } else {
                 bytesConsumed = readWords * sizeof(int32_t);
             }
 
             if (bytesConsumed == 0) {
-                // BUILDV5-FIX8: 非阻塞写失败 = 未占用 DMA 描述符 → 只 break，不减 m_dmaFreeDesc。
-                // 原阻塞代码失败也 fetch_sub(1)（等待后仍失败≈描述符已占用）；非阻塞下失败频率大增，
-                // 若照旧减计数会漂移归零 → playChunk 永不再写 → 死锁。ISR 播完才 +1，失败必须不动计数。
                 AUDIO_LOG_DEBUG("i2s write err={:X} consumed={} freeDesc={}", m_plCh.err, bytesConsumed, m_dmaFreeDesc.load());
+                m_dmaFreeDesc.fetch_sub(1, std::memory_order_release);
                 break;
             }
 
             if (bytesConsumed != readWords * sizeof(int32_t)) { AUDIO_LOG_WARN("partial write: {} / {}", bytesConsumed, readWords * sizeof(int32_t)); }
 
             SamplesBuff.bytesRead(bytesConsumed / sizeof(int32_t));
-            diagBytes += (uint32_t)bytesConsumed;
             m_dmaFreeDesc.fetch_sub(1, std::memory_order_release);
         }
     }
@@ -3994,14 +3937,6 @@ void Audio::playChunk() {
     if (m_plCh.err == ESP_ERR_INVALID_STATE) AUDIO_LOG_ERROR("I2S is not ready to write");
     if (m_plCh.err == ESP_ERR_TIMEOUT) AUDIO_LOG_ERROR("Writing timeout, no writing event received from ISR within ticks_to_wait");
 
-    uint32_t nowMs = (uint32_t)(esp_timer_get_time() / 1000); // BUILDV5
-    if (diagT0 == 0) diagT0 = nowMs;
-    uint32_t dtMs = nowMs - diagT0;
-    if (dtMs >= 1000) { // BUILDV5-HLSFIX15: 1s 级——i2sBytes/s 是 DMA 实际送出字节 =
-        // 扬声器真实输出；掉到 <200K 即播放卡顿（用户实测否决 10 分钟级采样）
-        AUDIO_LOG_INFO("BUILDV5: i2sBytes/s={} dt={}ms peak={}", diagBytes, dtMs, diagPeak);
-        diagBytes = 0; diagT0 = nowMs; diagPeak = 0;
-    }
     return;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -4031,9 +3966,7 @@ void Audio::loop() {
                     m_lVar.count = 0;
                 }
                 break;
-            case AUDIO_PLAYLISTINIT:
-                if (!readPlayListData()) stopSong();
-                break;
+            case AUDIO_PLAYLISTINIT: readPlayListData(); break;
             case AUDIO_PLAYLISTDATA:
                 if (m_playlistFormat == FORMAT_M3U) httpPrint(parsePlaylist_M3U().c_get());
                 if (m_playlistFormat == FORMAT_PLS) httpPrint(parsePlaylist_PLS().c_get());
@@ -4049,6 +3982,7 @@ void Audio::loop() {
         switch (m_dataMode) {
             case HTTP_RESPONSE_HEADER:
                 if (!parseHttpResponseHeader()) {
+                    AUDIO_LOG_ERROR("S2DBG m3u8 hdr fail retry={}", m_lVar.count);
                     if (m_lVar.count < 3) {
                         m_lVar.count++;
                         m_f_running = true; // keep running
@@ -4079,7 +4013,14 @@ void Audio::loop() {
                         // AUDIO_LOG_DEBUG("wait");
                         break;
                     }
-                    if (m_f_stream) m_lVar.no_host_timer = millis() + 1000; // BUILDV5-SCALE1 (2026-10-14): 3s→1s——分片粒度调度下，列表轮询周期≈分片时长(3s) 造成相位漂移（每~9s轮询错过新分片→10s周期断流）。1s 轮询更快发现新分片→下载更连续→prefetch 更快累积。
+                    if (m_f_stream) {
+                        // S2-7 (2026-10-16) [NET] segDone 插桩铁证: 原 10s 固定节流导致
+                        // "拉3片→停9s→缓冲触底→alert→断音" 锯齿(905.m3u8 窗口3s滚1片)。
+                        // 改为按 m3u8 targetDuration 半周期退避(905=1.5s), 持续跟滚小步补水。
+                        uint32_t rollMs = ((m_m3u8_targetDuration ? m_m3u8_targetDuration : 3) * 1000) / 2;
+                        m_lVar.no_host_timer = millis() + rollMs;
+                        AUDIO_LOG_ERROR("S2DBG m3u8 noHost retry in {}ms (td={}s)", rollMs, m_m3u8_targetDuration);
+                    }
                     httpPrint(m_m3u8_host.get());
                     m_dataMode = HTTP_RESPONSE_HEADER; // we have a new playlist now
                 }
@@ -4137,7 +4078,7 @@ bool Audio::readPlayListData() {
             goto exit;
         }
         plSize = chunkLen; // chunkSize is known
-    } else if (m_audioFileSize) {
+    } else if (plSize) {
         plSize = m_audioFileSize; // fileSize is known
     } else {
         plSize = m_client->available(); // only avBytes is known
@@ -4270,11 +4211,11 @@ ps_ptr<char> Audio::parsePlaylist_M3U() {
     bool         isM3U = false;
     ps_ptr<char> host = {};
 
-    size_t lines = m_playlistContent.size();
+    uint8_t lines = m_playlistContent.size();
 
-    // for (size_t i = 0; i < lines; i++) { AUDIO_LOG_INFO("M3U Line {}; {}", i, m_playlistContent[i]); }
+    // for (int i = 0; i < lines; i++) { AUDIO_LOG_INFO("M3U Line {}; {}", i, m_playlistContent[i]); }
 
-    for (size_t i = 0; i < lines; i++) {
+    for (int i = 0; i < lines; i++) {
         if (m_playlistContent[i].contains("#EXTM3U")) {
             isM3U = true;
             continue;
@@ -4352,7 +4293,6 @@ ps_ptr<char> Audio::parsePlaylist_PLS() {
         if (isPLS) {
             if (m_playlistContent[i].starts_with_icase("File")) {
                 pos = m_playlistContent[i].index_of("=");
-                if (pos < 4) continue; // no '=' found, or line too short — skip this line safely
                 seq_str = m_playlistContent[i].substr(4, pos - 4);
                 seqNr = m_playlistContent[i].substr(4, pos - 4).to_int32();
                 entryNr = sequenceNr_to_entryNr(seqNr);
@@ -4582,6 +4522,14 @@ ps_ptr<char> Audio::parsePlaylist_M3U8() {
             if (m_playlistContent[i].starts_with("#EXTINF:")) {
                 m_linesWithEXTINF.emplace_back(m_playlistContent[i]);
                 addNextLine = true;
+                // DIAG 2026-10-16 [PIPE]: 记录最近分片时长(#EXTINF:3.008,)→分片完成后算音频码率(size/dur)
+                m_pipeSegDurS = atof(m_playlistContent[i].c_get() + 8);
+            }
+            // S2-7b (2026-10-16): 原库从不解析 #EXT-X-TARGETDURATION → m_m3u8_targetDuration 恒默认 10,
+            // 导致跟滚节流(td/2)算出 5s, 对 3s 滚动窗口(905)入不敷出(5s 拉 1 片 < 播放 3s/片)。905 td=4 → 节流 2s。
+            if (m_playlistContent[i].starts_with("#EXT-X-TARGETDURATION:")) {
+                int td = atoi(m_playlistContent[i].c_get() + strlen("#EXT-X-TARGETDURATION:"));
+                if (td > 0 && td < 60) m_m3u8_targetDuration = td;
             }
         }
         if (!f_haveRedirection) {
@@ -4937,8 +4885,8 @@ void Audio::processWebStream() {
             playChunk();
             return;
         }
+        info(*this, evt_eof, "{}", m_lastHost.c_get());
         stopSong();
-        info(*this, evt_eof, "eoof"); //"{}", m_lastHost);
     }
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -5043,22 +4991,13 @@ void Audio::processWebFile() {
             playChunk();
             return;
         }
-        stopSong();
         info(*this, evt_eof, "{}", m_lastHost.c_get());
+        stopSong();
         return;
     }
 }
 // ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::processWebStreamTS() {
-    static uint32_t tsDiagBytes = 0, tsDiagT0 = 0; // BUILDV5: network read rate
-    // BUILDV5-DIAGX: 每次调用总耗时（cap_fix1b 实证每次调用 ~27ms，量化阻塞分布）
-    static uint32_t xT0 = 0;
-    if (xT0 == 0) xT0 = (uint32_t)(esp_timer_get_time() / 1000);
-    static uint32_t xCnt = 0, xSum = 0;
-    if ((++xCnt % 600000) == 0) { // BUILDV5-HLSFIX: 10 分钟级，消除高频 UART 竞争源
-        AUDIO_LOG_INFO("BUILDV5-DIAGX: callDt={}ms", xSum / 64);
-        xSum = 0;
-    }
 
     // first call, set some values to default ———————————————————————————————————
     if (m_f_firstCall) { // runs only one time per connection, prepare for start
@@ -5072,37 +5011,18 @@ void Audio::processWebStreamTS() {
         m_t0 = millis();
         if (!m_pwsst.ts_packet.valid()) m_pwsst.ts_packet.alloc_array(m_pwsst.ts_packetsize, "m_pwsst.ts_packet"); // first init
         if (!m_decoder) {                                                                                          // first init
-            AUDIO_LOG_INFO("BUILDV5-DIAG4: firstCall initDecoder codec={} ts={} contentType={}", (int)m_codec, (int)m_f_ts, m_content_type.get() ? m_content_type.get() : "null");
             getChunkSize(0, true);
             m_pwsst.chunkSize = 0;
             ts_parsePacket(0, 0, 0);
             m_pwsst.ts_packetPtr = 0;
-            bool initOk = initializeDecoder();
-            AUDIO_LOG_INFO("BUILDV5-DIAG4: initDecoder result={} decoder={}", initOk, m_decoder != nullptr);
-            if (!initOk) { m_f_firstCall = true; return; } // BUILDV5-DIAG4: 失败保持 firstCall 以便重试
+            if (!initializeDecoder()) return;
         }
     } // —————————————————————————————————————————————————————————————————————————
 
     m_pwsst.ts_packetStart = 0;
     m_pwsst.ts_packetLength = 0;
 nextRound:
-    // BUILDV5-DUALBUF: prefetch 满 → 停下载（等播放切到 prefetch 腾空；下载目标随之回 InBuff）
-    if (m_prefetchActive && prefetch.freeSpace() < 188) {
-        m_pwsst.f_nextRound = false;
-        return;
-    }
     uint32_t availableBytes = m_client->available(); // available bytes in stream
-    static uint32_t d8c = 0;
-    if ((++d8c % 600000) == 0) { AUDIO_LOG_INFO("BUILDV5-DIAG8: availNow={}", availableBytes); }
-
-    // BUILDV5-DIAG2: 10 分钟级——用毫秒时间限频（m_controlCounter 会被每次连接重置
-    // 归零 → 0%600000==0 恒触发 = 打印风暴，cap_fix10 实证 DIAG2 28行/s）
-    static uint32_t d2LastMs = 0;
-    uint32_t d2Now = millis();
-    if (d2Now - d2LastMs >= 600000) {
-        d2LastMs = d2Now;
-        AUDIO_LOG_INFO("BUILDV5-DIAG2: avail={} chunked={} chunkSize={} byteCounter={} fileSize={} ptr={} pktSize={} firstCall={} stream={}", availableBytes, (int)m_f_chunked, m_pwsst.chunkSize, m_pwsst.byteCounter, m_audioFileSize, m_pwsst.ts_packetPtr, m_pwsst.ts_packetsize, (int)m_f_firstCall, (int)m_f_stream);
-    }
 
     if (availableBytes) {
         /* If the m3u8 stream uses 'chunked data transfer' no content length is supplied. Then the chunk size determines the audio data to be processed.
@@ -5131,227 +5051,149 @@ nextRound:
                 goto chunkFinished;
             }
         }
-        // BUILDV5-DIAG9: while 循环一次调用读多包（cap_diag8/10 实证：每调用仅 1 包，
-        // avail 30KB 充足却不连续读 → 下载 20 包/s≈4KB/s → 缓冲永不达 ready 阈值 → 死锁。
-        // 循环直到：avail 耗尽 / 部分读取(等凑满188) / 分片完 / 写满 / chunkFinished。
-        while (availableBytes > 0 && !m_pwsst.f_chunkFinished) {
-            uint32_t minAvBytes2;
-            if (m_pwsst.chunkSize)
-                minAvBytes2 = min3(availableBytes, (uint32_t)(m_pwsst.ts_packetsize - m_pwsst.ts_packetPtr), (uint32_t)(m_pwsst.chunkSize - m_pwsst.byteCounter));
-            else
-                minAvBytes2 = min(availableBytes, (uint32_t)(m_pwsst.ts_packetsize - m_pwsst.ts_packetPtr));
+        if (m_pwsst.chunkSize)
+            minAvBytes = min3(availableBytes, m_pwsst.ts_packetsize - m_pwsst.ts_packetPtr, m_pwsst.chunkSize - m_pwsst.byteCounter);
+        else
+            minAvBytes = min(availableBytes, (uint32_t)(m_pwsst.ts_packetsize - m_pwsst.ts_packetPtr));
 
-            int res = audioFileRead(m_pwsst.ts_packet.get() + m_pwsst.ts_packetPtr, minAvBytes2);
-            if (res > 0) {
-                static uint32_t d6pkt = 0; // per-call packet counter
-                d6pkt++;
-                static uint32_t d6cnt = 0;
-                if ((++d6cnt % 600000) == 0) { // BUILDV5-HLSFIX: 10 分钟级，消除 UART 竞争
-                    AUDIO_LOG_INFO("BUILDV5-DIAG6: pktsLast2048Calls={}", d6pkt);
-                    d6pkt = 0;
-                }
-                static uint32_t d5cnt = 0;
-                // BUILDV5-HLSFIX: DIAG5 10 分钟级（cap_fix4 实证日志开销本身是下载瓶颈 320ms/call；
-                // cap_fix9 实证多任务打印竞争 → UART 字节交错）
-                if ((++d5cnt % 600000) == 0) {
-                    AUDIO_LOG_INFO("BUILDV5-DIAG5: avail={} res={} ptr={} pktLen={} f_nr={} in={} pref={} prefA={} byteC={}", availableBytes, res, m_pwsst.ts_packetPtr, m_pwsst.ts_packetLength, (int)m_pwsst.f_nextRound, InBuff.bufferFilled(), prefetch.bufferFilled(), (int)m_prefetchActive, m_pwsst.byteCounter);
-                }
-                tsDiagBytes += (uint32_t)res; // BUILDV5
-                uint32_t tsNow = (uint32_t)(esp_timer_get_time() / 1000);
-                if (tsDiagT0 == 0) tsDiagT0 = tsNow;
-                if (tsNow - tsDiagT0 >= 600000) { // BUILDV5-HLSFIX: 每秒→10分钟，消除高频 UART 竞争源
-                    AUDIO_LOG_INFO("BUILDV5: netRead={}B/s pkts/s={}", tsDiagBytes, tsDiagBytes / 188);
-                    tsDiagBytes = 0; tsDiagT0 = tsNow;
-                }
-                m_pwsst.ts_packetPtr += res;
-                m_pwsst.byteCounter += res;
-                availableBytes -= res;
-                if (m_pwsst.ts_packetPtr < m_pwsst.ts_packetsize) {
-                    // BUILDV5-DIAGX: 量化 partial-read break（读不满 188）
-                    static uint32_t bkP = 0;
-                    if ((++bkP % 600000) == 1) AUDIO_LOG_INFO("BUILDV5-DIAGX: break@partial res={} ptr={}", res, m_pwsst.ts_packetPtr);
-                    break; // not enough data yet, wait for the next call
-                }
-                m_pwsst.ts_packetPtr = 0;
-                if (m_pwsst.f_firstPacket) { // search for ID3 Header in the first packet
-                    m_pwsst.f_firstPacket = false;
-                    uint8_t ID3_HeaderSize = process_m3u8_ID3_Header(m_pwsst.ts_packet.get());
-                    if (ID3_HeaderSize > m_pwsst.ts_packetsize) {
-                        AUDIO_LOG_ERROR("ID3 Header is too big");
-                        stopSong();
-                        return;
-                    }
-                    if (ID3_HeaderSize) {
-                        memcpy(m_pwsst.ts_packet.get(), &m_pwsst.ts_packet.get()[ID3_HeaderSize], m_pwsst.ts_packetsize - ID3_HeaderSize);
-                        m_pwsst.ts_packetPtr = m_pwsst.ts_packetsize - ID3_HeaderSize;
-                        break;
-                    }
-                }
-                if (!ts_parsePacket(&m_pwsst.ts_packet.get()[0], &m_pwsst.ts_packetStart, &m_pwsst.ts_packetLength)) {
+        int res = audioFileRead(m_pwsst.ts_packet.get() + m_pwsst.ts_packetPtr, minAvBytes);
+        if (res > 0) {
+            m_pwsst.ts_packetPtr += res;
+            m_pwsst.byteCounter += res;
+            m_s2dbgTsBytes += res; // S2DBG: 累计 TS body 下载字节——证明数据真实流入（60s 应 ~2.2MB @36.6KB/s）
+            if (m_s2dbgTsBytes >= 32768) {
+                m_s2dbgTsBytes = 0;
+                AUDIO_LOG_ERROR("S2DBG TS +32KB avail={} inBuff={}B heap={}", availableBytes, InBuff.bufferFilled(), (unsigned)ESP.getFreeHeap());
+            }
+            if (m_pwsst.ts_packetPtr < m_pwsst.ts_packetsize) return; // not enough data yet, the process must be repeated if the packet size (188 bytes) is not reached
+            m_pwsst.ts_packetPtr = 0;
+            if (m_pwsst.f_firstPacket) { // search for ID3 Header in the first packet
+                m_pwsst.f_firstPacket = false;
+                uint8_t ID3_HeaderSize = process_m3u8_ID3_Header(m_pwsst.ts_packet.get());
+                if (ID3_HeaderSize > m_pwsst.ts_packetsize) {
+                    AUDIO_LOG_ERROR("ID3 Header is too big");
                     stopSong();
-                    AUDIO_LOG_ERROR("song stopped");
                     return;
                 }
+                if (ID3_HeaderSize) {
+                    memcpy(m_pwsst.ts_packet.get(), &m_pwsst.ts_packet.get()[ID3_HeaderSize], m_pwsst.ts_packetsize - ID3_HeaderSize);
+                    m_pwsst.ts_packetPtr = m_pwsst.ts_packetsize - ID3_HeaderSize;
+                    return;
+                }
+            }
+            if (!ts_parsePacket(&m_pwsst.ts_packet.get()[0], &m_pwsst.ts_packetStart, &m_pwsst.ts_packetLength)) {
+                // S2-8 (2026-10-16) [NET] 插桩铁证: 分片中途 TCP 断开(ERR:128)后重连, 新连接响应头("HTTP")被当 TS 数据,
+                // 原版直接 stopSong = "播几秒就永久静音"。改为: 丢弃坏分片, 重置分片状态, 回 PLAYLISTDATA 重拉
+                // m3u8 → httpPrint 检测断连自动重连 → 响应头被 parseHttpResponseHeader 正确消费, 流自恢复。
+                AUDIO_LOG_ERROR("S2DBG TS sync lost (stale conn data), re-arming playlist");
+                m_pwsst.byteCounter = 0;
+                m_pwsst.ts_packetPtr = 0;
+                m_pwsst.f_chunkFinished = false;
+                m_pwsst.f_nextRound = false;
+                m_f_continue = true; // loop() 见 m_f_continue → AUDIO_PLAYLISTDATA → 重拉
+                return;
+            }
 
-                if (m_pwsst.ts_packetStart == 0 && m_pwsst.ts_packetLength == 188) { // dummy packet, ttps://livepeercdn.studio/hls/85c28sa2o8wppm58/index.m3u8?video=false
-                    AUDIO_LOG_DEBUG("dummy");
+            if (m_pwsst.ts_packetStart == 0 && m_pwsst.ts_packetLength == 188) { // dummy packet, ttps://livepeercdn.studio/hls/85c28sa2o8wppm58/index.m3u8?video=false
+                AUDIO_LOG_DEBUG("dummy");
+                m_pwsst.f_nextRound = true;
+            }
+            else if (m_pwsst.ts_packetLength) {
+                size_t ws = InBuff.writeSpace();
+                if (ws >= m_pwsst.ts_packetLength) {
+                    memcpy(InBuff.getWritePtr(), m_pwsst.ts_packet.get() + m_pwsst.ts_packetStart, m_pwsst.ts_packetLength);
+                    InBuff.bytesWritten(m_pwsst.ts_packetLength);
                     m_pwsst.f_nextRound = true;
-                } else if (m_pwsst.ts_packetLength) {
-                    // BUILDV5-DUALBUF: 下载目标 = prefetchActive ? prefetch : InBuff
-                    // （分片 N 下载到 InBuff 播放；分片 N+1 预取到 prefetch，切换零断流）
-                    AudioBuffer& dst = m_prefetchActive ? prefetch : InBuff;
-                    // BUILDV5-DIAG-DST (2026-10-14): 下载目标变化时打印（定位 preA 切换节奏）
-                    static AudioBuffer* lastDst = nullptr;
-                    if (&dst != lastDst) {
-                        AUDIO_LOG_INFO("BUILDV5-DIAG-DST: dst={} preA={} bc={} fsz={} pref={} in={}", (&dst == &prefetch) ? 1 : 0, (int)m_prefetchActive, m_pwsst.byteCounter, m_audioFileSize, prefetch.bufferFilled(), InBuff.bufferFilled());
-                        lastDst = &dst;
-                    }
-                    size_t ws = dst.writeSpace();
-                    if (ws >= m_pwsst.ts_packetLength) {
-                        memcpy(dst.getWritePtr(), m_pwsst.ts_packet.get() + m_pwsst.ts_packetStart, m_pwsst.ts_packetLength);
-                        dst.bytesWritten(m_pwsst.ts_packetLength);
-                        m_pwsst.f_nextRound = true;
-                    } else {
-                        // BUILDV5-HLSFIX: 目标缓冲写不下 → 写能写的部分立即 break（下轮再续），
-                        // 绝不 vTaskDelay(10) 等待（cap_diagx 实证：写满等待使 processWebStreamTS
-                        // 单次调用阻塞 130-718ms → netTask 下载泵被拖死 → 27KB/s << 110KB/s）。
-                        // 写满 = 播放尚未消费（或 prefetch 满等切换），此刻下载停是正确行为；
-                        // 播放消费释放空间后下一轮自动续写，稳态下载 = 播放消耗。
-                        int ws0 = (int)ws;
-                        memcpy(dst.getWritePtr(), m_pwsst.ts_packet.get() + m_pwsst.ts_packetStart, ws); // write everything that fits into the buffer
-                        dst.bytesWritten(ws);
-                        m_pwsst.f_nextRound = false;
-                        (void)ws0;
-                        break;
-                    }
                 } else {
-                    // BUILDV5-HLSFIX: 无效 TS 包（packetLength==0 且非 dummy）——跳过继续循环，
-                    // 不 break（cap_fix1 实证：无效包 break 导致每次 audio.loop 仅读 1 包，
-                    // 下载锁死 ~23KB/s << 110KB/s 播放消耗 → 缓冲永不达 ready）。一次调用读尽 avail。
-                    m_pwsst.f_nextRound = true;
-                }
-                if (m_audioFileSize && m_pwsst.byteCounter > m_audioFileSize) {
-                    AUDIO_LOG_ERROR("byteCounter overflow, byteCounter: {}, contentlength: {}", m_pwsst.byteCounter, m_audioFileSize);
-                    return;
-                }
-                if (m_pwsst.chunkSize && m_pwsst.byteCounter > m_pwsst.chunkSize) {
-                    AUDIO_LOG_ERROR("byteCounter overflow, byteCounter: {}, chunkSize: {}", m_pwsst.byteCounter, m_pwsst.chunkSize);
-                    return;
-                }
-                // BUILDV5-DUALBUF: 分片 N 下载完 → 立即预取分片 N+1 到 prefetch（独立缓冲，切换零断流）。
-                // 根因（cap_fix8c/hlsbuf2r 实证）：网络下载 ~110KB/s ≈ HLS 流速率 112KB/s → 播放中
-                // 缓冲无法积累 → 单缓冲切换断流(1-4s)必低谷。双缓冲：N 播放期间 N+1 已提前下载，
-                // InBuff 播完 → 无缝切 prefetch（数据已就绪），下载目标回 InBuff（N+2）。
-                if (m_audioFileSize && m_pwsst.byteCounter == m_audioFileSize) {
-                    // BUILDV5-HLSFIX: 仅当播放源是 InBuff 时切预取 prefetch（N+1）；
-                    // 若播放源已是 prefetch，保持下载写 InBuff（N+2）。cap_fix5 实证：
-                    // 无条件 prefA=true 使播放 prefetch 时下载也写 prefetch（读写竞争），
-                    // pref 765K→45K 净减 → 切换时 prefetch 只剩残渣 → 周期断流。
-                    // BUILDV5-FIX11 (2026-10-12): prefetch 已有货（N+1 已预取）时，N+2 必须写
-                    // InBuff——cap_hls_2_90 铁证：列表 3 分片 1.42s 全下载完，2846（第3分片）
-                    // 误写 prefetch（与 2845 竞争）→ 数据丢失 → switch back 后 InBuff 空 → 
-                    // 5.5s 慢速爬升（i2sBytes=131072 dt=5562ms）。prefetch 有货时保持写 InBuff。
-                    // BUILDV5-FIX16 (2026-10-13): 预取触发水位 8192 → BUILDV5_PREFETCH_TARGET(218KB≈2分片≈6s)。
-                    // 目标 = 让 prefetch 累积多分片（缓冲加深验证）。prefetch 未达目标 → 继续预取；
-                    // 已达 → 回 InBuff 写 N+2（播放缓冲同样加深）。
-                    // BUILDV5-DIAG-PREA (2026-10-14): 分片完成时的 preA 决策现场（每分片 1 行，~3s/次）
-                    AUDIO_LOG_INFO("BUILDV5-DIAG-PREA: bc={} fsz={} pfp={} preA={} pref={} in={}", m_pwsst.byteCounter, m_audioFileSize, (int)m_playingFromPrefetch, (int)m_prefetchActive, prefetch.bufferFilled(), InBuff.bufferFilled());
-                    if (!m_playingFromPrefetch && prefetch.bufferFilled() < BUILDV5_PREFETCH_TARGET) {
-                        m_prefetchActive = true; // prefetch 未达目标水位 → 继续预取（N+1/N+2...到 218KB）
-                        m_pendingPrefetch = true; // 重连(setDefaults)时保留 prefetch 状态（分片切换非用户切台）
-                    } else {
-                        m_prefetchActive = false; // prefetch 已达目标 → N+2 写 InBuff（播放缓冲）
+                    int t = 0;
+                    memcpy(InBuff.getWritePtr(), m_pwsst.ts_packet.get() + m_pwsst.ts_packetStart, ws); // write everything that fits into the buffer
+                    InBuff.bytesWritten(ws);
+                    while (true) {
+                        if (InBuff.writeSpace() >= m_pwsst.ts_packetLength - ws) {
+                            memcpy(InBuff.getWritePtr(), &m_pwsst.ts_packet.get()[ws + m_pwsst.ts_packetStart], m_pwsst.ts_packetLength - ws); // write the rest
+                            InBuff.bytesWritten(m_pwsst.ts_packetLength - ws);
+                            break;
+                        }
+                        t++;
+                        vTaskDelay(10); // wait until the buffer is free
+                        if (t == 10) {
+                            AUDIO_LOG_ERROR("InBuff is full");
+                            break;
+                        }
                     }
-                    m_f_continue = true;
-                    m_pwsst.byteCounter = 0;
-                    m_pwsst.ts_packetPtr = 0;
-                    m_pwsst.f_nextRound = false;
-                    goto exit;
                 }
-                if (!m_pwsst.f_nextRound) {
-                    // BUILDV5-DIAGX: 量化 f_nextRound=false break（无效包/其他）
-                    static uint32_t bkN = 0;
-                    if ((++bkN % 600000) == 1) AUDIO_LOG_INFO("BUILDV5-DIAGX: break@nextRound pktLen={}", m_pwsst.ts_packetLength);
-                    break; // 写满/写失败 → 停止本轮下载
-                }
-                m_pwsst.f_nextRound = false;     // 为下一轮循环做准备（防止 goto 失效空转）
-            } else {
-                break; // read 失败或无数据
+            }
+            if (m_audioFileSize && m_pwsst.byteCounter > m_audioFileSize) {
+                AUDIO_LOG_ERROR("byteCounter overflow, byteCounter: {}, contentlength: {}", m_pwsst.byteCounter, m_audioFileSize);
+                return;
+            }
+            if (m_pwsst.chunkSize && m_pwsst.byteCounter > m_pwsst.chunkSize) {
+                AUDIO_LOG_ERROR("byteCounter overflow, byteCounter: {}, chunkSize: {}", m_pwsst.byteCounter, m_pwsst.chunkSize);
+                return;
             }
         }
     }
-    // BUILDV5-DUALBUF: stream ready 检查提前到分片完检查之前（否则首次缓冲满→分片完 goto exit
-    // 跳过本检查→m_f_stream 卡 false→playAudioData guard 永远 return→无声死锁，cap_dualbuf 实证）。
-    // 双缓冲感知：InBuff + prefetch 总填充够深即 ready（分片 ~109KB << 600K 阈值，单侧永远不够，
-    // cap_diag3 实证：分片 1 写完即切 prefetch → InBuff 停 109KB → 永不 ready → 死锁）。
-    if (!m_f_stream) {
-        size_t totalFill = InBuff.bufferFilled() + prefetch.bufferFilled();
-        AUDIO_LOG_INFO("BUILDV5-DIAG: notready total={} in={} pref={} prefActive={} playFromPref={}", totalFill, InBuff.bufferFilled(), prefetch.bufferFilled(), m_prefetchActive, m_playingFromPrefetch);
-        if (totalFill > BUILDV5_HLS_BUF) {
-            m_f_stream = true; // ready to play the audio data
-            uint16_t filltime = millis() - m_t0;
-            info(*this, evt_info, "stream ready");
-            info(*this, evt_info, "buffer filled in {} ms", filltime);
-        }
-    }
     if (m_audioFileSize && m_pwsst.byteCounter == m_audioFileSize) {
-        // BUILDV5-FIX16: 分片完成兜底点——预取目标水位判断（与包循环内 L5243 统一）。
-        // prefetch 未达目标(218KB≈6s) → 下一分片写 prefetch；已达 → 写 InBuff（播放缓冲加深）。
-        if (!m_playingFromPrefetch && prefetch.bufferFilled() < BUILDV5_PREFETCH_TARGET) {
-            m_prefetchActive = true;
-            m_pendingPrefetch = true;
-        } else {
-            m_prefetchActive = false;
+        if (m_pipeSegDurS > 0.1f) m_pipeBitrate = (uint32_t)(m_audioFileSize / m_pipeSegDurS); // 音频码率=分片字节/#EXTINF 时长(滑动)
+        uint32_t br = m_pipeBitrate ? m_pipeBitrate : 36000;
+        AUDIO_LOG_ERROR("[PIPE] seg size={}B dur={}s bitrate={}B/s water={}s target={}s", m_audioFileSize, m_pipeSegDurS, br, InBuff.bufferFilled() / br, (uint32_t)(targetBytes() / br)); // §2.8 seg
+        // DIAG 2026-10-16 [NET] segDone: total=GET→读完 hdr=GET→响应头 body=传输 wait=上分片完→本GET rate=body传输速率
+        {
+            uint32_t now = millis();
+            uint32_t total = (now >= m_diagSegT0) ? (now - m_diagSegT0) : 0;
+            uint32_t hdr = (m_diagSegHdr >= m_diagSegT0) ? (m_diagSegHdr - m_diagSegT0) : 0;
+            uint32_t body = (total >= hdr) ? (total - hdr) : 0;
+            uint32_t wait = (m_diagSegT0 >= m_diagLastSegDone) ? (m_diagSegT0 - m_diagLastSegDone) : 0;
+            uint32_t rate = body ? (m_audioFileSize * 1000 / body / 1024) : 0; // KB/s（1B/ms=1KB/s）
+            AUDIO_LOG_ERROR("[NET] segDone total={}ms hdr={}ms body={}ms wait={}ms size={}B rate={}KB/s", total, hdr, body, wait, m_audioFileSize, rate);
+            m_diagLastSegDone = now;
         }
-        m_f_continue = true;
-        m_pwsst.byteCounter = 0;
-        m_pwsst.ts_packetPtr = 0;
+        if (InBuff.bufferFilled() < targetBytes()) { // §3-3: 深水位续拉（原 BUFFER_TRESHOLD_HLS*2 浅水位）
+            m_f_continue = true;
+            m_pwsst.byteCounter = 0;
+            m_pwsst.ts_packetPtr = 0;
+        }
         m_pwsst.f_nextRound = false;
         goto exit;
     }
 
 chunkFinished:
     if (m_pwsst.f_chunkFinished) {
-        // BUILDV5-FIX16: chunkFinished 分支——预取目标水位判断（与 L5243/L5281 统一）。
-        // 无条件 preA=true 会使 prefetch 已满(218K)时仍抢占下载目标 → InBuff 饿死断流。
-        if (!m_playingFromPrefetch && prefetch.bufferFilled() < BUILDV5_PREFETCH_TARGET) {
-            m_prefetchActive = true;
-            m_pendingPrefetch = true;
-        } else {
-            m_prefetchActive = false;
+        if (InBuff.bufferFilled() < targetBytes()) { // §3-3: 深水位续拉
+            m_pwsst.f_chunkFinished = false;
+            m_f_continue = true;
+            m_pwsst.byteCounter = 0;
+            m_pwsst.chunkSize = 0;
+            m_pwsst.ts_packetPtr = 0;
         }
-        m_pwsst.f_chunkFinished = false;
-        m_f_continue = true;
-        m_pwsst.byteCounter = 0;
-        m_pwsst.chunkSize = 0;
-        m_pwsst.ts_packetPtr = 0;
         goto exit;
     }
 
     // if the buffer is often almost empty issue a warning - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    if (m_f_stream) { streamDetection(availableBytes); }
+    if (m_f_stream) {
+        uint32_t br2 = m_pipeBitrate ? m_pipeBitrate : 36000;
+        if (InBuff.bufferFilled() < (size_t)settings.PIPE_SWITCH_SEC * br2 && availableBytes < 4096) { // §2.8 alert：缓冲剩<3s 且下载未跟上（节流 2s）
+            static uint32_t lastAlert = 0;
+            if (millis() - lastAlert > 2000) {
+                lastAlert = millis();
+                AUDIO_LOG_ERROR("[PIPE] alert remain={}s(<{}s) avail={}B", InBuff.bufferFilled() / br2, settings.PIPE_SWITCH_SEC, availableBytes);
+            }
+        }
+        streamDetection(availableBytes);
+    }
 
-    // BUILDV5-HLSBUF-FLOWCTRL: 下载水位上限（1.0MB 深缓冲）
-    // 1.5MB InBuff 写空间充足时 f_nextRound 无限循环读网络 → 6MB/s burst → WiFi 全速+PSRAM 大流量
-    // +解码+I2S 并发 → 电流尖峰 → brownout(LVL7) 硬复位。水位 > 1.0MB 即停本轮下载。
-    if (InBuff.bufferFilled() > BUILDV5_HLS_WATERMARK) {
-        m_pwsst.f_nextRound = false;
-        goto exit;
-    }
-    // BUILDV5-DIAG7: 强制 f_nextRound 循环（cap_diag8 实证 pktsLast256Calls=256=每调用仅 1 包，
-    // goto 未形成循环 → 下载 20 包/s≈4KB/s → 缓冲永不达 ready 阈值）。每轮先清标志：
-    // avail>0 继续读下一包；avail=0 时 f_nextRound 已清 → 自然退出，杜绝空转。
-    if (m_pwsst.f_nextRound) {
-        m_pwsst.f_nextRound = false;
-        goto nextRound;
-    }
-exit:
-    // BUILDV5-DIAGX: 累计本次调用耗时
+    // buffer fill routine  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     {
-        uint32_t xNow = (uint32_t)(esp_timer_get_time() / 1000);
-        xSum += (xNow - xT0);
-        xT0 = xNow;
+        if (InBuff.bufferFilled() > readyBytes() && !m_f_stream) { // §3-5: ready 门控 3s（原 BUFFER_TRESHOLD_HLS 1.8s）
+            m_f_stream = true;                                     // ready to play the audio data
+            uint16_t filltime = millis() - m_t0;
+            AUDIO_LOG_ERROR("[PIPE] ready total={}s(>{}s)", filltime / 1000, settings.PIPE_READY_SEC); // §2.8 ready
+            info(*this, evt_info, "stream ready");
+            info(*this, evt_info, "buffer filled in {} ms", filltime);
+        }
     }
+    if (m_pwsst.f_nextRound) { goto nextRound; }
+exit:
     return;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -5414,26 +5256,24 @@ void Audio::processWebStreamHLS() {
             }
             if (m_controlCounter != 100) return;
 
-            // BUILDV5-DUALBUF: 下载目标 = prefetchActive ? prefetch : InBuff
-            AudioBuffer& dst = m_prefetchActive ? prefetch : InBuff;
-            size_t ws = dst.writeSpace();
+            size_t ws = InBuff.writeSpace();
             if (ws >= m_pwsHLS.ID3BuffSize - m_pwsHLS.ID3ReadPtr) {
-                memcpy(dst.getWritePtr(), &m_pwsHLS.ID3Buff[m_pwsHLS.ID3ReadPtr], m_pwsHLS.ID3BuffSize - m_pwsHLS.ID3ReadPtr);
-                dst.bytesWritten(m_pwsHLS.ID3BuffSize - m_pwsHLS.ID3ReadPtr);
+                memcpy(InBuff.getWritePtr(), &m_pwsHLS.ID3Buff[m_pwsHLS.ID3ReadPtr], m_pwsHLS.ID3BuffSize - m_pwsHLS.ID3ReadPtr);
+                InBuff.bytesWritten(m_pwsHLS.ID3BuffSize - m_pwsHLS.ID3ReadPtr);
             } else {
                 int t = 0;
-                memcpy(dst.getWritePtr(), &m_pwsHLS.ID3Buff[m_pwsHLS.ID3ReadPtr], ws);
-                dst.bytesWritten(ws);
+                memcpy(InBuff.getWritePtr(), &m_pwsHLS.ID3Buff[m_pwsHLS.ID3ReadPtr], ws);
+                InBuff.bytesWritten(ws);
                 while (true) {
-                    if (dst.writeSpace() >= m_pwsHLS.ID3BuffSize - (m_pwsHLS.ID3ReadPtr + ws)) {
-                        memcpy(dst.getWritePtr(), &m_pwsHLS.ID3Buff[ws + m_pwsHLS.ID3ReadPtr], m_pwsHLS.ID3BuffSize - (m_pwsHLS.ID3ReadPtr + ws)); // write everything that fits into the buffer
-                        dst.bytesWritten(m_pwsHLS.ID3BuffSize - (m_pwsHLS.ID3ReadPtr + ws));
+                    if (InBuff.writeSpace() >= m_pwsHLS.ID3BuffSize - (m_pwsHLS.ID3ReadPtr + ws)) {
+                        memcpy(InBuff.getWritePtr(), &m_pwsHLS.ID3Buff[ws + m_pwsHLS.ID3ReadPtr], m_pwsHLS.ID3BuffSize - (m_pwsHLS.ID3ReadPtr + ws)); // write everything that fits into the buffer
+                        InBuff.bytesWritten(m_pwsHLS.ID3BuffSize - (m_pwsHLS.ID3ReadPtr + ws));
                         break;
                     }
                     t++;
                     vTaskDelay(10); // wait until the buffer is free
                     if (t == 10) {
-                        AUDIO_LOG_ERROR("{} is full", m_prefetchActive ? "prefetch" : "InBuff");
+                        AUDIO_LOG_ERROR("InBuff is full");
                         break;
                     }
                 }
@@ -5444,15 +5284,13 @@ void Audio::processWebStreamHLS() {
         }
 
         size_t bytesWasWritten = 0;
-        // BUILDV5-DUALBUF: 下载目标选择器（同上）
-        AudioBuffer& dst2 = m_prefetchActive ? prefetch : InBuff;
-        if (dst2.writeSpace() >= m_pwsHLS.availableBytes) {
+        if (InBuff.writeSpace() >= m_pwsHLS.availableBytes) {
             //    if(availableBytes > 1024) availableBytes = 1024; // 1K throttle
-            bytesWasWritten = audioFileRead(dst2.getWritePtr(), m_pwsHLS.availableBytes);
+            bytesWasWritten = audioFileRead(InBuff.getWritePtr(), m_pwsHLS.availableBytes);
         } else {
-            bytesWasWritten = audioFileRead(dst2.getWritePtr(), dst2.writeSpace());
+            bytesWasWritten = audioFileRead(InBuff.getWritePtr(), InBuff.writeSpace());
         }
-        dst2.bytesWritten(bytesWasWritten);
+        InBuff.bytesWritten(bytesWasWritten);
 
         m_pwsHLS.byteCounter += bytesWasWritten;
 
@@ -5462,57 +5300,51 @@ void Audio::processWebStreamHLS() {
         }
     }
 
-    // BUILDV5-DUALBUF: stream ready 提前（同 processWebStreamTS：分片完 return 会跳过原位置检查
-    // → m_f_stream 卡 false 死锁）。双缓冲感知：InBuff + prefetch 总填充够深即 ready。
-    if (!m_f_stream) {
-        size_t totalFill = InBuff.bufferFilled() + prefetch.bufferFilled();
-        if (totalFill > BUILDV5_HLS_BUF) {
-            m_f_stream = true; // ready to play the audio data
-            // uint16_t filltime = millis() - m_t0;
-            info(*this, evt_info, "stream ready");
-            // info(*this, evt_info, "buffer filled in {} ms", filltime);
-        }
-    }
-
     if (m_pwsHLS.f_chunkFinished) {
-        // BUILDV5-DUALBUF: 分片下载完 → 立即预取下一分片到 prefetch（切换零断流）
-        // BUILDV5-HLSFIX: 同 processWebStreamTS 条件化——播放源已是 prefetch 时保持写 InBuff，
-        // 避免预取与播放读写竞争（cap_fix5 实证 pref 765K→45K 净减）。
-        if (!m_playingFromPrefetch) {
-            m_prefetchActive = true;
-            m_pendingPrefetch = true; // 重连(setDefaults)时保留 prefetch 状态
+        if (m_pipeSegDurS > 0.1f) m_pipeBitrate = (uint32_t)(m_audioFileSize / m_pipeSegDurS); // 音频码率（HLS 非 TS 分片路径同样适用）
+        uint32_t br = m_pipeBitrate ? m_pipeBitrate : 36000;
+        AUDIO_LOG_ERROR("[PIPE] seg size={}B dur={}s bitrate={}B/s water={}s target={}s", m_audioFileSize, m_pipeSegDurS, br, InBuff.bufferFilled() / br, (uint32_t)(targetBytes() / br)); // §2.8 seg（HLS 路径）
+        if (InBuff.bufferFilled() < targetBytes()) { // §3-4: 深水位续拉
+            m_pwsHLS.f_chunkFinished = false;
+            m_f_continue = true;
         }
-        m_pwsHLS.f_chunkFinished = false;
-        m_f_continue = true;
     }
 
     // if the buffer is often almost empty issue a warning or try a new connection - - - - - - - - - - - - - - - - - - -
     if (m_f_stream) { streamDetection(m_pwsHLS.availableBytes); }
+
+    if (InBuff.bufferFilled() > readyBytes() && !m_f_stream) { // §3-5: ready 门控 3s
+        m_f_stream = true;                                     // ready to play the audio data
+        AUDIO_LOG_ERROR("[PIPE] ready total={}s(>{}s)", millis() / 1000, settings.PIPE_READY_SEC); // §2.8 ready（HLS 路径）
+        // uint16_t filltime = millis() - m_t0;
+        info(*this, evt_info, "stream ready");
+        // info(*this, evt_info, "buffer filled in {} ms", filltime);
+    }
     return;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::playAudioData() {
 
-    // BUILDV5-PLAY-DIAG: 2s 级播放源诊断（定位 HLS 分片切换后静默——InBuff 残渣死锁假设验证）：
-    // st=stream eof lock / in=InBuff.readSpace pref=prefetch.readSpace pfp=playingFromPrefetch
-    // sb=SamplesBuff.filled mvs=validSamples mb=InBuff maxBlockSize（sendBytes 消费下限）。
-    // 预期若死锁：in 停在小残渣(<mb) 且 pref>0 且 pfp=0（永不切换）。
-    static uint32_t pdLast = 0;
-    uint32_t pdNow = (uint32_t)(esp_timer_get_time() / 1000);
-    if (pdNow - pdLast >= 2000) {
-        pdLast = pdNow;
-        AUDIO_LOG_INFO("BUILDV5-PLAY: st={} eof={} lock={} in={} pref={} pfp={} sb={} mvs={} mb={}",
-                       (int)m_f_stream, (int)m_f_eof, (int)m_f_lockInBuffer,
-                       (unsigned)InBuff.readSpace(), (unsigned)prefetch.readSpace(),
-                       (int)m_playingFromPrefetch, (unsigned)SamplesBuff.bufferFilled(),
-                       (int)m_validSamples, (unsigned)InBuff.getMaxBlockSize());
+    if (++m_s2dbgPlayCnt >= 100) { // S2DBG: 每 ~2s（audioTask 20ms/次）打播放侧水位——证明解码/播放管线是否在消费
+        m_s2dbgPlayCnt = 0;
+        AUDIO_LOG_ERROR("S2DBG play inBuff={}B samp={}B run={} valid={} codec={} gap={}", InBuff.bufferFilled(), SamplesBuff.bufferFilled(), m_f_stream, m_validSamples, (int)m_codec, m_diagOutGapCnt);
+    }
+
+    // DIAG 2026-10-16 [OUT]: 播放输出连续性——缓冲<1帧且正在播放=输出即将断（rebuffer 前兆）；恢复后累计 gap 时长
+    if (m_f_stream) {
+        if (InBuff.readSpace() < 4096 && !m_diagOutGapStart) m_diagOutGapStart = millis();
+        else if (InBuff.readSpace() >= 4096 && m_diagOutGapStart) {
+            uint32_t gapMs = millis() - m_diagOutGapStart;
+            if (gapMs > 100) {
+                m_diagOutGapCnt++;
+                AUDIO_LOG_ERROR("[OUT] gap {}ms (buffer drained, {}th)", gapMs, m_diagOutGapCnt);
+            }
+            m_diagOutGapStart = 0;
+        }
     }
 
     if (m_f_eof || m_f_lockInBuffer || !m_f_stream) {
-        // BUILDV5-DIAG4: guard 不再 vTaskDelay——delay 使 performAudioTask 掉到 ~20x/s → 下载限死
-        // 3KB/s → 缓冲永远到不了 ready 阈值 → 死锁闭环（cap_diag5 实证：decoder 已建仍 0 ready）。
-        // 立即 return 让下载循环全速跑。
-        if (!m_f_stream && (m_pwsst.byteCounter & 0x3FF) == 0) { AUDIO_LOG_INFO("BUILDV5-DIAG: guard in={} pref={}", InBuff.bufferFilled(), prefetch.bufferFilled()); }
+        vTaskDelay(1);
         return;
     } // guard, stream not ready or eof reached or InBuff is locked or not running
     if (SamplesBuff.bufferFilled()) { playChunk(); } // guard, play samples first
@@ -5538,10 +5370,7 @@ void Audio::playAudioData() {
 
     if (!isFile() && !isStream()) return;
 
-    uint32_t lk0 = (uint32_t)(esp_timer_get_time() / 1000); // BUILDV5-DIAG
     xSemaphoreTake(mutex_audioTaskIsDecoding, 1 * configTICK_RATE_HZ);
-    uint32_t lk1 = (uint32_t)(esp_timer_get_time() / 1000); // BUILDV5-DIAG
-    if (lk1 - lk0 >= 2) AUDIO_LOG_INFO("BUILDV5: lockWait={}ms", lk1 - lk0); // BUILDV5-DIAG
     {
         m_pad.bytesDecoded = 0;
         if (isFile()) {
@@ -5569,70 +5398,23 @@ void Audio::playAudioData() {
         }
 
         if ((isStream())) {
-            // BUILDV5-DUALBUF: 播放源切换（HLS 分片无缝衔接）
-            // InBuff(分片 N) 播空 → 切 prefetch(分片 N+1 已预取就绪) → 下载目标回 InBuff(N+2)。
-            // prefetch 播空 → 切回 InBuff（N+2 下载中）。切换在 sendBytes 前完成，零断流。
-            if (m_playingFromPrefetch) {
-                if (prefetch.readSpace() == 0) {
-                    m_playingFromPrefetch = false;
-                    AUDIO_LOG_INFO("BUILDV5: switch back to InBuff");
-                }
-            } else {
-                // BUILDV5-DIAG-SW: 10 分钟级（cap_fix6 无 switch 日志 → 判定条件
-                // InBuff空+prefetch有 从未满足，需确认播放源/缓冲真实状态）
-                static uint32_t swCnt = 0;
-                if ((++swCnt % 600000) == 0) AUDIO_LOG_INFO("BUILDV5-SW: in={} pref={} pfp={}", InBuff.readSpace(), prefetch.readSpace(), (int)m_playingFromPrefetch);
-                // BUILDV5-FIX13: 切换阈值 0→8192B——残量(<1帧)切换=切过去立即空→双空重爬
-                // (cap_hls_2_600 38.2s 深 dip 实证)。≥8192B 才切，保证切换后有实际播放余量。
-                if (InBuff.readSpace() == 0 && prefetch.readSpace() >= 8192) {
-                    m_playingFromPrefetch = true;
-                    m_prefetchActive = false; // 下载目标回 InBuff（N+2）
-                    AUDIO_LOG_INFO("BUILDV5: switch to prefetch");
-                }
-            }
-            AudioBuffer& src = m_playingFromPrefetch ? prefetch : InBuff;
             if (m_f_allDataReceived) { // Google TTS, OpenAI
                 m_pad.lastFrames = true;
-                if (m_f_tts && !src.bufferFilled()) {
+                if (m_f_tts && !InBuff.bufferFilled()) {
                     m_f_eof = true;
                     goto exit;
                 }
             }
             if (m_pad.lastFrames) {
                 if (m_f_chunked) {
-                    m_pad.bytesToDecode = src.readSpace();
+                    m_pad.bytesToDecode = InBuff.readSpace();
                 } else {
-                    m_pad.bytesToDecode = min(src.readSpace(), (size_t)(m_audioDataStart + m_audioDataSize - m_audioDataReadPtr));
+                    m_pad.bytesToDecode = min(InBuff.readSpace(), (size_t)(m_audioDataStart + m_audioDataSize - m_audioDataReadPtr));
                 }
-                m_pad.bytesDecoded = sendBytes(src.getReadPtr(), m_pad.bytesToDecode);
+                m_pad.bytesDecoded = sendBytes(InBuff.getReadPtr(), m_pad.bytesToDecode);
             } else {
-                // BUILDV5-FIX8b: 每 tick 解 ≤2 帧 = 供给 76 帧/s = 1.6 倍余量（hlsbuf2 实证
-                // 0 低谷）。≤4 帧（fix8c/hlsbuf6）未改善低谷反引入 11 次（cap_hlsbuf6），
-                // 回退 fix8b。非阻塞写 + 循环内推进（fix8b 结构）不引入慢速（慢速根因是
-                // 阻塞写+一次写光）。循环内 sendBytes 遇 m_validSamples 残留 guard 返回 0 → break，
-                // 残留在 L5289 cacheSamples 消化，不挡死（区别于 fix5 的永久挡死场景）。
-                size_t bdTotal = 0;
-                for (int i = 0; i < 2; i++) {
-                    m_pad.bytesToDecode = src.readSpace();
-                    // BUILDV5-AACSYNC2: 单次喂给 libfaad 的输入限幅 64KB（fix8b 等效窗口）。
-                    // 深缓冲(1.5MB)下 readSpace 达 900KB → libfaad 在大窗口内 findNextSync 撞上
-                    // 分片杂质/ID3 产生的伪 sync → 伪帧 payload 损坏 → CPE 位流越界 StoreProhibited
-                    // （channel_pair_element:7982 panic 已实证，RESET_REASON=4）。
-                    // 64KB 窗口内必含真帧 sync（0.58s=27 帧），伪 sync 概率与 fix8b（稳定不崩）相同。
-                    if (m_pad.bytesToDecode > 65536) { m_pad.bytesToDecode = 65536; }
-                    // BUILDV5-DEADLOCK-FIX (2026-10-12): 门槛从 getMaxBlockSize()(18000) 降到 188。
-                    // PLAY-DIAG 铁证：in=17931 pref=65535 pfp=0 sb=0 —— InBuff 残渣 17931 差 69 字节
-                    // 到 18000 → 永不被 sendBytes 消费 → 永不切 prefetch（L5541 需 readSpace()==0）→
-                    // 双缓冲全卡死 → 播放几秒即静默。sendBytes 内部按 AAC 帧边界消费 + findNextSync
-                    // 对齐残渣，任意 len(>=188 TS 包粒度) 都能正确推进，故该门槛只会造成死锁。
-                    if (m_pad.bytesToDecode < 188) break;
-                    int bd = sendBytes(src.getReadPtr(), m_pad.bytesToDecode);
-                    if (bd <= 0) break; // guard 返回 0 / decodeError 返回负值，均停止（负值转 size_t 会损坏缓冲）
-                    src.bytesWasRead((size_t)bd); // 循环内推进（fix6 正确组合）
-                    m_audioDataReadPtr += (size_t)bd;
-                    bdTotal += (size_t)bd;
-                }
-                (void)bdTotal; // 已循环内消费，L5365 不执行
+                m_pad.bytesToDecode = InBuff.readSpace();
+                if (m_pad.bytesToDecode >= InBuff.getMaxBlockSize()) { m_pad.bytesDecoded = sendBytes(InBuff.getReadPtr(), m_pad.bytesToDecode); }
             }
         }
 
@@ -5643,10 +5425,7 @@ void Audio::playAudioData() {
     }
 exit:
     xSemaphoreGive(mutex_audioTaskIsDecoding);
-    // BUILDV5-STEP3FIX: 官方库热路径 DEBUG 每 audio.loop() 打一行（netTask 泵 15ms →
-    // ~80 行/s 刷爆 UART → main loop Serial.printf 阻塞 → 触摸消费卡死（cap_step3b_ts.log
-    // 实证 60s 内触摸事件 0 条、本行 4900+ 条）。生产模式注释，保留诊断能力看 DIAG 限频行。
-    // AUDIO_LOG_DEBUG("m_audioDataReadPtr {}, m_audioDataSize {}", m_audioDataReadPtr, m_audioDataSize);
+    AUDIO_LOG_DEBUG("m_audioDataReadPtr {}, m_audioDataSize {}", m_audioDataReadPtr, m_audioDataSize);
     return;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -5728,13 +5507,7 @@ Audio::HeaderResult Audio::parseHeaderLine(ps_ptr<char> name, ps_ptr<char> value
     }
 
     else if (name.equals_icase("connection")) {
-        if (value.contains_with_icase("close")) {
-            m_f_connectionClose = true;
-            info(*this, evt_info, "server connection mode: close");
-        } else {
-            m_f_connectionClose = false;
-            info(*this, evt_info, "server connection mode: {}", value.c_get());
-        }
+        if (value.contains_with_icase("close")) { m_f_connectionClose = true; }
         return HeaderResult::Continue;
     }
 
@@ -5763,7 +5536,6 @@ Audio::HeaderResult Audio::parseHeaderLine(ps_ptr<char> name, ps_ptr<char> value
 
     else if (name.equals_icase("content-range")) {
         info(*this, evt_info, "{}: {}", name, value);
-        m_f_acceptRanges = true;
         return HeaderResult::Continue;
     }
 
@@ -5811,6 +5583,7 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
     ps_ptr<char> redirectUrl;
 
     auto header = readHeader();
+    AUDIO_LOG_ERROR("S2DBG parseHeader enter: running={} connected={} timeout={}ms hdrLen={}", m_f_running, m_client->connected(), m_timeout_ms, header.size());
     if (header.empty()) goto exit;
 
     for (auto& rhl : header) { // read the header line for line
@@ -5828,17 +5601,12 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
             case HeaderResult::Continue: break;
             case HeaderResult::ContentTypeSeen: ct_seen = true; break;
             case HeaderResult::Redirect:
-                if(redirectUrl.starts_with("http")){
-                    m_client->stop();
-                    httpPrint(redirectUrl.c_get());
-                    return true;
-                }
-                // http://live.rockmelodic-radio.com:8124/ --> Location:index.html?sid=1
-                // so do nothing and try a different user agent
-                break;
+                m_client->stop();
+                httpPrint(redirectUrl.c_get());
+                return true;
             case HeaderResult::Error: goto exit;
         }
-        // AUDIO_LOG_DEBUG("name: {}, value; {}", name, value); // BUILDV5-STEP3-TFIX2: 注释——HLS 每分片响应 ~30 个 header 循环打印 → 刷爆串口阻塞 main loop（触摸"点不中"根因之一）
+        AUDIO_LOG_DEBUG("name: {}, value; {}", name, value);
     }
 
     if (ct_seen) {
@@ -5848,11 +5616,14 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
     }
 
 exit: // termination condition
+    AUDIO_LOG_ERROR("S2DBG parseHeader EXIT hdrEmpty={} ctSeen={} running={}", header.empty(), ct_seen, m_f_running);
     m_dataMode = AUDIO_NONE;
     stopSong();
     return false;
 
 lastToDo:
+    AUDIO_LOG_ERROR("S2DBG parseHeader OK plsFmt={} codec={} ctSeen={}", (int)m_playlistFormat, (int)m_codec, ct_seen);
+    m_diagSegHdr = millis(); // DIAG [NET] segDone: 响应头完成时刻
     m_streamType = ST_WEBSTREAM;
     if (m_audioFileSize > 0) m_streamType = ST_WEBFILE; // content length found
     if (m_phreh.f_icy_data) m_streamType = ST_WEBSTREAM;
@@ -5866,14 +5637,7 @@ lastToDo:
         m_dataMode = AUDIO_PLAYLISTINIT; // playlist expected
         // AUDIO_LOG_INFO("now parse playlist");
     } else {
-        if (m_content_type == "text/html") {  // SHOUTcast http://server1.chilltrax.com:9000/
-            if(!m_f_alternative_user_agent){
-                m_f_alternative_user_agent = true;
-                m_client->stop();
-                AUDIO_LOG_INFO("The http-request was unsuccessful; use a different User-Agent");
-                httpPrint(m_currentHost.c_get());
-                return true;
-            }
+        if (m_content_type == "text/html") {
             AUDIO_LOG_INFO("{} is probably an HTML page", m_currentHost.c_get());
         } else {
             AUDIO_LOG_INFO("unknown content found at: {}, content type is: {}", m_currentHost.c_get(), m_content_type);
@@ -5881,7 +5645,7 @@ lastToDo:
         goto exit;
     }
 
-    // AUDIO_LOG_DEBUG("playlistFormat {}, dataMode {}, streamType: {}", plsFmtStr[m_playlistFormat], dataModeStr[m_dataMode], streamTypeStr[m_streamType]); // BUILDV5-STEP3-TFIX2: 注释——每次响应结束 1 行，累计也是刷屏源
+    AUDIO_LOG_DEBUG("playlistFormat {}, dataMode {}, streamType: {}", plsFmtStr[m_playlistFormat], dataModeStr[m_dataMode], streamTypeStr[m_streamType]);
     return true;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -6467,17 +6231,9 @@ uint32_t Audio::decodeContinue(int8_t res, uint8_t* data, int32_t bytesDecoded, 
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 int Audio::sendBytes(uint8_t* data, size_t len) {
-    static uint32_t sCall=0, sNoSync=0, sOffset=0, sOk=0, sGuard=0, sNotReady=0, sErr=0, sMore=0, sT0=0; // BUILDV5-DIAG
-    uint32_t nowMs = (uint32_t)(esp_timer_get_time()/1000); // BUILDV5-DIAG
-    sCall++; // BUILDV5-DIAG
-    if (sT0==0) sT0=nowMs; // BUILDV5-DIAG
-    if (nowMs - sT0 >= 600000) { // BUILDV5-HLSFIX: 1s→10分钟级（UART 竞争源）
-        AUDIO_LOG_INFO("BUILDV5: sb call={} noSync={} off={} ok={} guard={} notReady={} err={} more={}", sCall, sNoSync, sOffset, sOk, sGuard, sNotReady, sErr, sMore); // BUILDV5-DIAG
-        sCall=sNoSync=sOffset=sOk=sGuard=sNotReady=sErr=sMore=0; sT0=nowMs; // BUILDV5-DIAG
-    }
     if (!m_f_running) return 0;   // guard
     if (!m_decoder) return 0;     // guard
-    if (m_validSamples) { sGuard++; return 0; } // guard + DIAG
+    if (m_validSamples) return 0; // guard
 
     int                   res = 0;
     int                   bytesDecoded = 0;
@@ -6493,38 +6249,16 @@ int Audio::sendBytes(uint8_t* data, size_t len) {
         m_sbyt.isPS = 0;
         m_sbyt.f_setDecodeParamsOnce = true;
         m_sbyt.nextSync = findNextSync(data, len);
-        if (m_sbyt.nextSync < 0) { sNoSync++; return len; } // no syncword found + DIAG
+        if (m_sbyt.nextSync < 0) return len; // no syncword found
         if (m_sbyt.nextSync == 0) { m_f_playing = true; }
-        if (m_sbyt.nextSync > 0) { sOffset++; return m_sbyt.nextSync; } // + DIAG
+        if (m_sbyt.nextSync > 0) return m_sbyt.nextSync;
     }
     // m_f_playing is true at this pos
 
     m_sbyt.bytesLeft = len;
 
-    // BUILDV5-AACSYNC: 深缓冲(1.5MB)分片切换时旧分片残留+新分片头在 InBuff 拼接 → data 开头
-    // 是错位字节或"伪 ADTS 头" → libfaad 误解析(帧长/采样率异常) → faad_imdct 浮点数组写越界
-    // → StoreProhibited panic（RESET_REASON=4 已实证）。合法 AAC 流的帧边界处 data 必为有效
-    // ADTS 头(0xFFF + 帧长合理)，故此处校验：非有效头 = 错位 → findNextSync 对齐，畸形数据不进 libfaad。
-    if (m_codec == CODEC_AAC && len >= 7) {
-        uint8_t b0 = data[0], b1 = data[1];
-        bool hdrOk = (b0 == 0xFF && (b1 & 0xF0) == 0xF0);
-        if (hdrOk) {
-            uint32_t flen = ((b1 & 0x03) << 11) | (data[2] << 3) | (data[3] >> 5);
-            if (flen < 7 || flen > (uint32_t)len + 2) { hdrOk = false; } // 帧长异常 = 伪头
-        }
-        if (!hdrOk) {
-            sNoSync++;
-            m_f_playing = false; // 强制重新找 sync（分片切换/错位后）
-            int ns = findNextSync(data, len);
-            if (ns < 0) { return len; }     // 无 sync：丢弃本段，等新数据
-            if (ns > 0) { return ns; }      // 跳过错位字节，返回 offset 由调用方推进读指针
-            // ns==0：data 开头是 sync 但帧长校验失败 → 前进 1 字节重找
-            return 1;
-        }
-    }
-
-    if (m_codec == CODEC_NONE && m_playlistFormat == FORMAT_M3U8) { sNotReady++; return 0; } // can happen when the m3u8 playlist is loaded + DIAG
-    if (!m_f_decode_ready) { sNotReady++; return 0; }                                        // find sync first + DIAG
+    if (m_codec == CODEC_NONE && m_playlistFormat == FORMAT_M3U8) return 0; // can happen when the m3u8 playlist is loaded
+    if (!m_f_decode_ready) return 0;                                        // find sync first
 
     //-----------------------------------------------------------------
     res = m_decoder->decode(data, &m_sbyt.bytesLeft, m_outBuff.get());
@@ -6537,39 +6271,16 @@ int Audio::sendBytes(uint8_t* data, size_t len) {
     //        < 0: there has been an error
     //       -100: serious error, stop song
 
-    if (res < 0) {
-        sErr++;
-        // BUILDV5-FIX12 (2026-10-12): 分片边界伪 sync 风暴——连续错误时不再逐帧喂 libfaad 试错
-        // （每次失败仅跳 1 字节，1.1s/11 次风暴实证 i2sBytes -31%），直接 findNextSync 严格双帧
-        // 校验整段重扫，一次跳过整段垃圾（findSyncWord 校验帧长+帧尾双 sync）。
-        // 风暴 1.1s→<100ms，dip 31%→~3%，听感无感。
-        if (++m_aacErrStrike >= 2) {
-            m_aacErrStrike = 0;
-            m_f_playing = false;
-            int ns = findNextSync(data, len);
-            if (ns < 0) return len;      // 无有效 sync → 整段丢弃（等新数据/新分片）
-            if (ns > 0) return ns;       // 跳到有效帧头（严格双帧校验）
-            return 1;                    // sync 在开头但解码失败 → 跳 1 字节继续
-        }
-        return decodeError(res, data, bytesDecoded);
-    }
-    if (res > 99) { sMore++; m_aacErrStrike = 0; return decodeContinue(res, data, bytesDecoded, &m_sbyt.bytesLeft); } // decoder needs more data... + DIAG
+    if (res < 0) { return decodeError(res, data, bytesDecoded); }                        // Error, skip the frame...
+    if (res > 99) { return decodeContinue(res, data, bytesDecoded, &m_sbyt.bytesLeft); } // decoder needs more data...
 
     if ((bytesDecoded == 0) && (m_codec != CODEC_VORBIS && m_codec != CODEC_FLAC)) { // unlikely framesize, exept VORBIS decodes lastSegmentTable
         info(*this, evt_info, "framesize is 0, start decoding again");
         m_f_playing = false; // seek for new syncword
         // we're here because there was a wrong sync word so skip one byte and seek for the next
-        // BUILDV5-FIX12: 连续 0 帧长（伪 sync）也整段重扫，避免逐字节爬行
-        if (++m_aacErrStrike >= 2) {
-            m_aacErrStrike = 0;
-            int ns = findNextSync(data, len);
-            if (ns < 0) return len;
-            if (ns > 0) return ns;
-        }
         return 1;
     }
     // status: bytesDecoded > 0 and res >= 0
-    m_aacErrStrike = 0; // BUILDV5-FIX12: 成功解码复位连续错误计数
 
     switch (m_codec) {
         case CODEC_WAV: m_validSamples = m_decoder->getOutputSamples(); break;
@@ -6637,23 +6348,10 @@ int Audio::sendBytes(uint8_t* data, size_t len) {
     samples_out = m_validSamples;
 
     if (m_validSamples) {
-        sOk++; // BUILDV5-DIAG
-        static uint32_t decSamp = 0, decT0 = 0; // BUILDV5: decoder sample throughput
-        decSamp += (uint32_t)m_validSamples;
-        uint32_t decNow = (uint32_t)(esp_timer_get_time() / 1000);
-        if (decT0 == 0) decT0 = decNow;
-        if (decNow - decT0 >= 1000) { // BUILDV5-HLSFIX15: 1s 级——精确数"每秒播放推进"，
-            // 卡顿=某秒 decSamp 显著低于 140K（之前 10s 级把 1-2s 卡顿平均掩盖，用户实测否决）
-            AUDIO_LOG_INFO("BUILDV5: dec/s={} playT={}ms", decSamp, (uint32_t)m_audioCurrentTime);
-            decSamp = 0; decT0 = decNow;
-        }
         calculateAudioTime(bytesDecoded, samples_out);
         cacheSamples();
     }
-    // BUILDV5-FIX: 删除嵌套 playChunk —— 解码与 I2S 播放解耦。
-    // 原库每帧解码后立即同步写 I2S（等 DMA 放行），把 sendBytes 拖到 ~37ms/次，
-    // audioTask 掉到 8-12x/s → 每秒只解 ~12 帧 → 全局慢 1/4。
-    // 写 I2S 统一由 playAudioData 入口的 playChunk() 负责。
+    if (SamplesBuff.bufferFilled()) { playChunk(); }
     return bytesDecoded;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -7097,16 +6795,11 @@ bool Audio::setSampleRate(uint32_t sampRate) {
         AUDIO_LOG_WARN("Sample rate must not be smaller than 16kHz, found: {}", sampRate);
         // return false;
     }
-    // BUILDV5-FIX12b (2026-10-12): 采样率不变时跳过日志与 IIR 重算——原库每帧都调
-    // setSampleRate（解码成功路径），正常播放时 48000 不变仍打日志+重算 IIR+50 行 D 日志；
-    // 分片边界伪 sync 风暴时（60-70s 实证 58 次）UART 爆量+CPU 浪费拖慢重同步。
-    // IIR 系数仅依赖采样率，采样率未变时旧系数仍有效，跳过安全。
     if (m_i2s_items.sampleRate != sampRate) {
-        AUDIO_LOG_INFO("BUILDV5: setSampleRate {} (decoder getSampleRate)", sampRate);
         m_i2s_items.sampleRate = sampRate;
         reconfigI2S();
-        IIR_calculateCoefficients();
     }
+    IIR_calculateCoefficients();
     return true;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -7204,10 +6897,6 @@ void Audio::reconfigI2S() {
         m_i2s_std_cfg.clk_cfg.sample_rate_hz = m_i2s_items.sampleRate;
     }
     i2s_channel_reconfig_std_clock(m_i2s_tx_handle, &m_i2s_std_cfg.clk_cfg);
-    AUDIO_LOG_INFO("BUILDV5: reconfig done clk={} out_sr={}", m_i2s_std_cfg.clk_cfg.sample_rate_hz, m_output_sr);
-    i2s_chan_info_t ci = {}; // BUILDV5: query HW actual clock
-    if (i2s_channel_get_info(m_i2s_tx_handle, &ci) == ESP_OK)
-        AUDIO_LOG_INFO("BUILDV5: HW sclk={} mclk={} bclk={}", ci.sclk_hz, ci.mclk_hz, ci.bclk_hz);
     i2s_channel_enable(m_i2s_tx_handle);
     m_dmaFreeDesc = settings.DMA_DESC_NUM;
 }
@@ -7453,10 +7142,22 @@ int32_t Audio::getI2sPort() {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::gain_ramp() {
-    // BUILDV5: no fade-in / fade-out ramp — apply target volume immediately
-    // (v4 default ramps cur_volume over ~5s, which sounded like a slow volume
-    //  fade-up from 0 on every start; user requested instant volume)
-    m_audio_items.cur_volume = m_audio_items.mute ? 0.0f : (float)m_audio_items.volume;
+    settings.VOL_FADING_SPEED = std::clamp(settings.VOL_FADING_SPEED, 1.0f, 100.0f); // avoid div0
+    // determine goal
+    float target = m_audio_items.mute ? 0.0f : (float)m_audio_items.volume;
+
+    // maximum change per tick
+    float step = (float)m_audio_items.volume_steps / settings.VOL_FADING_SPEED;
+
+    float diff = target - m_audio_items.cur_volume;
+
+    if (fabsf(diff) <= step) {
+        // Goal achieved (no oscillation!)
+        m_audio_items.cur_volume = target;
+    } else {
+        // Ramp
+        m_audio_items.cur_volume += (diff > 0.0f ? step : -step);
+    }
 
     // Security-Clamp
     if (m_audio_items.cur_volume < 0.0f)
@@ -7902,6 +7603,49 @@ bool Audio::ts_parsePacket(uint8_t* packet, uint8_t* packetStart, uint8_t* packe
         return true;
     }
 
+    // --- Audio PID auto-detection (M5HLSPlayer-style), before PID dispatch -------
+    // Multi-program muxes such as CNR carry NO usable PMT in the transport stream
+    // (their PAT points to PMT PIDs that are absent), so the audio PID is never
+    // discovered via PAT/PMT and no frames reach the decoder (silence). Lock the
+    // first PUSI payload that clearly carries audio: an audio PES (StreamID 0xC0..0xDF)
+    // or a valid ADTS sync word. Once locked, the normal AAC branch below handles it.
+    if (PUSI && PID > 0 && m_tspp.pidOfAAC == 0) {
+        int pos = 4;
+        if (AFL >= 0) pos = 5 + AFL;
+        bool isAudio = false;
+        // (a) Audio PES start code: 00 00 01 <StreamID 0xC0..0xDF>
+        if (pos + 4 <= TS_PACKET_SIZE) {
+            if (packet[pos] == 0x00 && packet[pos + 1] == 0x00 && packet[pos + 2] == 0x01) {
+                uint8_t sid = packet[pos + 3];
+                if (sid >= 0xC0 && sid <= 0xDF) isAudio = true;
+            }
+        }
+        // (b) Raw ADTS (non-PES) stream: valid sync + header in the first payload bytes.
+        //     Restricted to the start of the payload to avoid matching video data.
+        if (!isAudio) {
+            for (int i = pos; i + 5 < TS_PACKET_SIZE && i < pos + 8; i++) {
+                if (packet[i] == 0xFF && (packet[i + 1] & 0xE0) == 0xE0) {
+                    uint8_t prof = (packet[i + 1] & 0xC0) >> 6;
+                    if (prof == 3) continue; // reserved AAC profile
+                    uint8_t b2 = packet[i + 2];
+                    uint8_t b3 = packet[i + 3];
+                    uint8_t b4 = packet[i + 4];
+                    int srIdx = (b2 & 0x0C) >> 2;
+                    int chCfg = (b2 & 0x01) << 2 | (b3 & 0x0C) >> 4;
+                    int flen = (((b2 & 0x3C) >> 2) << 11) | (((b3 & 0x03) << 8) | b4);
+                    if (srIdx < 13 && chCfg < 8 && flen >= 7 && flen <= 65520) {
+                        isAudio = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (isAudio) {
+            m_tspp.pidOfAAC = PID;
+            AUDIO_LOG_INFO("AAC PID auto-discovered: 0x{:04X}({})", PID, PID);
+        }
+    }
+
     if (PID == 0) {
         // Program Association Table (PAT) - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
         if (log) AUDIO_LOG_INFO("PAT");
@@ -7914,11 +7658,17 @@ bool Audio::ts_parsePacket(uint8_t* packet, uint8_t* packetStart, uint8_t* packe
         if (log) AUDIO_LOG_INFO("Section Length: {}", sectionLength);
         int program_number, program_map_PID;
         int indexOfPids = 0;
-        (void)program_number; // [-Wunused-but-set-variable]
-        for (int i = startOfProgramNums; i <= sectionLength; i += lengthOfPATValue) {
+        // Robust PAT parse. Multi-program muxes (e.g. CNR) pad the section with
+        // 0xFFFF null-program entries, so the old unbounded loop (i <= sectionLength,
+        // sectionLength up to 176) overflowed m_tspp.pids[4] and corrupted the stack.
+        // Stop at the packet edge, at the array limit, or at the first null program
+        // (0xFFFF); skip the null PMT PID (0x1FFF).
+        for (int i = startOfProgramNums; PLS + i + 3 < TS_PACKET_SIZE && indexOfPids < PID_ARRAY_LEN; i += lengthOfPATValue) {
             program_number = ((packet[PLS + i] & 0xFF) << 8) | (packet[PLS + i + 1] & 0xFF);
+            if (program_number == 0xFFFF) break; // null program -> rest of section is padding
             program_map_PID = ((packet[PLS + i + 2] & 0x1F) << 8) | (packet[PLS + i + 3] & 0xFF);
             if (log) AUDIO_LOG_INFO("Program Num: 0x{:04X}({}) PMT PID: 0x{:04X}({})", program_number, program_number, program_map_PID, program_map_PID);
+            if (program_map_PID == 0x1FFF) continue; // null PID
             m_tspp.pids[indexOfPids++] = program_map_PID;
         }
         m_tspp.pidNumber = indexOfPids;
@@ -8359,45 +8109,40 @@ fail:
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————-
 boolean Audio::streamDetection(uint32_t bytesAvail) {
 
+    if (!m_client->connected()) {
+        info(*this, evt_info, "Stream lost");
+        connecttohost(m_lastHost.get());
+        return false;
+    }
+
     if (InBuff.bufferFilled() < InBuff.getMaxBlockSize()) {
-        if (m_sdet.cnt_slow == 0) { m_sdet.tmr_slow = millis(); }
+        if (m_sdet.cnt_slow == 0) m_sdet.tmr_slow = millis();
         m_sdet.cnt_slow++;
     } else {
         m_sdet.cnt_slow = 0;
         m_sdet.cnt_lost = 0;
+        return true;
     }
 
-    // Low buffer for 2 seconds?
+    // if within one second the content of the audio buffer falls below the size of an audio frame 100 times,
+    // issue a message
     if (m_sdet.cnt_slow && m_sdet.tmr_slow + 2000 < millis()) {
-
         m_sdet.tmr_slow = millis();
-
         info(*this, evt_info, "slow stream");
-
         m_sdet.cnt_slow = 0;
         m_sdet.cnt_lost++;
     }
 
-    // If bytes are still arriving the stream is NOT lost.
     if (bytesAvail) { m_sdet.cnt_lost = 0; }
+    if (InBuff.bufferFilled() > InBuff.getMaxBlockSize() * 2) return true; // enough data available to play
 
-    // buffer sufficiently full
-    if (InBuff.bufferFilled() > InBuff.getMaxBlockSize() * 2) { return true; }
-
-    // Só depois de vários períodos realmente sem áudio
-    // consideramos o stream perdido.
-    if (m_sdet.cnt_lost >= 5) {
-
-        info(*this, evt_info, "Stream lost -> reconnect");
-
+    // if no audio data is received within 10 seconds, a new connection attempt is started.
+    if (m_sdet.cnt_lost == 5) {
+        info(*this, evt_info, "Stream lost");
         connecttohost(m_lastHost.get());
-
         m_sdet.cnt_slow = 0;
         m_sdet.cnt_lost = 0;
-
-        return false;
     }
-
     return false;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————-
@@ -8652,25 +8397,13 @@ const char* Audio::getVersion() {
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 bool Audio::get_info() {
 
-    bool any = false;
-    while (true) {
-        // Pull one item out of the queue while holding the lock, then release
-        // the lock before invoking the callback. audio_info_callback() may call
-        // back into the Audio API (e.g. connecttohost() from an evt_eof handler),
-        // which in turn calls info()/enqueueInfo() and needs to lock mutex_info
-        // again. Holding the lock across the callback would deadlock (mutex_info
-        // is a plain std::mutex, not recursive).
-        audiolib::InfoItem item;
-        {
-            std::lock_guard<std::mutex> lock(mutex_info);
-            if (m_info_queue.queue.empty()) break;
-            item = std::move(m_info_queue.queue.front());
-            m_info_queue.queue.pop_front();
-        }
-        any = true;
+    std::lock_guard<std::mutex> lock(mutex_info);
+    if (m_info_queue.queue.empty()) return false;
 
-        msg_t        i = {0};
-        ps_ptr<char> msg = item.msg;
+    while (m_info_queue.queue.size()) {
+        msg_t                     i = {0};
+        const audiolib::InfoItem& item = m_info_queue.queue.front();
+        ps_ptr<char>              msg = item.msg;
         i.msg = msg.c_get();
         i.e = (event_t)item.e;
         ps_ptr<char> evtstr = item.s;
@@ -8682,8 +8415,9 @@ bool Audio::get_info() {
         i.vec2 = item.vec2;
 
         audio_info_callback(i);
+        m_info_queue.queue.pop_front();
     }
-    return any;
+    return true;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::trim(char* str) {
@@ -8905,18 +8639,7 @@ void Audio::audioTask() {
 }
 
 void Audio::performAudioTask() {
-    static uint32_t pCnt = 0, pT0 = 0; // BUILDV5: decode-task call rate
-    pCnt++;
-    uint32_t pNow = (uint32_t)(esp_timer_get_time() / 1000);
-    if (pT0 == 0) pT0 = pNow;
-    if (pNow - pT0 >= 600000) { // BUILDV5-HLSFIX: 10 分钟级，消除高频 UART 竞争源(cap_fix9)
-        AUDIO_LOG_INFO("BUILDV5: audioTask={}x/s heap={}B psram={}B", pCnt,
-                       (int)esp_get_free_heap_size(),
-                       (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-        pCnt = 0; pT0 = pNow;
-    }
     int32_t dummy[2] = {0};
-    if ((pCnt % 600000) == 0) { AUDIO_LOG_INFO("BUILDV5-DIAG4: perf decoder={} codec={} dataMode={}", m_decoder != nullptr, (int)m_codec, (int)m_dataMode); }
     if (m_decoder) {
         xSemaphoreTake(mutex_audioTask, 0.3 * configTICK_RATE_HZ);
         playAudioData();
@@ -8929,8 +8652,8 @@ void Audio::performAudioTask() {
         if (SamplesBuff.bufferFilled()) {
             playChunk();
         } else {
-            if (settings.VU_LEVEL) calculateVUlevel(dummy, 0);  // fade out
-            if (settings.SPECTRUM) calculateSpectrum(dummy, 0); // fade out
+            calculateVUlevel(dummy, 0);  // fade out
+            calculateSpectrum(dummy, 0); // fade out
         }
         vTaskDelay(50);
         return;
@@ -8941,12 +8664,9 @@ uint32_t Audio::getHighWatermark() {
     UBaseType_t highWaterMark = uxTaskGetStackHighWaterMark(m_audioTaskHandle);
     return highWaterMark; // dwords
 }
-// —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-
-// BUILDV5-TONE: emit 1kHz sine via the existing v4 i2s channel (32-bit slot)
+// BUILDV5-TONE (restored from backup_lib_dualbuf): emit 1kHz sine via the existing v4 i2s channel (32-bit slot)
 void Audio::toneTaskImpl(void* arg) {
     Audio* self = (Audio*)arg;
-    AUDIO_LOG_INFO("tone: start %ds align=%d on i2s%u", 10, self->m_toneAlign, (unsigned)self->m_i2s_items.i2s_num);
     const int SR = 16000;
     static int32_t buf[1600]; // 0.1s @ 16kHz, 32-bit
     for (int i = 0; i < 1600; i++) {
@@ -8958,16 +8678,16 @@ void Audio::toneTaskImpl(void* arg) {
     while (millis() - t0 < 10000) { // 10s cap
         size_t written = 0;
         esp_err_t e = i2s_channel_write(self->m_i2s_tx_handle, buf, sizeof(buf), &written, 100);
-        if (e != ESP_OK) { AUDIO_LOG_ERROR("tone: write err %X", e); break; }
+        if (e != ESP_OK) break;
         if (written == 0) vTaskDelay(1);
     }
-    AUDIO_LOG_INFO("tone: done");
     vTaskDelete(NULL);
 }
 bool Audio::testTone1k(int seconds, int align) {
     m_toneAlign = align;
-    if (m_i2s_tx_handle == NULL) { AUDIO_LOG_ERROR("tone: i2s not init"); return false; }
+    if (m_i2s_tx_handle == NULL) return false;
     BaseType_t r = xTaskCreate(&Audio::toneTaskImpl, "tone1k", 4096, this, 5, NULL);
-    if (r != pdPASS) { AUDIO_LOG_ERROR("tone: task create fail %d", (int)r); return false; }
+    if (r != pdPASS) return false;
     return true;
 }
+// —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————

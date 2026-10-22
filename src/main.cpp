@@ -71,8 +71,7 @@ TFT_eSPI tft = TFT_eSPI();
 // ANALOG_FRAME_MS �?�? (30 FPS), 秒针每帧仅推�?<0.1px �?视�?��??冻结"�?
 // 缓存后每帧只 memcpy 42.6KB (~1ms) + �?3 �? 实际 FPS 回到 ~30, 秒针平滑�?秒�??
 XFont font16(&tft);
-XFont font24(&tft);
-XFont font32(&tft);   // 64px AA 字库 (黄历大字; ver3, ~1.0MB PSRAM)
+XFont font32(&tft);   // 64px AA 字库 (黄历大字; ver3, ~1.0MB PSRAM; Flash 直读)
 // Legacy audioI2S (3.0.12e + HLS BUILD42/46/48 patches): default ctor,
 // external I2S DAC configured via setPinout() in setup.
 Audio audio(1);  // BUILDV5-TEST: I2S1 (was I2S0, silent on v5)
@@ -373,8 +372,16 @@ void initTouch() {
   // BUILDV5-BASE1/STEP2: 触摸独立任务（BASE1 实证：单任务同步采样被 audio.loop
   // 阻塞拖死 → 点不到电台/拖动不灵敏）。touchScanTask 采样 80ms、任务层包
   // g_spiMutex（与 main loop 绘制互斥），main loop 只读共享状态。
+  // CALFIX-CORE（2026-10-17，crash dump 铁证）：xTaskCreate → 固定 core 1。
+  //   crash: assert xTaskPriorityDisinherit tasks.c:5156 (pxTCB == pxCurrentTCBs[core])
+  //   Backtrace: spiEndTransaction ← SPIClass::endTransaction ← TFT_eSPI::end_nin_write
+  //             ← modeRadio ← loop ← loopTask（main loop 释放 SPI 锁时崩溃）。
+  //   根因：touchScanTask 无核心固定 → 调度器双核迁移 → 与 loopTask(core1) 跨核并发
+  //   Take/Give g_spiMutex/TFT spi_mutex/SPI spi_mutex（三层嵌套）→ ESP-IDF 5.x
+   //   FreeRTOS 双核优先级继承断言 bug（netTask 已同款固定 core1，见 L710）。
+  //   拖动列表=触摸采样+高频重绘同时压锁→触发；日历点击低频未触发。
   touchDriverInit();
-  xTaskCreate(&touchScanTask, "touchScan", 4096, NULL, 3, NULL);
+  xTaskCreate(&touchScanTask, "touchScan", 4096, NULL, 3, NULL);  // 改回不固定核（验证：固定core1后屏幕完全没反应）
 }
 
 // BUILDV5-NETTASK: 独立下载泵任务（单任务调 audio.loop，main loop 彻底不调）。
@@ -556,10 +563,14 @@ void handleTouch() {
   touchWasDown = isDown;
 }
 
+// 2026-10-20: autoPlayOnceTask (boot 自动播放环球资讯 + 10s 兜底重连) 已删除。
+// 它是 V81 代理调试期的验证任务, 与新播放条"暂停"按钮直接冲突
+// (用户暂停后 10s 内被强制重新连流, 暂停形同虚设)。现恢复手动控制, 播放条 ▶ 起播。
+
 void setup() {
   Serial.begin(115200);
   delay(500);
-  esp_log_level_set("*", ESP_LOG_WARN); // BUILDV5-STEP3-TFIX2: 全局统一关 IDF DEBUG/INFO 刷屏（Audio 库 log_d/log_i + WiFi/HTTP 组件）；WARN/ERROR 保留，故障仍可见
+  esp_log_level_set("*", ESP_LOG_NONE); // 关所有 esp_log 打印（Audio 库 S2DBG 刷屏），我们自己的 Serial.printf 不受影响
   sdProbe();  // DIAG: read the on-board SD card (CS=GPIO6, shared SPI bus) and dump contents
   // BUILD41-DIAG-AAC-RATE: BUILD40 confirmed fixed_mclk=0 does NOT fix the
   // slow playback (MEAS still ~16000). All I2S driver register tweaks failed
@@ -583,6 +594,26 @@ void setup() {
   // �?TFT_eSPI 内置字体(不依�?LittleFS / �?定�??XFont)在屏幕上逐�?�显�?,
   // 这样在没有串口监视器时也能直接看出黑屏停在哪�?步�??
   initTFT();
+
+  // PENIRQ-WAKE（2026-10-18）：XPT2046 复位后 PENIRQ 输出级可能卡住（一直高电平），
+  //   手动短接 GPIO38→GND 可"唤醒"。在 SPI 总线初始化后做：先拉低 GPIO38，
+  //   再通过 SPI 发个读 X 的命令"唤醒" XPT2046，然后改回输入上拉。
+  Serial.println("[PENIRQ] wake up: GPIO38 LOW + SPI wakeup...");
+  pinMode(TOUCH_IRQ, OUTPUT);
+  digitalWrite(TOUCH_IRQ, LOW);
+  delay(100);
+  // 通过 SPI 发个读 X 的命令"唤醒" XPT2046
+  pinMode(TOUCH_CS, OUTPUT);
+  digitalWrite(TOUCH_CS, LOW);
+  tft.getSPIinstance().transfer(0xD0);  // 读 X 命令
+  tft.getSPIinstance().transfer(0);
+  tft.getSPIinstance().transfer(0);
+  digitalWrite(TOUCH_CS, HIGH);
+  delay(100);
+  pinMode(TOUCH_IRQ, INPUT_PULLUP);
+  delay(10);
+  Serial.printf("[PENIRQ] after wake: GPIO38=%d\n", digitalRead(TOUCH_IRQ));
+
   tft.setTextFont(2);                 // 内置 16px 字体 (User_Setup.h �?LOAD_FONT2)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(0, 0);
@@ -608,12 +639,10 @@ void setup() {
 
   // 3) �?文字�? (加载失败 -> 后续�?有中文都�?空�?? 看起来像黑屏)
   bool f16 = font16.reInit("/font_simhei_16.font");
-  bool f24 = font24.reInit("/font_simhei_24.font");
-  font32.setFlashMode(true);   // BUILDV5-FONTF: 64px 黄历字库 Flash 直读 → 释放 1.48MB PSRAM 给音频深缓冲
+  font32.setFlashMode(true);   // BUILDV5-FONTF: 64px 黄历字库 Flash 直读 → 释放 1.48MB PSRAM 给音频深缓冲 (2026-10-17 恢复; 加诊断验证字形数据)
   bool f32 = font32.reInit("/font_simhei_64.font");
-  Serial.printf("font16: %s  font24: %s  font32: %s\n", f16 ? "OK" : "FAIL", f24 ? "OK" : "FAIL", f32 ? "OK" : "FAIL");
+  Serial.printf("font16: %s  font32: %s\n", f16 ? "OK" : "FAIL", f32 ? "OK" : "FAIL");
   tft.print("Font16: "); tft.println(f16 ? "OK" : "MISSING");
-  tft.print("Font24: "); tft.println(f24 ? "OK" : "MISSING");
 
   // 4) WiFi + NTP
   Serial.println("Connecting WiFi...");
@@ -650,6 +679,7 @@ void setup() {
   else tft.println("DB: MISSING");
   Serial.printf("DB cats=%d stn=%d\n", radioCatCount, radioStnTotal);
   audio.setPinout(I2S_BCK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
+  radioVolume = 21;     // 2026-10-20: 音量状态与 UI 同步 (播放条显示百分比, 点按可静音)
   audio.setVolume(21); // BUILDV5-FIX: v4 lib defaults volume=0 (silent); v2/v3 defaulted to 21=max
   // HLS buffer tuning (CNR/CRI m3u8, 10s segments / separate HTTP GET each):
   // 400KB PSRAM buffer ~= 25s @128kbps. Old 64KB setting gave only ~3.5s
@@ -664,6 +694,15 @@ void setup() {
 
   tft.println("READY - start main UI");
   Serial.println("Setup done.");
+  // CLKFIX 2026-10-16: boot 内存基线——定位"播放后内部 RAM 碎片化(maxBlock 38KB)导致时钟缓冲分配失败"的碎片源
+  Serial.printf("[MEM] boot: internalFree=%uKB internalMax=%uKB psramFree=%uKB psramMax=%uKB\n",
+                (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+                (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+  // BUILDV5-CLKFIX-A (2026-10-17): 时钟缓冲 boot 常驻。此时堆最干净(maxBlock 最大)、
+  // 任务未创建、音频未连接 → 分配必然成功 → 播放期切时钟直接用常驻缓冲(与碎片无关)。
+  allocClockBufsResident();
   // BUILDV5-NETTASK: 独立下载泵任务（见 netTask 定义注释）。固定 Core 1 + 优先级 2。
   // 根因（cap_diagx/fix3 实证）：①任意核落 Core 0 被 audioTask 解码抢占 → callDt 130-718ms；
   // ②pin Core 1+prio1 与 loopTask 同级轮转被 2900fps UI 抢占 → callDt 563-896ms。
@@ -673,6 +712,7 @@ void setup() {
   // 分片切换网络阻塞 7-9s → task_wdt 看门狗 + 缓冲耗尽无声 + main loop 卡死触摸丢失）。
   // audio.loop 的阻塞只影响 netTask，main loop 保持响应。固定 Core 1 + prio 2。
   BaseType_t netOk = xTaskCreatePinnedToCore(&netTask, "netTask", 8192, NULL, 2, NULL, 1);
+  // 2026-10-20: autoPlayOnce 任务已随 autoPlayOnceTask 删除 (与播放条暂停按钮冲突, 见上注释)
   // BUILDV5-HLSFIX: 全局 SPI 互斥——touchScanTask 与 main loop 显示绘制共享 FSPI
   // 总线（TFT_eSPI locked 标志单线程假设 + SPIClass 锁 IDF5.5 不可靠 → cap_fix8
   // 链A pushSwapBytePixels 崩溃）。main loop 绘制段(touch消费+modeXxx)与 touch
@@ -696,6 +736,29 @@ void loop() {
     if (g_printMutex) xSemaphoreTake(g_printMutex, portMAX_DELAY);
     Serial.printf("[LOCKS] spiMutex=%d printMutex=%d\n", g_spiMutex != nullptr, g_printMutex != nullptr);
     if (g_printMutex) xSemaphoreGive(g_printMutex);
+  }
+  // CLKFIX 2026-10-16: 播放期内存基线(60s 节流)——定位"播放后内部 RAM 碎片化(maxBlock<42.6KB)导致时钟缓冲失败"的碎片源
+  // BUILDV5-CLKFIX-A: 增加播放期 internalFree 最低点采样(2s 节流, 60s 打印)——预分配时钟缓冲后
+  // 音频余量是否够的硬指标(回写计划 §2.4: 预分配后 FLAP≈66KB/ANALOG≈80KB)。
+  static uint32_t s_memLast = 0;
+  static uint32_t s_lowLast = 0;
+  static uint32_t s_lowMin = 0xFFFFFFFF;
+  if (millis() - s_lowLast >= 2000) {
+    s_lowLast = millis();
+    uint32_t f = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (f < s_lowMin) s_lowMin = f;
+  }
+  if (millis() - s_memLast >= 60000) {
+    s_memLast = millis();
+    if (g_printMutex) xSemaphoreTake(g_printMutex, portMAX_DELAY);
+    Serial.printf("[MEM] run: internalFree=%uKB internalMax=%uKB psramFree=%uKB psramMax=%uKB lowmin=%uKB\n",
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024),
+                  (unsigned)(s_lowMin / 1024));
+    if (g_printMutex) xSemaphoreGive(g_printMutex);
+    s_lowMin = 0xFFFFFFFF;  // 重置, 下一个 60s 窗口
   }
   // NOTE: DEBUG-AUTO-PLAY removed 2026-10-09 (BUILD60) -- boot now shows the
   // clock UI (flap/analog per NVS) instead of hijacking into radio mode.
@@ -784,13 +847,12 @@ void loop() {
   // -> 每个 mode 的 `if (!modeDrawn[i] || modeChanged)` 每帧(~1000+ FPS)都整页重绘
   // -> 全屏闪烁(导航栏用 navDirty 不受影响)。与 preview 无关(预览整帧原子渲染)。
   modeChanged = false;
-  // BUILD17: leaving the clock page -> free the active style's render buffers so the internal heap's
-  // largest contiguous block grows to ~200KB for the HTTPS radio TLS handshake. Re-alloc happens in
-  // modeClock's first-entry branch on return (one-shot, cheap). Guarded so we don't free every frame
-  // once everything is already null.
-  if (currentMode != MODE_CLOCK) {
-    freeClockBufs();
-  }
+  // BUILDV5-CLKFIX-A (2026-10-17): 时钟缓冲 boot 常驻(allocClockBufsResident, setup 时分配)。
+  // 原 BUILD17 "离开时钟页释放缓冲, 让内部堆最大连续块长到 ~200KB 给 HTTPS radio TLS handshake"
+  // 的理由在 V5 已过时(全 HTTP 无 TLS) → 删除 freeClockBufs() 调用, 缓冲常驻,
+  // 播放期切时钟不依赖任何新分配(根治切时钟空白/齿轮带缺失)。
+  // freeClockBufs() 保留为空实现, 防其他引用。
+  if (false) freeClockBufs();
   // 节日音乐在任意界面都继续 (收音机只由 netTask 泵; 此处不再调 audio.loop)
   if (musicPlaying) {
     if (!audio.isRunning()) {   // BUILD14: 节日流死 -> 停 (checkFestivalMusic 负责重试)
