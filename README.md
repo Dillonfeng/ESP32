@@ -1,72 +1,70 @@
-# ESP32-S3 智能网络收音机
+# ESP32-S3 网络收音机 / 翻页时钟（V5）
 
-基于 ESP32-S3 N16R8 的全功能网络收音机，支持央广电台、VU表显示、语音控制、天气预报等功能。
+基于 ESP32-S3 N16R8 的多功能桌面设备：机械翻页(split-flap)时钟、万年历（农历/干支/节气/节日）、网络收音机（HLS/MP3/AAC）、天气显示。
+
+> 本文档对应 BUILDV5 分支（当前 HEAD：BUILDV5 clean baseline，2026-10-14）。
+> 详细开发记忆见 `AGENTS.md`（含调试铁律、硬件反模式 R1-R5、AA 中文字库格式说明）。
 
 ## 硬件清单
 
 | 模块 | 型号 | 数量 | 用途 |
 |------|------|------|------|
 | 主控板 | ESP32-S3 N16R8 开发板 | 1 | 主控 (16MB Flash + 8MB PSRAM) |
+| 显示屏 | 4.0" SPI TFT 触摸屏 | 1 | ST7796S, 480x320, 带 XPT2046 触摸 |
 | 音频DAC | PCM5102A | 1 | I2S 数字音频解码 |
 | 功放模块 | PAM8403 | 1 | D类数字功放 (2x3W) |
-| 麦克风 | INMP441 | 1 | I2S MEMS 麦克风 (语音控制) |
-| 显示屏 | 4.0" SPI TFT 触摸屏 | 1 | ST7796S, 480x320, 带触摸 |
+| 麦克风 | INMP441 | 1 | I2S MEMS 麦克风 (语音扩展) |
 | 喇叭 | 4Ω 3W 全频喇叭 | 2 | 立体声输出 |
 
 ## 功能特性
 
+### 🕐 机械翻页时钟 (split-flap)
+- 翻页牌式数字遮罩（`include/digits.h`，46×88 8-bit 灰度，Bahnschrift）
+- 指针表盘样式（`include/dialnum.h`，12 个数字遮罩）
+- 两种样式通过触摸点击实时切换
+- 局部刷新 + 整帧合成（R2），时钟页干净无闪烁
+
+### 📅 万年历 / 黄历
+- 农历、干支、节气、节日计算（`src/nongli.cpp`，17 位表 + 积日算法）
+- 节假日（放假/补班）离线缓存（`data/holidays_2025/2026/2027.json`，LittleFS）
+- 黄历弹层：粗体大数字 + 宜/忌单行 + 星期双框 + 月相（`include/almnum.h` 62×112 遮罩）
+- 中西节日配色（西方节日大数字变红，如万圣节/光棍节/黑五/母亲节等）
+
 ### 📻 网络电台播放
-- 支持 MP3、AAC、FLAC、M4A、HLS(m3u8) 等多种格式
-- 预置 20+ 核心电台（央广系列、地方台、音乐台、国际台）
-- 支持**批量导入 2000+ 电台**（JSON / M3U / CSV 格式）
-- 电台收藏、分类浏览、搜索、最近播放
-- 网页能播的电台基本都能播（HLS/MP3/AAC流）
+- 电台库 `data/stations.bin`（1652 站 / 40 地区，纯 HTTP，设备无 TLS 能力故全站 http://）
+- 支持 HLS(m3u8) / MP3 / AAC 流，央视、CRI、地方台、网络音乐台
+- 多任务架构：`netTask` 独立下载泵 + `touchScanTask` 独立触摸任务 + 主 loop 显示
+- HLS 双缓冲预取（`src/hls_prefetch.cpp`，BUILDV5 HLS 阶段性成果）
 
-### 🌐 Web管理界面
-- 浏览器访问设备IP，图形化管理电台
-- 批量上传电台文件（拖拽上传）
-- 电台列表浏览、搜索、分类筛选
-- 远程播放控制、系统设置
+### 🌤 天气显示
+- 和风天气 API（`src/weather_sync.cpp` + `src/weather_ui.cpp`）
 
-### 🎵 音频显示
-- **双声道 VU 表** - 实时左右声道电平显示
-- **立体声指示** - STEREO/MONO 状态显示
-- **电台信息** - 名称、地区、码率、格式
-- **音量条** - 可视化音量显示
+### 🖱 触摸
+- 自写 XPT2046 驱动（`src/touch_driver.cpp`，PENIRQ 中断 + SPI 采样独立任务）
+- 引脚见下方接线图（TOUCH_CS=GPIO1 / TOUCH_IRQ=GPIO38，GPIO38 为 octal PSRAM SPICS1 复用脚，历史调试曾实验改 GPIO4）
 
-### 🎙 小智AI语音控制
-- 离线唤醒词："你好小智"
-- 语音指令支持：
-  - 播放/暂停/停止
-  - 下一台/上一台
-  - 音量+/音量-/音量XX%
-  - 静音/取消静音
-  - 播放XX电台
-  - 天气预报
-  - 几点了/现在时间
-  - 打开电台列表/天气/主页
-  - 心情模式
+### 🈶 AA 中文字库
+- 16px 8-bit 灰度抗锯齿字库（`data/font_simhei_16.font`，XAAX 大端格式，~4088 字）
+- 24px/64px 大字号（`font_simhei_24/64.font`），64px 用于黄历大数字/节日框
+- 生成器 `scripts/gen_aa_font.py` / `gen_aa_font32.py`（C:\Python314，需 PIL）
 
-### 🌤 天气预报
-- 和风天气API（免费版即可）
-- 实时温度、体感温度、湿度、风速
-- 3天天气预报
-- 支持全国城市切换
+## 硬件接线
 
-### 😊 心情电台
-- 开心、放松、助眠、活力、怀旧、冥想 6种心情模式
-- 自动匹配对应风格的音乐电台
+### ESP32-S3 → ST7796S 4" 触摸屏
 
-### 📺 网络电视（扩展）
-- MJPEG 视频流播放
-- 支持网络摄像头、IP电视
-
-### 📱 操作方式
-- 触摸屏操作
-- 3个物理按键（音量+、音量-、播放/暂停/切台）
-- 语音控制
-
-## 硬件接线图
+| ESP32-S3 引脚 | TFT 模块引脚 | 说明 |
+|--------------|--------------|------|
+| GPIO 12 | SCK | SPI 时钟 |
+| GPIO 11 | SDA (MOSI) | SPI 数据 |
+| GPIO 13 | SDO (MISO) | SPI 输入 (触摸共享) |
+| GPIO 10 | CS | 显示屏片选 |
+| GPIO 9 | DC | 数据/命令选择 |
+| GPIO 14 | RST | 复位 |
+| GPIO 21 | BLK | 背光控制 |
+| GPIO 1 | T_CS | 触摸片选 (XPT2046) |
+| GPIO 38 | T_IRQ | 触摸中断 (PENIRQ) |
+| 3.3V | VCC | 电源 |
+| GND | GND | 地 |
 
 ### ESP32-S3 → PCM5102A (I2S 音频输出)
 
@@ -77,24 +75,8 @@
 | GPIO 8 | DIN | I2S 数据输入 |
 | 3.3V | VCC | 电源 |
 | GND | GND | 地 |
-| GND | FLT | 滤波器选择 (接地=正常) |
-| GND | DEMP | 去加重 (接地=关闭) |
+| GND | FLT / DEMP / FMT | 滤波器/去加重/格式 (接地=正常) |
 | 3.3V | XSMT | 软静音 (接VCC=正常) |
-| GND | FMT | 格式选择 (接地=I2S) |
-
-### PCM5102A → PAM8403 → 喇叭
-
-| PCM5102A | PAM8403 | 说明 |
-|----------|---------|------|
-| OUTL | L-IN | 左声道输入 |
-| OUTR | R-IN | 右声道输入 |
-| GND | GND | 共地 |
-
-| PAM8403 | 喇叭 | 说明 |
-|---------|------|------|
-| L+ / L- | 左喇叭 | 左声道输出 |
-| R+ / R- | 右喇叭 | 右声道输出 |
-| VCC (5V) | USB 5V | 功放电源 |
 
 ### ESP32-S3 → INMP441 (I2S 麦克风输入)
 
@@ -107,298 +89,124 @@
 | GND | GND | 地 |
 | GND | L/R | 左声道 (接地=左) |
 
-### ESP32-S3 → ST7796S 4" 触摸屏
+### 功能按键 / LED
 
-| ESP32-S3 引脚 | TFT 模块引脚 | 说明 |
-|--------------|--------------|------|
-| GPIO 12 | SCK | SPI 时钟 |
-| GPIO 11 | SDA (MOSI) | SPI 数据 |
-| GPIO 13 | SDO (MISO) | SPI 输入 (触摸用) |
-| GPIO 10 | CS | 显示屏片选 |
-| GPIO 9 | DC | 数据/命令选择 |
-| GPIO 14 | RST | 复位 |
-| GPIO 21 | BLK | 背光控制 |
-| GPIO 20 | T_CS | 触摸屏片选 |
-| GPIO 19 | T_IRQ | 触摸中断 |
-| 3.3V | VCC | 电源 |
-| GND | GND | 地 |
-
-### 功能按键
-
-| ESP32-S3 引脚 | 按键 | 功能 |
-|--------------|------|------|
-| GPIO 18 | KEY1 | 音量+ (短按) / 上一台 (长按) |
-| GPIO 4 | KEY2 | 音量- (短按) / 下一台 (长按) |
-| GPIO 5 | KEY3 | 播放/暂停 (短按) / 下一台 (中按) / 切页 (长按) |
+| ESP32-S3 引脚 | 功能 |
+|--------------|------|
+| GPIO 18 | KEY1 |
+| GPIO 4 | KEY2 |
+| GPIO 5 | KEY3 |
+| GPIO 2 | 状态 LED (板载) |
 
 ## 软件架构
 
 ```
 src/
-├── main.cpp              # 主程序入口，系统整合
-├── audio_player.cpp      # 音频播放器 (ESP32-audioI2S封装)
-├── radio_stations.cpp    # 电台管理 (预置30+电台)
-├── display_ui.cpp        # 显示UI (TFT_eSPI + LVGL)
-├── weather.cpp           # 天气预报 (和风天气API)
-└── voice_control.cpp     # 语音控制 (小智AI)
+├── main.cpp              # 主程序入口，多任务整合 (netTask 下载泵 + touchScanTask + 主loop)
+├── clock_ui.cpp          # 时钟 UI（翻页/指针，buildAnalogFace 缓存 + 整帧合成）
+├── calendar_ui.cpp       # 万年历 UI（月份表格/选中/黄历弹层）
+├── radio_ui.cpp          # 收音机 UI（地区/电台列表、播放条、滚动）
+├── radio_db.cpp          # 电台数据库 (stations.bin 解析)
+├── touch_driver.cpp      # 自写 XPT2046 驱动（PENIRQ 中断 + SPI 采样）
+├── tft_touch.cpp         # TFT_eSPI 触摸封装（校准映射）
+├── hls_prefetch.cpp      # HLS 双缓冲预取 (BUILDV5)
+├── holiday_sync.cpp      # 节假日离线缓存 (LittleFS)
+├── weather_sync.cpp      # 天气同步 (和风 API)
+├── weather_ui.cpp        # 天气显示
+├── nongli.cpp            # 农历/干支/节气/节日计算
+├── festival.cpp          # 节日表
+├── geo_pin.cpp           # 地理位置/固定台
+├── xfont.cpp             # XFont AA 字库 (XAAX 大端格式, loadAA/findAA/合成)
+└── ui_common.h           # 模块共享声明 (BUILD61)
 
 include/
-├── config.h              # 全局配置 (引脚、WiFi、API Key等)
-├── audio_player.h        # 音频播放器头文件
-├── radio_stations.h      # 电台管理头文件
-├── display_ui.h          # 显示UI头文件
-├── weather.h             # 天气模块头文件
-├── voice_control.h       # 语音控制头文件
-├── User_Setup.h          # TFT_eSPI 配置
-└── lv_conf.h             # LVGL 配置
+├── config.h              # 全局配置（引脚、WiFi、API Key）
+├── User_Setup.h          # TFT_eSPI 配置 (TOUCH_CS=1 / TOUCH_IRQ=38)
+├── tft_setup.h           # 屏幕初始化封装
+├── touch_driver.h        # 触摸驱动头
+├── hls_prefetch.h        # HLS 预取头
+├── digits.h / dialnum.h  # 翻页/表盘数字遮罩
+├── almnum.h              # 黄历大数字遮罩 (62×112)
+├── nongli.h              # 农历头
+└── ...                   # 其余模块头文件
+
+data/                     # LittleFS 文件
+├── stations.bin          # 电台库 (1652 站, 纯 HTTP)
+├── radio_meta.bin        # 电台元数据 (sid 索引)
+├── stations.json         # 电台 JSON (源数据)
+├── festival.json         # 节日配置
+├── holidays_2025/2026/2027.json  # 节假日缓存
+└── font_simhei_16/24/64.font     # AA 字库
 ```
 
-## 开发环境搭建
-
-### 方式一：PlatformIO (推荐)
-
-1. 安装 VS Code + PlatformIO 插件
-2. 打开项目文件夹
-3. 修改 `include/config.h` 中的配置：
-   - WiFi SSID 和密码
-   - 和风天气 API Key
-   - 小智 AI API Key (可选)
-4. 编译并上传
+## 构建与烧录 (PlatformIO)
 
 ```bash
-pio run
-pio run --target upload
-pio device monitor
+# 编译（必须指定 -e s3v5，默认 env 会联网下载框架卡死）
+pio run -e s3v5
+
+# 烧固件（COM 口按实际，历史为 COM4/COM5）
+pio run -e s3v5 -t upload --upload-port COM4
+
+# 烧 LittleFS（data/ 下的字库、电台库、节假日缓存）
+pio run -e s3v5 -t uploadfs --upload-port COM4
+
+# 串口监视
+pio run -e s3v5 -t monitor
 ```
 
-### 方式二：Arduino IDE
+> 终端集成抽风时的可靠烧录法（脱离终端）：
+> ```powershell
+> Start-Process -FilePath "D:\ESP32-S3\.platformio\penv\Scripts\platformio.exe" `
+>   -ArgumentList "run","-e","s3v5","-t","upload","--upload-port","COM4" -WindowStyle Hidden
+> ```
+> 或使用 `scripts/flash2.py`（内含端口清理 + 烧录 + 抓 boot log）。
+> 注意：`C:\Python311\python.exe` 不存在，真路径是 `C:\Users\fhaiy\AppData\Local\Programs\Python\Python311\python.exe`。
 
-1. 安装 ESP32 开发板支持包 (v2.0.14+)
-2. 安装以下库：
-   - ESP32-audioI2S
-   - TFT_eSPI
-   - lvgl
-   - ArduinoJson
-3. 配置 TFT_eSPI (复制 `User_Setup.h` 到库目录)
-4. 配置 LVGL (复制 `lv_conf.h` 到库目录)
-5. 打开 `src/main.cpp` 并上传
+## 调试铁律（用户确认，详见 AGENTS.md）
 
-## 配置说明
-
-### WiFi 配置
-编辑 `include/config.h`：
-```c
-#define WIFI_SSID     "你的WiFi名称"
-#define WIFI_PASSWORD "你的WiFi密码"
-```
-
-### 和风天气API (免费)
-1. 注册 https://dev.qweather.com/
-2. 获取 API Key
-3. 编辑 `include/config.h`：
-```c
-#define WEATHER_API_KEY "你的API Key"
-#define WEATHER_CITY_ID "101010100"  // 城市ID，默认北京
-```
-
-常用城市ID：
-- 北京: 101010100
-- 上海: 101020100
-- 广州: 101280101
-- 深圳: 101280601
-- 杭州: 101210101
-- 成都: 101270101
-
-### 小智AI语音
-1. 访问 https://xiaozhi.dev/ 获取开发文档
-2. 配置 API Key 和设备ID
-3. 离线唤醒词建议使用 ESP-SR 库替换当前的简化实现
-
-## 电台源说明
-
-### 中央人民广播电台 (HLS m3u8)
-- 中国之声、经济之声、音乐之声、经典音乐广播
-- 中华之声、文艺之声、华夏之声、乡村之声
-- 香港之声、中国交通广播、故事广播、阅读之声
-- 体育之声
-
-### 中国国际广播电台 CRI
-- 环球资讯广播、轻松调频 EZFM、劲曲调频 Hit FM
-
-### 地方电台
-- 北京：新闻广播、交通广播、音乐广播
-- 上海：新闻广播、东广新闻台、动感101
-- 广东：新闻广播、羊城交通、音乐之声
-
-### 网络音乐电台
-- 500首华语经典、周杰伦频道、轻音乐、古典音乐
-- BBC World Service、VOA慢速英语
-
-### 添加自定义电台
-编辑 `src/radio_stations.cpp` 中的 `loadDefaultStations()` 函数，添加：
-```cpp
-memset(&st, 0, sizeof(st));
-strncpy(st.name, "电台名称", STATION_NAME_MAX_LEN - 1);
-strncpy(st.url, "http://example.com/stream.m3u8", STATION_URL_MAX_LEN - 1);
-strncpy(st.region, "地区", 31);
-strncpy(st.genre, "音乐", 31);
-st.format = STREAM_FORMAT_M3U8;  // 格式
-st.bitrate = 128;                // 码率
-st.favorite = true;              // 是否收藏
-_stations.push_back(st);
-```
-
-## 批量电台管理 (v2.0)
-
-### 支持的导入格式
-
-| 格式 | 扩展名 | 说明 |
-|------|--------|------|
-| JSON | `.json` | 推荐，支持完整字段 |
-| M3U  | `.m3u` / `.m3u8` | 通用播放列表格式 |
-| CSV  | `.csv` | 逗号分隔，可用Excel编辑 |
-
-### JSON格式规范
-
-```json
-{
-  "version": 2,
-  "count": 3,
-  "stations": [
-    {
-      "n": "电台名称",
-      "u": "http://example.com/stream.m3u8",
-      "r": "北京",
-      "g": "新闻",
-      "b": 128,
-      "f": 2
-    }
-  ]
-}
-```
-
-字段说明：
-- `n` / `name` - 电台名称 (必填, 最长64字符)
-- `u` / `url` - 流地址 (必填, 最长256字符)
-- `r` / `region` - 地区 (可选, 最长32字符)
-- `g` / `genre` - 分类/流派 (可选, 最长32字符)
-- `b` / `bitrate` - 码率 kbps (可选)
-- `f` / `format` - 格式: 0=MP3, 1=AAC, 2=M3U8, 3=PLS, 4=OGG, 5=FLAC, 6=WAV, 7=M4A, 8=未知
-
-### 方式一：Web界面上传（推荐）
-
-1. 确保收音机已连接WiFi
-2. 查看屏幕或串口获取设备IP地址
-3. 电脑浏览器访问 `http://<设备IP>/`
-4. 点击「批量上传」菜单
-5. 拖拽或选择电台文件上传
-6. 系统自动识别格式并导入
-
-> 支持最大 2000 个电台，文件大小受 LittleFS 空间限制
-
-### 方式二：PC端批量导入工具
-
-使用 `tools/station_import.py` 将各种格式转换为设备兼容的JSON：
-
-```bash
-# 从M3U导入
-python tools/station_import.py my_stations.m3u -o stations.json
-
-# 从CSV导入
-python tools/station_import.py my_stations.csv -f csv -o stations.json
-
-# 从简单TXT导入 (格式: 名称,URL)
-python tools/station_import.py list.txt -f txt -o stations.json
-
-# 生成示例测试数据
-python tools/station_import.py --sample 500 -o sample.json
-```
-
-工具功能：
-- 自动识别电台格式
-- 自动分类（新闻/音乐/财经/交通等）
-- 自动地区识别
-- URL去重
-- 数据验证（检查名称、URL长度等）
-
-### 方式三：直接烧录LittleFS镜像
-
-1. 将准备好的 `stations.json` 放到 `data/` 目录
-2. 使用 PlatformIO 命令烧录：
-```bash
-pio run -t uploadfs
-```
-
-## 常见问题
-
-### 1. 没有声音怎么办？
-- 检查 PCM5102A 接线是否正确
-- 确认 XSMT 引脚接 3.3V (高电平=正常工作)
-- 检查 PAM8403 电源和喇叭连接
-- 串口监视器看是否有 "播放中" 状态
-
-### 2. 电台连接失败？
-- 确认 WiFi 正常连接
-- 检查电台地址是否有效 (用 VLC 测试)
-- 有些电台可能需要 HTTPS，确认证书支持
-- 尝试更换码率较低的流地址
-
-### 3. 触摸屏不准？
-- 修改 `include/config.h` 中的触摸校准值
-- 或使用 TFT_eSPI 的触摸校准示例进行校准
-
-### 4. 内存不足？
-- 确认使用的是 ESP32-S3 N16R8 (带8MB PSRAM)
-- ESP32-audioI2S 库必须有 PSRAM 才能正常工作
-- 减小 LVGL 缓冲区大小
-
-### 5. 语音控制不工作？
-- 检查 INMP441 接线 (注意是 I2S 输入)
-- 当前版本是简化实现，仅作演示
-- 建议集成 ESP-SR 离线语音识别库
-- 或使用小智AI官方固件
-
-## 技术栈
-
-- **主控**: ESP32-S3 WROOM-1 N16R8
-- **开发框架**: Arduino + PlatformIO
-- **音频解码**: ESP32-audioI2S (HELIX MP3 + FAAD2 AAC)
-- **显示驱动**: TFT_eSPI
-- **UI 框架**: LVGL 9.x
-- **触摸芯片**: XPT2046
-- **天气API**: 和风天气
-- **语音AI**: 小智AI
+1. 没有连硬件的环境时才用 `preview/live_preview.py` 调试；先在模拟器调好 → 统一烧录硬件。
+2. 连上硬件后以模拟器效果为目标；模拟器每个改动，硬件 firmware 必须同步（lockstep）。
+3. `main.cpp` 与 `make_preview.py` 必须 lockstep：颜色、月相、节气/节日配色、农历逻辑两侧一致。
+4. 不要运行 `scripts/rebuild_main.py`（会覆盖 main.cpp 手动 split-flap 改动）。
+5. 手改 `src/main.cpp` 后必跑 `python scripts/check_hw_patterns.py` 自检（R1-R5 硬件反模式）。
+6. 解析 XAAX 字库头/字段一律按大端。
 
 ## 版本历史
 
+### BUILDV5 (2026-10-14) — 当前
+- 多任务拆分：netTask 独立下载泵（audio.loop 不再占 main loop）+ touchScanTask 独立触摸任务
+- 自写 XPT2046 驱动（PENIRQ 中断方案，替换 TFT_eSPI 轮询）
+- HLS 双缓冲预取（FIX11/12/12b）+ TWDTRESET 防网络阻塞复位（BUILDV5-TWDTRESET）
+- 全局 SPI 总线互斥 + 全局打印锁（BUILDV5-HLSFIX）
+- 触摸 SPI 提速 2.5→8MHz（getTouch 92ms→30ms，帧率 25-30fps）
+- **已修复**：翻页时钟显示不全/不翻页（整帧合成）、黄历字体发虚（AA 字库）、指针时钟残影、万年历末行日期选不中、HLS 播几秒断流（阶段性）
+- **待解决**：HLS 长时卡顿（待双连接正式方案）、触摸漂移/单双击误判（低概率）
+
+### BUILD23 (2026-10-02)
+- 黄历弹层 宜/忌 重复项根治 + 西方节日大数字变红
+
+### BUILD22 (2026-10-02)
+- 西方小节日补全（万圣节/光棍节/黑五/母亲节/父亲节）+ 2027 除夕显示 + font32 补齐
+
+### BUILD21 (2026-10-02)
+- 黄历顶行/节日框"字被截断"根治（64px 源降采样）+ 春节整段节日名
+
+### BUILD20 (2026-10-01)
+- 节假日乱码(use-after-free)根治 + 2/16 除夕显示
+
+### BUILD15 (2026-09-27)
+- 收音机"三种失效模式"诊断：connect 超时 200ms→2s、看门狗重置、播放条刷新
+
+### 收音机"总是停"根治 (2026-09-27)
+- 设备无 TLS 能力 → 电台库全改纯 HTTP（`_rewrite_bin_http.py`）+ 节假日离线化
+
 ### v2.0.0 (2026-08-31)
-- 支持大批量电台管理 (最大2000个)
-- LittleFS 文件系统存储电台数据
-- 批量导入: JSON / M3U / CSV 三种格式
-- Web管理界面: 浏览器上传、电台管理、播放控制
-- 电台搜索、分类浏览、地区筛选
-- 收藏和最近播放功能
-- 分页显示，流畅滚动
+- 批量电台管理 (最大2000个)、LittleFS、Web 管理界面、搜索/分类/收藏
 
 ### v1.0.0 (2026-08-31)
-- 初始版本
-- 网络电台播放 (MP3/AAC/HLS)
-- VU表双声道显示
-- 电台列表管理
-- 天气预报
-- 语音控制框架
-- 心情电台模式
-- 触摸屏UI
+- 初始版本：网络电台播放、VU 表、天气预报、语音控制框架、触摸屏 UI
 
 ## 许可证
 
 MIT License
-
-## 参考资料
-
-- [ESP32-audioI2S 库](https://github.com/schreibfaul1/ESP32-audioI2S)
-- [TFT_eSPI 库](https://github.com/Bodmer/TFT_eSPI)
-- [LVGL 图形库](https://lvgl.io/)
-- [小智AI](https://xiaozhi.dev/)
-- [和风天气开发平台](https://dev.qweather.com/)
-- [央广电台直播源](https://www.cnr.cn/)
