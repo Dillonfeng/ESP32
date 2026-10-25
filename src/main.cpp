@@ -135,26 +135,9 @@ uint8_t clockStyle = STYLE_FLAP;
 // ========== 收音机状�?==========
 // 二进�?stations.bin 格式 (v2):
 //   Header(24) + RegionIdx(28*N) + StationRecords(变长)
-#define RADIO_SIDEBAR_W    70
-#define RADIO_HEADER_H     28
-#define RADIO_PLAYBAR_H    80
-#define RADIO_LIST_X       70
-#define RADIO_LIST_W       390
-#define RADIO_SCROLLBAR_W  8
-#define RADIO_LIST_TOP     (RADIO_HEADER_H)
-#define RADIO_LIST_BOT     (NAV_BAR_Y - RADIO_PLAYBAR_H)
-#define RADIO_LIST_H       (RADIO_LIST_BOT - RADIO_LIST_TOP)
-// 侧栏: 顶部 4 个固定行(全部/收藏/历史/个人) + 下方可滚动地区行 (与 make_preview 一致)
-#define RADIO_SPECIAL_CNT  4
-#define RADIO_SPECIAL_H    22
-#define RADIO_ROW_H_SIDE   24
-#define RADIO_REGION_TOP   (RADIO_HEADER_H + RADIO_SPECIAL_CNT * RADIO_SPECIAL_H)
-// 电台列表: 45px 行高, 4 行 (180/45=4, 与 make_preview R_ROW_H/R_ROWS 一致)
-#define RADIO_ROW_H        45
-#define RADIO_STATION_ROWS 4
-#define RADIO_FULLSCREEN   1
-#define RADIO_DBL_MS       500   // 列表双击判定窗口 (2026-09-27: 350->500 更灵敏; 与 live_preview 一致)
-#define RADIO_PLAY_FLUSH_MS 600  // 延迟起播: 双击窗口完全关闭后才真正连流 (防 connecttohost 阻塞吞掉双击第二击)
+// 2026-10-22: 布局宏统一由 ui_common.h 提供 (150/24/48/48/28/26), 删掉本文件的重复定义
+//   (旧值 70/28/80/45/22/24 是 2026-10-20 重构前布局; 重复定义曾导致 radio_ui.cpp
+//   按新值绘制、main.cpp 按旧值判断触摸分区 -> 命中区与绘制区错位)
 RegionEntry* regionEntries = nullptr;
 int regionCount = 0;
 #define RMAX_STN 1700
@@ -319,8 +302,7 @@ uint16_t humidColor(int h) {
 // 指针样式刷新帧间�?(ms) �?30 FPS。�?�针�?平滑�?�?, 每帧都会重绘整张表盘
 // (~40KB: fillCircle 白底 + 60 刻度 + 12 数字 + 指针)。loop() 无节流时 (~1000+ FPS)
 // 会把 20MHz SPI 打满 -> 整面�?�?/撕�?��?�限�?~30 FPS, 秒针 6°/s => 0.2°/�?
-// 依然平滑, 与翻页的 FLAP_FRAME_MS 节流同理�?
-#define ANALOG_FRAME_MS 33
+// 依然平滑, 与翻页的 FLAP_FRAME_MS 节流同理�? 2026-10-22: ANALOG_FRAME_MS 由 ui_common.h 统一 (50), 删本行
 #define ROLLER_W      16
 #define ROLLER_PITCH  14
 #define GAP1_CX       (COLON_X  + COLON_W / 2)   // 165 (= preview GAP1_CX)
@@ -413,7 +395,10 @@ void netTask(void* arg) {
       }
       if (millis() - lastBeat >= 2000) {
         lastBeat = millis();
-        Serial.printf("[NET-BEAT] dt=%ums heap=%u\n", lastDt, (unsigned)ESP.getFreeHeap());
+        // BUILDV5-BUFFLOG (2026-10-24): 缓冲水位诊断——断流取证（inBufferFilled/free）。
+        // 播放断流 = 水位耗尽假设的验证点：断流瞬间 filled 应接近 0。
+        Serial.printf("[NET-BEAT] dt=%ums heap=%u buff_f=%u buff_free=%u\n", lastDt, (unsigned)ESP.getFreeHeap(),
+                      (unsigned)audio.inBufferFilled(), (unsigned)audio.inBufferFree());
       }
     }
     vTaskDelay(15 / portTICK_PERIOD_MS); // BUILDV5-HLSFIX: 10→15ms（进一步减跨核唤醒频率；
@@ -457,14 +442,12 @@ void handleTouch() {
     touchScrollStartScrollTop = listScrollTop;
     // 拖拽分区 (镜像 live_preview _on_press): 左侧地区侧栏 / 右侧电台列表 都可上下拖动
     if (currentMode == MODE_RADIO) {
-      if (tx < RADIO_SIDEBAR_W && ty >= RADIO_HEADER_H && ty < NAV_BAR_Y) {
+      if (tx < RADIO_SIDEBAR_W && ty >= RADIO_HEADER_H + SIDEBAR_HEAD_H && ty < NAV_BAR_Y) {
         touchScrollZone = 2; touchScrollStartRegion = regionScrollTop;
       } else if (tx >= RADIO_LIST_X && ty >= RADIO_LIST_TOP && ty < RADIO_LIST_BOT) {
         touchScrollZone = 1;
       } else touchScrollZone = 0;
     } else touchScrollZone = 0;
-    Serial.printf("[DBG-T] press(%d,%d) raw(%d,%d) mode=%d zone=%d regionTop=%d listTop=%d listBot=%d navY=%d regionScroll=%d\n",
-                 tx, ty, g_touchRawRX, g_touchRawRY, (int)currentMode, touchScrollZone, RADIO_REGION_TOP, RADIO_LIST_TOP, RADIO_LIST_BOT, NAV_BAR_Y, regionScrollTop);
   }
 
   if (!isDown && touchWasDown) {
@@ -474,17 +457,26 @@ void handleTouch() {
     touchWasDown = false;
     touchStartTime = 0;
 
-    // 2026-09-27: 侧栏拖拽结束吸附 -> 视口顶所在行的行顶对齐视口顶(28px), 避免停在半行
+    // 2026-09-27: 侧栏拖拽结束吸附 -> 视口顶所在行的行顶对齐视口顶, 避免停在半行
+    // 2026-10-22: 行偏移含分组标题行, 统一用 sideRowTop/sideTotalH
     if (touchDidScroll && touchScrollZone == 2 && currentMode == MODE_RADIO) {
-      int totalH = RADIO_SPECIAL_CNT * RADIO_SPECIAL_H + max(0, radioCatCount - RADIO_SPECIAL_CNT) * RADIO_ROW_H_SIDE;
-      int smax = max(0, totalH - (NAV_BAR_Y - RADIO_HEADER_H));
-      int topk = 0, snap = 0;
+      int totalH = sideTotalH();
+      int smax = max(0, totalH - (NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H)));
+      int snap = 0;
       for (int k = 0; k < radioCatCount; k++) {
-        if (topk <= regionScrollTop) snap = topk;
-        topk += (k < RADIO_SPECIAL_CNT) ? RADIO_SPECIAL_H : RADIO_ROW_H_SIDE;
+        int t = sideRowTop(k);
+        if (t <= regionScrollTop) snap = t;
       }
       if (snap > smax) snap = smax;
       if (snap != regionScrollTop) { regionScrollTop = snap; sideScrollDirty = true; }
+    }
+    // 2026-10-22 问题③: 右列拖拽结束同样吸附到行顶 (与左列一致, 不悬停在半行)
+    if (touchDidScroll && touchScrollZone == 1 && currentMode == MODE_RADIO) {
+      int totalPix = curCount() * RADIO_ROW_H;
+      int smax = max(0, totalPix - RADIO_LIST_H);
+      int snap = (listScrollTop + RADIO_ROW_H / 2) / RADIO_ROW_H * RADIO_ROW_H;
+      if (snap > smax) snap = smax;
+      if (snap != listScrollTop) { listScrollTop = snap; listScrollDirty = true; }
     }
     if (touchDidScroll) touchScrollZone = 0;   // 拖拽结束 -> 复位分区 (避免下次按下误判)
     if (!touchDidScroll && dur < 800 && abs(dy) < 15 && abs(dx) < 15) {
@@ -536,23 +528,23 @@ void handleTouch() {
     int dy = ty - touchStartY;
     if (abs(dy) > 10 && !touchDidScroll) touchDidScroll = true;
     if (touchDidScroll) {
-      static unsigned long lastScDbg = 0;
-      if (millis() - lastScDbg > 120) { lastScDbg = millis(); Serial.printf("[DBG-T] scroll zone=%d dy=%d regionScroll=%d\n", touchScrollZone, dy, regionScrollTop); }
       if (touchScrollZone == 2) {
-        // 2026-09-27: 侧栏整列(固定4行+地区行)一起滚动, 像素级 1:1 跟手(最灵敏);
-        // 局部刷新: 只重绘 70x260 侧栏 (sideScrollDirty), 不整页 (旧版每行整页重绘, SPI 要 ~100ms
-        // 阻塞主循环, 拖拽采样跟不上 -> 不灵敏/卡顿)。
-        int totalH = RADIO_SPECIAL_CNT * RADIO_SPECIAL_H + max(0, radioCatCount - RADIO_SPECIAL_CNT) * RADIO_ROW_H_SIDE;
-        int smax = max(0, totalH - (NAV_BAR_Y - RADIO_HEADER_H));
+        // 2026-09-27: 侧栏整列(分组标题+分类行)一起滚动, 像素级 1:1 跟手(最灵敏);
+        // 局部刷新: 只重绘 150x264 侧栏 (sideScrollDirty), 不整页 (旧版每行整页重绘, SPI 要 ~100ms
+        // 阻塞主循环, 拖拽采样跟不上 -> 不灵敏/卡顿)。2026-10-22: 总高用 sideTotalH (含组标题行)
+        int totalH = sideTotalH();
+        int smax = max(0, totalH - (NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H)));
         int ns = constrain(touchScrollStartRegion - dy, 0, smax);
         if (ns != regionScrollTop) { regionScrollTop = ns; sideScrollDirty = true; }
       } else if (touchScrollZone == 1) {
-        // 自然滚动(上划=看下面更多电台)。BUILD50-LISTSCROLL: 与左侧侧栏统一为
-        // 1:1 跟手 —— listScrollTop 是"行索引", 故按行高 RADIO_ROW_H(45px)
-        // 换算: 手指拖动一个行高就翻一行。旧版 dy/3 要拖 45px 才翻 3 行 -> 翻不动。
-        int newScroll = touchScrollStartScrollTop - dy / RADIO_ROW_H;
-        newScroll = constrain(newScroll, 0, max(0, curCount() - RADIO_STATION_ROWS));
-        if (newScroll != listScrollTop) { listScrollTop = newScroll; listScrollDirty = true; }
+        // 自然滚动(上划=看下面更多电台)。2026-10-22 问题③: 与左侧统一为像素级
+        // 1:1 跟手 —— listScrollTop 从"行索引"改为"像素偏移" (绘制/命中按像素反算)。
+        int totalPix = curCount() * RADIO_ROW_H;
+        int smax = max(0, totalPix - RADIO_LIST_H);
+        int ns = touchScrollStartScrollTop - dy;
+        if (ns < 0) ns = 0;
+        if (ns > smax) ns = smax;
+        if (ns != listScrollTop) { listScrollTop = ns; listScrollDirty = true; }
       }
     }
     touchLastX = tx; touchLastY = ty;
@@ -570,7 +562,8 @@ void handleTouch() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  esp_log_level_set("*", ESP_LOG_NONE); // 关所有 esp_log 打印（Audio 库 S2DBG 刷屏），我们自己的 Serial.printf 不受影响
+  // BUILDUI8-CRASH-DIAG: 临时全开 esp_log（含 WDT "Print CPU" / esp_timer / lwip），定位 boot 后 ~7s 卡死持锁者
+  // esp_log_level_set("*", ESP_LOG_NONE); // 关所有 esp_log 打印（Audio 库 S2DBG 刷屏），我们自己的 Serial.printf 不受影响
   sdProbe();  // DIAG: read the on-board SD card (CS=GPIO6, shared SPI bus) and dump contents
   // BUILD41-DIAG-AAC-RATE: BUILD40 confirmed fixed_mclk=0 does NOT fix the
   // slow playback (MEAS still ~16000). All I2S driver register tweaks failed
@@ -596,9 +589,10 @@ void setup() {
   initTFT();
 
   // PENIRQ-WAKE（2026-10-18）：XPT2046 复位后 PENIRQ 输出级可能卡住（一直高电平），
-  //   手动短接 GPIO38→GND 可"唤醒"。在 SPI 总线初始化后做：先拉低 GPIO38，
+  //   手动短接 GPIO38→GND 可"唤醒"。在 SPI 总线初始化后做：先拉低 GPIO4（2026-10-21：
+  //   GPIO38 实测点击变 0 但芯片 IN1 恒 1 = octal PSRAM SPICS1 复用钳制，改用 GPIO4），
   //   再通过 SPI 发个读 X 的命令"唤醒" XPT2046，然后改回输入上拉。
-  Serial.println("[PENIRQ] wake up: GPIO38 LOW + SPI wakeup...");
+  Serial.println("[PENIRQ] wake up: GPIO4 LOW + SPI wakeup...");
   pinMode(TOUCH_IRQ, OUTPUT);
   digitalWrite(TOUCH_IRQ, LOW);
   delay(100);
@@ -612,7 +606,7 @@ void setup() {
   delay(100);
   pinMode(TOUCH_IRQ, INPUT_PULLUP);
   delay(10);
-  Serial.printf("[PENIRQ] after wake: GPIO38=%d\n", digitalRead(TOUCH_IRQ));
+  Serial.printf("[PENIRQ] after wake: GPIO4=%d\n", digitalRead(TOUCH_IRQ));
 
   tft.setTextFont(2);                 // 内置 16px 字体 (User_Setup.h �?LOAD_FONT2)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -720,9 +714,9 @@ void setup() {
   g_spiMutex = xSemaphoreCreateMutex();
   g_printMutex = xSemaphoreCreateMutex();
   // BUILDV5-HLSFIX: 预热 newlib tzset——cap_fix9 链C 实证 main loop(modeClock 时间格式化)
-  // 与另一核首次并发调 localtime_r → _tzset_unlocked 崩溃。启动时先单线程调一次，
-  // 消除"首次并发初始化"竞争窗口。
-  { time_t now0 = time(nullptr); struct tm tm0; localtime_r(&now0, &tm0); }
+  // 与另一核首次并发调 localtime_r → _tzset_unlocked 崩溃。
+  // BUILDV5-TZFIX (2026-10-22): 全部 localtime_r 调用已改为无锁 epochToLocalNoLock,
+  // 不再触碰 newlib tz 锁, 此预热窗口已消除; 保留空预热注释占位 (无锁函数无需预热)。
   Serial.printf("[NET] spiMutex=%d printMutex=%d\n", g_spiMutex != nullptr, g_printMutex != nullptr);
   modeChanged = true;
 }
@@ -871,5 +865,11 @@ void loop() {
   // BUILDV5-STEP3: audio.loop 已由 netTask 独立泵（main loop 不再调——单任务泵下
   // 分片切换网络阻塞 7-9s 卡死 main loop：task_wdt + 触摸丢失 + 缓冲耗尽无声，
   // 见 cap_step2_diag.log [237418] task_wdt）。
+  // BUILDUI8-WDTFIX (2026-10-24): IDLE1 饿死修复——loop() 无让位点，loopTask 连续
+  // 占用 CPU1 → IDLE1 5s 无调度 → task_wdt 触发（" - IDLE1 (CPU 1)"）→ backtrace
+  // 循环（panic=false 不重启，设备假死；时钟模式无网络阻塞让位，radio 模式有，故
+  // "播放正常、切时钟崩溃"）。每轮 vTaskDelay(1)=10ms 让位，UI 100fps 足够，
+  // 触摸(touchScanTask)/网络(netTask)走独立任务不受影响。
+  vTaskDelay(1);
 }
 

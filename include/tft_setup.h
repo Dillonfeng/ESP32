@@ -112,7 +112,7 @@
 
 // XPT2046 触摸引脚
 #define TOUCH_CS  1   // GPIO20被USB D+占用,改用GPIO1
-#define TOUCH_IRQ 38  // GPIO19被USB D-占用,改用GPIO38
+#define TOUCH_IRQ 4   // GPIO38被PSRAM SPICS1钳制,改用GPIO4
 
 // ##################################################################################
 //

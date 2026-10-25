@@ -7,6 +7,7 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include "holiday_sync.h"
+#include "ui_common.h"   // BUILDV5-TZFIX: epochToLocalNoLock
 
 namespace holiday {
 
@@ -136,7 +137,7 @@ void init() {
   struct tm t;
   time_t now = time(nullptr);
   if (now > 1000000000) {
-    localtime_r(&now, &t);
+    epochToLocalNoLock(now, t);   // BUILDV5-TZFIX: 无锁 UTC+8
     curYear = t.tm_year + 1900; curMonth = t.tm_mon + 1; curDay = t.tm_mday;
   }
   if (fsReady && curYear >= 2024) loadAllYears();   // NTP 未就绪时推迟到 tick() (用正确年份)
@@ -153,7 +154,7 @@ void tick() {
     struct tm t;
     time_t now = time(nullptr);
     if (now <= 1000000000) return;
-    localtime_r(&now, &t);
+    epochToLocalNoLock(now, t);   // BUILDV5-TZFIX: 无锁 UTC+8
     curYear = t.tm_year + 1900; curMonth = t.tm_mon + 1; curDay = t.tm_mday;
     loadAllYears();
   }

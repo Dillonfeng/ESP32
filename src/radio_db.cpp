@@ -40,24 +40,46 @@ const char* radioPinnedKey() {
   const char* p = geo::pinned();
   return (p && p[0]) ? p : RPINNED;
 }
-// 重建收音机分类。2026-10-20 对齐设计稿左列顺序:
-//   全国·中央·国际·海外(固定4) -> 置顶省 -> 省市(RORDER) -> 其它 -> 伴音 -> 收藏 -> 历史 -> 个人
+// 2026-10-24 问题①: 设计稿"我的"组含"助眠"分类 (6 台演示: 雨声/海浪/林间鸟鸣/篝火/咖啡馆/白噪音)。
+// 无真实音源 URL (readURLForSid 对 !in_bin 台读 extraUrl, url_offset=extraUrlCount 越界 -> 返回空 -> 点击不播放, 安全)。
+// 待用户提供音源后可把 URL 填进 extraUrl[extraUrlCount+i] 并让 url_offset 指向它。
+static const char* SLEEP_NAMES[6] = { "雨声", "海浪", "林间鸟鸣", "篝火", "咖啡馆", "白噪音" };
+void addSleepStations() {
+  for (int i = 0; i < 6 && radioStnTotal < RMAX_STN; i++) {
+    RadioStation& s = radioStn[radioStnTotal];
+    truncCopy(s.name, sizeof(s.name), (const uint8_t*)SLEEP_NAMES[i], (int)strlen(SLEEP_NAMES[i]));
+    truncCopy(s.freq, sizeof(s.freq), (const uint8_t*)"--", 2);
+    truncCopy(s.region, sizeof(s.region), (const uint8_t*)"助眠", (int)strlen("助眠"));
+    truncCopy(s.cat, sizeof(s.cat), (const uint8_t*)"助眠", (int)strlen("助眠"));
+    s.r = 0x78; s.g = 0xA0; s.b = 0xC8;
+    s.is_user = true; s.in_bin = false;
+    s.url_offset = extraUrlCount;   // 空 URL 槽 -> readURLForSid 返回空
+    radioStnTotal++;
+  }
+}
+
+// 重建收音机分类。2026-10-22 对齐设计稿左列三分组:
+//   组0 频道: 全国·中央·国际·海外
+//   组1 省市: 置顶省 -> 省市(RORDER) -> 其它
+//   组2 我的: 收藏 -> 个人 -> 伴音(电视伴音) -> 历史
 // 联网定位到省份后可再调一次重建, 让置顶省(完整名)正确出现在列表中 (与 preview 一致)。
 void buildRadioCats() {
   // 释放旧 sids (避免重复构建时 PSRAM 泄漏)
   for (int i = 0; i < radioCatCount; i++) { if (radioCats[i].sids) heap_caps_free(radioCats[i].sids); }
   radioCatCount = 0;
-  auto addCat = [&](const char* label, const char* key, bool meta, const uint16_t* seq, int n) {
+  auto addCat = [&](const char* label, const char* key, bool meta, const uint16_t* seq, int n, int grp) {
     if (radioCatCount >= RMAX_CATS) return;
     RadioCat& c = radioCats[radioCatCount];
     truncCopy(c.label, sizeof(c.label), (const uint8_t*)label, (int)strlen(label));
     truncCopy(c.key, sizeof(c.key), (const uint8_t*)key, (int)strlen(key));
     c.meta = meta; c.count = n;
+    c.group = grp;
     c.sids = (n > 0) ? (uint16_t*)ps_malloc((size_t)n * 2) : nullptr;
     if (c.sids && seq) memcpy(c.sids, seq, (size_t)n * 2);
     radioCatCount++;
   };
-  addCat(RLBL[0], RLBL[0], true, allSeq, allCount);   // 全国
+  // ---- 组0 频道: 全国 + 中央/国际/海外 ----
+  addCat(RLBL[0], RLBL[0], true, allSeq, allCount, 0);   // 全国
   // 2 字缩写: 电视伴音->伴音 / 黑龙江->龙江 / 内蒙古->内蒙 (镜像 mobile labelMap)
   auto labelOf = [](const char* key) -> const char* {
     if (strcmp(key, "电视伴音") == 0) return "伴音";
@@ -65,24 +87,31 @@ void buildRadioCats() {
     if (strcmp(key, "内蒙古") == 0) return "内蒙";
     return key;
   };
-  auto regionCat = [&](const char* key) {
+  auto regionCat = [&](const char* key, int grp) {
     static uint16_t rc[RMAX_ALL]; int n = 0;
     for (int i = 0; i < allCount; i++) { RadioStation* s = stn(allSeq[i]); if (s && strcmp(s->region, key) == 0) rc[n++] = allSeq[i]; }   // 仅 channels(1652), 与 preview region_cats 一致
-    addCat(labelOf(key), key, false, rc, n);
+    addCat(labelOf(key), key, false, rc, n, grp);
   };
-  // 设计稿顶部固定 4 分类: 全国已在 cat0, 这里接 中央/国际/海外
-  regionCat("中央"); regionCat("国际"); regionCat("海外");
+  regionCat("中央", 0); regionCat("国际", 0); regionCat("海外", 0);
+  // ---- 组1 省市: 置顶省 + 其余省 + 其它 ----
   const char* pinned = radioPinnedKey();
   strlcpy(radioPinnedUsed, pinned, sizeof(radioPinnedUsed));   // 记录本次用的置顶省名, loop 比对用
   if (strcmp(pinned, "中央") != 0 && strcmp(pinned, "国际") != 0 && strcmp(pinned, "海外") != 0)
-    regionCat(pinned);
-  for (int i = 0; i < RORDER_N; i++) if (strcmp(RORDER[i], pinned) != 0) regionCat(RORDER[i]);
-  regionCat("其它"); regionCat("电视伴音");
+    regionCat(pinned, 1);
+  for (int i = 0; i < RORDER_N; i++) if (strcmp(RORDER[i], pinned) != 0) regionCat(RORDER[i], 1);
+  regionCat("其它", 1);
+// ---- 组2 我的: 收藏 -> 个人 -> 伴音 -> 助眠 -> 历史 (设计稿"我的"组序, 2026-10-24 补"助眠") ----
+  addCat(RLBL[1], RLBL[1], true, favSids, favCount, 2);   // 收藏
   static uint16_t userSeq[16]; int userN = 0;
   for (int e = 0; e < extraCount; e++) if (stn(radioBinTotal + e) && stn(radioBinTotal + e)->is_user) userSeq[userN++] = radioBinTotal + e;
-  addCat(RLBL[1], RLBL[1], true, favSids, favCount);   // 收藏
-  addCat(RLBL[2], RLBL[2], true, histSids, histCount); // 历史
-  addCat(RLBL[3], RLBL[3], true, userSeq, userN);      // 个人
+  addCat(RLBL[3], RLBL[3], true, userSeq, userN, 2);      // 个人
+  regionCat("电视伴音", 2);                               // 伴音
+  // 助眠 (运行时追加台: sid = radioBinTotal+extraCount .. radioStnTotal-1, 设计稿 6 台演示无真实 URL -> 点击不播放)
+  { static uint16_t sleepSeq[8]; int sleepN = 0;
+    for (int e = radioBinTotal + extraCount; e < radioStnTotal && sleepN < 8; e++) sleepSeq[sleepN++] = e;
+    addCat("助眠", "助眠", true, sleepSeq, sleepN, 2);
+  }
+  addCat(RLBL[2], RLBL[2], true, histSids, histCount, 2); // 历史
 }
 bool loadRadioMeta() {
   File f = LittleFS.open("/radio_meta.bin", "r");
@@ -154,6 +183,7 @@ bool loadRadioMeta() {
   memcpy(favSids, fav, (size_t)favCnt * 2); favCount = favCnt;
   memcpy(histSids, hist, (size_t)histCnt * 2); histCount = histCnt;
   radioNvsLoad();          // 2026-10-20: NVS 里用户运行时点亮的收藏/历史优先于离线 meta
+  addSleepStations();      // 2026-10-24 问题①: 追加"助眠"6 台 (设计稿"我的"组), 必须在 buildRadioCats 前
   buildRadioCats();
   f.close();
   Serial.printf("radio_meta: %d stn, %d cats, %d all, %d fav, %d hist\n", radioStnTotal, radioCatCount, allCount, favCount, histCount);
@@ -217,6 +247,15 @@ void radioToggleMute() {
   radioMuted = !radioMuted;
   audio.setVolume(radioMuted ? 0 : (uint8_t)radioVolume);
   Serial.printf("[RADIO] mute -> %d (vol=%d)\n", radioMuted, radioVolume);
+}
+void radioVolumeDelta(int d) {   // 2026-10-22: 全屏音量±按钮 (0..21, 调音量自动解除静音)
+  radioMuted = false;
+  int nv = radioVolume + d;
+  if (nv < 0) nv = 0;
+  if (nv > 21) nv = 21;
+  radioVolume = nv;
+  audio.setVolume((uint8_t)radioVolume);
+  Serial.printf("[RADIO] vol -> %d\n", radioVolume);
 }
 void playStationAt(int sid) {
   RadioStation* s = stn(sid); if (!s) return;

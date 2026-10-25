@@ -245,6 +245,8 @@ def main():
     radio_fullscreen    = [False]         # 全屏 (showingFullscreen)
     radio_last_tap_row  = [-1]            # 双击判定 (lastTapRow)
     radio_last_tap_ms   = [0.0]
+    radio_last_fs_ms    = [0.0]           # 全屏底部双击判定 (lastFsTap, 2026-10-22)
+    radio_vol           = [100]           # 音量% (镜像 radioVolume, 全屏±用)
     label = tk.Label(root, text=" 时钟/日历/收音机/天气   |   [1/2/3] 时钟/日历/收音机 [空格]翻页⇄指针 [←→]翻月   |   收音机: 点电台=播放 拖拽=滚动 双击=全屏 ",
                      bg="#121212", fg="#00FFFF", font=("Microsoft YaHei", 9), anchor="w")
     label.pack(side="bottom", fill="x")
@@ -399,66 +401,75 @@ def main():
         return _cats0[ci]["stations"] if 0 <= ci < len(_cats0) else []
 
     def _radio_on_click(x, y):
-        # 全屏模式: 点任意处关闭
+        # 全屏模式 (2026-10-22 镜像固件 handleRadioTap): 返回chip | 收藏星 | 三控制钮 | 底部双击
         if radio_fullscreen[0]:
-            radio_fullscreen[0] = False
+            if 8 <= x <= 72 and 6 <= y <= 32:                       # 返回 chip
+                radio_fullscreen[0] = False
+            elif 410 <= x <= 472 and 6 <= y <= 32:                  # 收藏星
+                flash_hint("收藏切换 (模拟器不持久化)")
+            elif FS_BTN_Y - 30 <= y <= FS_BTN_Y + 30:
+                if FS_BTN_DN_X - 28 <= x <= FS_BTN_DN_X + 28:
+                    radio_vol[0] = max(0, radio_vol[0] - 1)         # 音量− (镜像固件 ±1 档)
+                elif FS_BTN_UP_X - 28 <= x <= FS_BTN_UP_X + 28:
+                    radio_vol[0] = min(100, radio_vol[0] + 1)       # 音量+ (镜像固件 ±1 档)
+                elif FS_BTN_MAIN_X - 30 <= x <= FS_BTN_MAIN_X + 30:
+                    radio_playing[0] = not radio_playing[0]         # 播放/暂停
+            elif mp.NAV_Y <= y < mp.NAV_Y + 30:                     # 底部提示条: 双击返回
+                now_ms = time.time() * 1000
+                if now_ms - radio_last_fs_ms[0] < 300:
+                    radio_fullscreen[0] = False
+                radio_last_fs_ms[0] = now_ms
             set_title()
             return
-        # 侧边栏分类 (x < 70): 固定4行+地区行 整列一起滚动 (镜像 main.cpp 2026-09-27)
+        # 侧边栏分类 (x < 150): 三分组(频道/省市/我的) 组标题行+分类行 整列滚动
+        # (镜像 main.cpp sideRowTop/sideTotalH, 2026-10-22)
         if x < mp.R_SIDEBAR_W:
             S = radio_region_scroll[0]
-            top = mp.R_HEADER_H - S
-            boundary = mp.R_REGION_TOP - S
+            top = mp.R_HEADER_H + mp.R_HEAD_H2 - S
             idx = -1
-            if y < boundary:
-                if y >= top:
-                    idx = (y - top) // mp.R_SPECIAL_H
-            elif y >= boundary:
-                idx = mp.R_SPECIAL_CNT + (y - boundary) // mp.R_ROW_H_SIDE
+            for i in range(len(_cats0)):
+                ry = top + mp.side_row_top(i)
+                rh = mp.R_SPECIAL_H if i < mp.R_SPECIAL_CNT else mp.R_ROW_H_SIDE
+                if ry <= y < ry + rh:
+                    idx = i
+                    break
             if 0 <= idx < len(_cats0) and idx != radio_cat[0]:
                 radio_cat[0] = idx
                 radio_list_scroll[0] = 0
                 set_title()
             return
-        # 播放栏 (y >= R_LIST_BOT, 即 208..288): 控件行 ≡/上一曲/播放暂停/下一曲
+        # 播放栏 (y >= R_LIST_BOT, 即 208..288) (2026-10-22 镜像固件 handleRadioTap):
+        #   右缘圆钮(播放/暂停) | 音量区(静音切换) | 台名区(进全屏)
         if mp.R_LIST_BOT <= y < mp.NAV_Y:
             if mp.R_LIST_X <= x < mp.R_LIST_X + mp.R_LIST_W:
-                # 三键以播放栏中心 (relx=195) 为轴居中: 上一=150 / 播放=195 / 下一=240
                 relx = x - mp.R_LIST_X
                 sts = _radio_stations(radio_cat[0])
                 cur = radio_playing_idx[0]
-                if relx < 125:                                  # ≡ 播放列表 (无操作)
-                    pass
-                elif relx < 172:                                # 上一曲 (中心 150)
-                    if cur > 0:
-                        radio_playing_idx[0] = cur - 1
-                        radio_playing[0] = True
-                elif relx < 218:                                # 播放/暂停 (中心 195)
+                if relx >= mp.R_LIST_W - 44:                     # 圆钮: 播放/暂停
                     if radio_playing[0]:
                         radio_playing[0] = False
                     elif cur >= 0:
                         radio_playing[0] = True
-                elif relx < 264:                                # 下一曲 (中心 240)
-                    if cur < len(sts) - 1:
-                        radio_playing_idx[0] = cur + 1
-                        radio_playing[0] = True
+                elif relx >= mp.R_LIST_W - 108:                  # 音量区: 静音切换 (模拟)
+                    flash_hint("音量/静音 (模拟器不持久化)")
+                elif cur >= 0:                                   # 台名/均衡器 -> 全屏
+                    radio_fullscreen[0] = True
                 set_title()
             return
-        # 滚动条点击跳转 (x in [R_LIST_X+R_LIST_W, +R_SB_W])
+        # 滚动条点击跳转 (x in [R_LIST_X+R_LIST_W, +R_SB_W]) (2026-10-22 像素)
         if mp.R_LIST_TOP <= y < mp.R_LIST_BOT and \
            mp.R_LIST_X + mp.R_LIST_W <= x < mp.R_LIST_X + mp.R_LIST_W + mp.R_SB_W:
             sts = _radio_stations(radio_cat[0])
             cnt = len(sts)
             if cnt > 0:
-                scroll_range = max(1, cnt - mp.R_ROWS)
-                pos = (y - mp.R_LIST_TOP) * scroll_range // mp.R_LIST_H
-                radio_list_scroll[0] = min(max(pos, 0), max(0, cnt - mp.R_ROWS))
+                smax = max(0, cnt * mp.R_ROW_H - mp.R_LIST_H)
+                pos = (y - mp.R_LIST_TOP) * smax // mp.R_LIST_H
+                radio_list_scroll[0] = min(max(pos, 0), smax)
                 set_title()
             return
-        # 列表区: 单击=播放, 双击(350ms 同一天)=全屏
+        # 列表区: 单击=播放, 双击(350ms 同一天)=全屏 (listScrollTop 像素偏移, 2026-10-22)
         if mp.R_LIST_TOP <= y < mp.R_LIST_BOT and x >= mp.R_LIST_X:
-            list_y = y - mp.R_LIST_TOP
-            row_idx = radio_list_scroll[0] + (list_y // mp.R_ROW_H)
+            row_idx = (radio_list_scroll[0] + (y - mp.R_LIST_TOP)) // mp.R_ROW_H
             sts = _radio_stations(radio_cat[0])
             if 0 <= row_idx < len(sts):
                 now_ms = time.time() * 1000
@@ -511,7 +522,7 @@ def main():
                 rdrag.update(on=True, zone="list", sy=e.y, start=radio_list_scroll[0], moved=False)
                 return
             # 左侧地区分类区 (可上下拖动) -> 拖拽侧栏 (铺满到导航栏 NAV_Y)
-            if e.x < mp.R_SIDEBAR_W and mp.R_HEADER_H <= e.y < mp.NAV_Y:
+            if e.x < mp.R_SIDEBAR_W and mp.R_HEADER_H + mp.R_HEAD_H2 <= e.y < mp.NAV_Y:
                 rdrag.update(on=True, zone="side", sy=e.y, start=radio_region_scroll[0], moved=False)
                 return
         rdrag["on"] = False
@@ -526,17 +537,18 @@ def main():
             rdrag["moved"] = True
         if not rdrag["moved"]:
             return
-        # 自然滚动 (与硬件 main.cpp 一致, 2026-09-27): 上划(鼠标向上, dy<0) = 看下面更多项,
-        # 即 scrollTop 增加 -> 用 -dy。速率: 列表 1 行/3px (-dy//3), 地区栏 1 行/6px (-dy//6), 两侧同款。
+        # 自然滚动 (与硬件 main.cpp 一致): 上划(鼠标向上, dy<0) = 看下面更多项,
+        # 即 scrollTop 增加 -> 用 -dy。两侧均为像素级 1:1 跟手 (2026-10-22 问题③对齐)。
         if rdrag["zone"] == "list":
             sts = _radio_stations(radio_cat[0])
             cnt = len(sts)
-            new_scroll = rdrag["start"] - dy // 3
-            radio_list_scroll[0] = min(max(new_scroll, 0), max(0, cnt - mp.R_ROWS))
+            new_scroll = rdrag["start"] - dy
+            smax = max(0, cnt * mp.R_ROW_H - mp.R_LIST_H)
+            radio_list_scroll[0] = min(max(new_scroll, 0), smax)
         elif rdrag["zone"] == "side":
-            # 整列像素级 1:1 跟手 (最灵敏), 与 main.cpp 一致 (2026-09-27)
-            total_h = mp.R_SPECIAL_CNT * mp.R_SPECIAL_H + max(0, len(_cats0) - mp.R_SPECIAL_CNT) * mp.R_ROW_H_SIDE
-            smax = max(0, total_h - (mp.NAV_Y - mp.R_HEADER_H))
+            # 整列像素级 1:1 跟手, 与 main.cpp 一致 (2026-10-22: 含组标题行 sideTotalH)
+            total_h = mp.side_total_h()
+            smax = max(0, total_h - (mp.NAV_Y - (mp.R_HEADER_H + mp.R_HEAD_H2)))
             new_scroll = rdrag["start"] - dy
             radio_region_scroll[0] = min(max(new_scroll, 0), smax)
 
@@ -545,15 +557,21 @@ def main():
         if rdrag["on"]:
             rdrag["on"] = False
             if rdrag["zone"] == "side":
-                # 吸附: 视口顶所在行的行顶对齐视口顶 (镜像 main.cpp, 避免停在半行)
-                total_h = mp.R_SPECIAL_CNT * mp.R_SPECIAL_H + max(0, len(_cats0) - mp.R_SPECIAL_CNT) * mp.R_ROW_H_SIDE
-                smax = max(0, total_h - (mp.NAV_Y - mp.R_HEADER_H))
-                topk, snap = 0, 0
+                # 吸附: 视口顶所在行的行顶对齐视口顶 (镜像 main.cpp sideRowTop, 避免停在半行)
+                total_h = mp.side_total_h()
+                smax = max(0, total_h - (mp.NAV_Y - (mp.R_HEADER_H + mp.R_HEAD_H2)))
+                snap = 0
                 for k in range(len(_cats0)):
-                    if topk <= radio_region_scroll[0]:
-                        snap = topk
-                    topk += mp.R_SPECIAL_H if k < mp.R_SPECIAL_CNT else mp.R_ROW_H_SIDE
+                    if mp.side_row_top(k) <= radio_region_scroll[0]:
+                        snap = mp.side_row_top(k)
                 radio_region_scroll[0] = min(snap, smax)
+            elif rdrag["zone"] == "list":
+                # 2026-10-22 问题③: 右列释放吸附到行顶 (与左侧一致)
+                sts = _radio_stations(radio_cat[0])
+                cnt = len(sts)
+                smax = max(0, cnt * mp.R_ROW_H - mp.R_LIST_H)
+                snap = (radio_list_scroll[0] + mp.R_ROW_H // 2) // mp.R_ROW_H * mp.R_ROW_H
+                radio_list_scroll[0] = min(snap, smax)
             if not rdrag["moved"]:
                 on_click(e)
 

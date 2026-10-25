@@ -833,7 +833,7 @@ void allocClockBufsResident() {
 void modeClock() {
   time_t now = time(nullptr);
   struct tm tm_info;
-  localtime_r(&now, &tm_info);
+  epochToLocalNoLock(now, tm_info);   // BUILDV5-TZFIX: 无锁 UTC+8, 替代 localtime_r (tz锁×跨核中断崩溃)
   int h = tm_info.tm_hour, m = tm_info.tm_min, s = tm_info.tm_sec;
   int year = tm_info.tm_year + 1900;
   int mon = tm_info.tm_mon + 1;

@@ -2,6 +2,8 @@
 #include "ui_common.h"    // extern TFT_eSPI tft
 #include "User_Setup.h"   // TOUCH_CS / SPI_TOUCH_FREQUENCY
 #include <Preferences.h>  // BUILDV5-CALIB: NVS 持久化触摸校准
+#include "soc/gpio_reg.h"
+#include "soc/io_mux_reg.h"
 
 // ============================================================
 // BUILDV5-TOUCHDRV: 自写 XPT2046 驱动（绕开 TFT_eSPI 的 FreeRTOS SPI_MUTEX）
@@ -27,7 +29,9 @@ void touchDriverInit() {
   s_spi = &tft.getSPIinstance();      // 与显示共用 FSPI 总线（不同 CS），bus lock 互斥
   pinMode(TOUCH_CS, OUTPUT);
   digitalWrite(TOUCH_CS, HIGH);       // 触摸片选默认释放
-  // CALFIX-PENIRQ（2026-10-17，硬件信号方案）：GPIO38 = XPT2046 PENIRQ（按下拉低/抬起拉高）。
+  // CALFIX-PENIRQ（2026-10-17，硬件信号方案）：GPIO4 = XPT2046 PENIRQ（按下拉低/抬起拉高）。
+  //   2026-10-21：GPIO38 实测物理引脚点击变 0 但芯片 IN1 恒 1 → GPIO38 是 octal PSRAM 的
+  //   SPICS1 复用脚，pad 被 PSRAM 控制器钳制 → 换 GPIO4（普通 GPIO，无复用）。
   //   PENIRQ 开漏输出 → 内部上拉。按下/抬起由硬件信号判定（替代 Z2 压力采样），
   //   XY 采样前永远没有 0xC0(Z2) 事务 → 彻底绕开已证实的残留污染链。
   pinMode(TOUCH_IRQ, INPUT_PULLUP);
@@ -117,7 +121,7 @@ static void touchReadRawXY(uint16_t* x, uint16_t* y) {
 bool touchDriverRead(uint16_t* scrX, uint16_t* scrY, uint16_t* z) {
   if (!s_spi) return false;
   // CALFIX-PENIRQ（2026-10-17，硬件信号方案，取代 SEPXY-P）：
-  //   按下/抬起 = GPIO38 PENIRQ 电平（低=按下），不再做 Z1/Z2 压力采样。
+  //   按下/抬起 = GPIO4 PENIRQ 电平（低=按下），不再做 Z1/Z2 压力采样。
   //   采样完成后重读 PENIRQ 确认（转换期间 PENIRQ 可能短暂抖动）。
   bool irqLow = (digitalRead(TOUCH_IRQ) == LOW);
   if (!irqLow) return false;   // 抬起/无触摸
@@ -129,12 +133,21 @@ bool touchDriverRead(uint16_t* scrX, uint16_t* scrY, uint16_t* z) {
   for (int i = 0; i < N; i++) {
     touchReadRawXY(&xs[i], &ys[i]);
   }
-  // 采样后再确认（CS 拉高后等 PENIRQ 稳定 ~10µs 再读，避免转换释放瞬间误判抬起）
-  delayMicroseconds(10);
-  int irqAfter = digitalRead(TOUCH_IRQ);
+  // 采样后等待 PENIRQ 恢复 LOW（BUILDUI9-TSM-FIX3, 2026-10-24）。XPT2046 转换期间
+  // PENIRQ 被内部禁用（悬空拉高），转换结束恢复需时且可能 >100µs——log 铁证
+  // （cap_pin.log）：电平打印按下期间 gpio4=0 正常，但 SPI 采样后 100µs 复核读到 HIGH。
+  // 改为轮询等待恢复（Linux ads7846 penirq_recheck 思想），最长 5ms；手指按着则等到
+  // LOW 确认有效，真抬起则超时 reject（正确拒绝）。
+  uint32_t recheckT0 = micros();
+  int irqAfter = 1;
+  while ((uint32_t)(micros() - recheckT0) < 5000) {
+    irqAfter = digitalRead(TOUCH_IRQ);
+    if (irqAfter == LOW) break;
+    delayMicroseconds(50);
+  }
   if (irqAfter != LOW) {
-    Serial.printf("[TS-DBG] sampled 5x but GPIO38 went HIGH (irqAfter=%d) -> reject\n", irqAfter);
-    return false;   // 抖动/已抬起 → 无效
+    Serial.printf("[TS-DBG] sampled 5x but PENIRQ not LOW within 5ms -> reject\n");
+    return false;   // 真抬起/卡住 → 无效
   }
 
   // 排序 X 和 Y（简单冒泡，N=5 足够快）
@@ -153,41 +166,112 @@ bool touchDriverRead(uint16_t* scrX, uint16_t* scrY, uint16_t* z) {
   return true;
 }
 
-// 触摸扫描任务：CALFIX-PENIRQ（2026-10-17）——5ms 轮询 GPIO38 PENIRQ 电平判定
-// 按下/抬起（低=按下，硬件信号），按下时采样 XY（无 Z 前置 → 干净）。
-// 写共享状态；不碰 TFT_eSPI 的 getTouch/绘制（绕开其 FreeRTOS spi_mutex）→ 无断言崩溃风险。
-// ⚠️ 任何 Z(0xB0/0xC0) 采样都会污染其后 ≤5ms 的 XY（残留 >3ms 铁证）——本任务内
-// 不再做 Z 采样；校准/touchDiag 也改用 PENIRQ 判定（见下）。
+// BUILDUI9-TSM (2026-10-24): 业界状态机消抖（Linux ads7846 同款：PENIRQ 仅作唤醒信号，
+// 按下/抬起有效性由"连续 N 次 good 读数"确认——debounce_rep=3，不依赖中断边沿）。
+// 放弃 ui9b 的"10ms ISR 抖动合并"（简单时间窗口非业界做法，丢边沿风险）。
+static SemaphoreHandle_t s_touchSem = nullptr;
+
+void IRAM_ATTR onTouchIrq() {
+  // 中断内只唤醒任务（give 计数信号量），不做任何判定/去抖/SPI（中断上下文安全）
+  BaseType_t hp = pdFALSE;
+  xSemaphoreGiveFromISR(s_touchSem, &hp);
+  portYIELD_FROM_ISR(hp);
+}
+
+// 触摸扫描任务（BUILDUI9-TSM v2，2026-10-24）：电平 tick 状态机。
+// 铁证（cap_pin.log）：GPIO4 电平读取正常（点击 gpio4=0/松开=1），但中断边沿唤醒
+// 不可靠（按下沿 sem 恒 0 → 漏唤醒）+ SPI 转换期间 PENIRQ 禁用导致采样复核撞恢复窗。
+// v2 设计：10ms tick 轻量轮询电平（digitalRead 不碰 SPI，无 Z 污染、无阻塞）——
+// 按下/抬起各需连续 3 tick 一致（30ms 消抖，Linux debounce 语义）；确认按下后才做
+// 一次 SPI 采样（touchDriverRead 内部等待式复核），确认抬起前不碰 SPI。ISR 保留
+// 仅作唤醒加速（give 计数信号量），10ms 轮询兜底不漏边沿。
 void touchScanTask(void* arg) {
   touchDriverInit();
-  int lastIrq = digitalRead(TOUCH_IRQ);
-  uint32_t lastBeat = 0;
-  Serial.printf("[PENIRQ] boot initial GPIO38=%d\n", lastIrq);
+  if (!s_touchSem) s_touchSem = xSemaphoreCreateCounting(4, 0);
+  attachInterrupt(digitalPinToInterrupt(TOUCH_IRQ), onTouchIrq, CHANGE);
+  Serial.printf("[PENIRQ] boot initial GPIO4=%d (level-tick state machine)\n", digitalRead(TOUCH_IRQ));
+
+  enum { TS_IDLE, TS_CONFIRM, TS_PRESSED, TS_RELEASING } st = TS_IDLE;
+  uint16_t lastOkX = 0, lastOkY = 0;
+  uint32_t lastOkAt = 0;
+  uint32_t lastProc = 0;
+  uint32_t lastMoveAt = 0;
+  uint32_t downAt = 0;
+  uint32_t releaseSince = 0;
+
   while (true) {
-    // 边沿触发诊断：GPIO38 电平任何变化立即打印（不做 1Hz 轮询错过窗口）。
-    // 判据：按下应变 0、松开应变 1；全程无任何 [EDGE] = 信号物理未到达 GPIO38。
-    int curIrq = digitalRead(TOUCH_IRQ);
-    if (curIrq != lastIrq) {
-      Serial.printf("[PENIRQ-EDGE] %d -> %d @%lums\n", lastIrq, curIrq, millis());
-      lastIrq = curIrq;
+    // ISR 加速唤醒 or 10ms 兜底 tick（v2-fix 曾改为固定 vTaskDelay(10)+take(0) 清空信号量，
+    // 铁证（cap_cal2）：点击无任何 [TSM] 事件——10ms 离散采样对快速轻点不利，按下窗口
+    // 短时凑不够 3 个采样点 → 漏按。恢复 ISR 唤醒路径：按下沿 give → 立即密集采样）
+    xSemaphoreTake(s_touchSem, pdMS_TO_TICKS(10));
+    uint32_t now = millis();
+    if ((uint32_t)(now - lastProc) < 5) continue;   // 5ms 节流：PENIRQ 抖动风暴（实测一次按下
+                                                    // 766 次 CHANGE 中断）给满信号量会让任务无间隔
+                                                    // 连跑；采样间留 5ms 让 PENIRQ 有恢复窗口
+    lastProc = now;
+    bool irqLow = (digitalRead(TOUCH_IRQ) == LOW); // 电平轮询（无 SPI）
+    switch (st) {
+      case TS_IDLE:
+        if (irqLow) {
+          // 按下沿 → 立即做第一次 SPI 采样（等待式复核）
+          uint16_t sx = 0, sy = 0, sz = 0;
+          if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
+          bool ok = touchDriverRead(&sx, &sy, &sz);
+          if (g_spiMutex) xSemaphoreGive(g_spiMutex);
+          if (ok) {
+            lastOkX = sx; lastOkY = sy; lastOkAt = now;
+            st = TS_CONFIRM;
+          }
+        }
+        break;
+
+      case TS_CONFIRM:
+        if (!irqLow) { st = TS_IDLE; break; }       // 抖动/已抬起 → 丢弃
+        if ((uint32_t)(now - lastOkAt) < 2) break;  // 两次采样间隔 ≥2ms
+        {
+          uint16_t sx = 0, sy = 0, sz = 0;
+          if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
+          bool ok = touchDriverRead(&sx, &sy, &sz);
+          if (g_spiMutex) xSemaphoreGive(g_spiMutex);
+          if (!ok) { lastOkAt = now; break; }       // 坏读数刷新重试
+          // 两次采样坐标一致（差 < 60）→ 确认按下（业界 ads7846 双采样一致性语义）
+          uint16_t dx = (sx > lastOkX) ? (sx - lastOkX) : (lastOkX - sx);
+          uint16_t dy = (sy > lastOkY) ? (sy - lastOkY) : (lastOkY - sy);
+          if (dx + dy < 60) {
+            s_touchDown = true;
+            s_touchX = sx; s_touchY = sy;
+            downAt = now;
+            Serial.printf("[TSM] press(%u,%u) raw(%u,%u) 2x-consistent\n",
+                          sx, sy, g_touchRawRX, g_touchRawRY);
+            st = TS_PRESSED;
+          } else { lastOkX = sx; lastOkY = sy; lastOkAt = now; }  // 不一致→以新点为准重试
+        }
+        break;
+
+      case TS_PRESSED:
+        if (!irqLow) { releaseSince = now; st = TS_RELEASING; }
+        else {
+          if ((uint32_t)(now - lastMoveAt) >= 20) {   // 拖动：每 20ms 刷新坐标
+            lastMoveAt = now;
+            uint16_t sx = 0, sy = 0, sz = 0;
+            if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
+            bool ok = touchDriverRead(&sx, &sy, &sz);
+            if (g_spiMutex) xSemaphoreGive(g_spiMutex);
+            if (ok) { s_touchX = sx; s_touchY = sy; }
+          }
+        }
+        break;
+
+      case TS_RELEASING:
+        if (!irqLow) {
+          if ((uint32_t)(now - releaseSince) >= 20) {  // 抬起：PENIRQ 高持续 ≥20ms 才确认
+            s_touchDown = false;
+            Serial.printf("[TSM] release dur=%lums\n", (unsigned long)(now - downAt));
+            st = TS_IDLE;
+          }
+        } else { st = TS_PRESSED; }                    // 抖动回按 → 回到保持
+        break;
     }
-    // BUILDV5-BASE1: 锁归并发调用方——采样任务包 g_spiMutex 与 main loop 显示互斥
-    if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
-    uint16_t sx, sy, sz;
-    bool down = touchDriverRead(&sx, &sy, &sz);
-    if (g_spiMutex) xSemaphoreGive(g_spiMutex);
-    s_touchDown = down;
-    if (down) {
-      s_touchX = sx; s_touchY = sy;
-      Serial.printf("[TS] press(%u,%u) raw(%u,%u)\n", sx, sy, g_touchRawRX, g_touchRawRY);
-    }
-    // 100ms 心跳（高频打印 GPIO38 电平，验证我们读的是不是对的）
-    if (millis() - lastBeat >= 100) {
-      lastBeat = millis();
-      Serial.printf("[PENIRQ-BEAT] GPIO38=%d down=%d\n", digitalRead(TOUCH_IRQ), down ? 1 : 0);
-    }
-    // 2ms 轮询（边沿捕捉 + 快速点击/双击不丢；无触摸时只读 GPIO 不触发 SPI）
-    vTaskDelay(2 / portTICK_PERIOD_MS);
   }
 }
 

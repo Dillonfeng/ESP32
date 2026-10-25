@@ -12,6 +12,7 @@
 #include <time.h>
 #include "weather_sync.h"
 #include "geo_pin.h"
+#include "ui_common.h"   // BUILDV5-TZFIX: epochToLocalNoLock
 
 namespace weather {
 
@@ -134,11 +135,11 @@ bool fetchAndCache() {
 
   // 当前日期/更新时间 (NTP 本地时间)
   time_t now = time(nullptr);
-  struct tm* lt = localtime(&now);
-  if (!lt || lt->tm_year < 100) return false;
+  struct tm lt; epochToLocalNoLock(now, lt);   // BUILDV5-TZFIX: 无锁 UTC+8, 替代 localtime() (tz锁×跨核中断)
+  if (lt.tm_year + 1900 < 2000) return false;
   static const char* WK[7] = {"周日","周一","周二","周三","周四","周五","周六"};
-  snprintf(d.date,   sizeof(d.date),   "%02d-%02d %s", lt->tm_mon + 1, lt->tm_mday, WK[lt->tm_wday]);
-  snprintf(d.update, sizeof(d.update), "%02d:%02d",    lt->tm_hour, lt->tm_min);
+  snprintf(d.date,   sizeof(d.date),   "%02d-%02d %s", lt.tm_mon + 1, lt.tm_mday, WK[lt.tm_wday]);
+  snprintf(d.update, sizeof(d.update), "%02d:%02d",    lt.tm_hour, lt.tm_min);
 
   // 7 天预报 (今天/明天/周一..周五)
   JsonObject daily = doc["daily"];
@@ -152,7 +153,7 @@ bool fetchAndCache() {
   for (int i = 0; i < 7; i++) {
     if (i == 0)      snprintf(d.dayLabel[i], 8, "今天");
     else if (i == 1) snprintf(d.dayLabel[i], 8, "明天");
-    else             snprintf(d.dayLabel[i], 8, "%s", WK[(lt->tm_wday + i) % 7]);
+    else             snprintf(d.dayLabel[i], 8, "%s", WK[(lt.tm_wday + i) % 7]);   // BUILDV5-TZFIX: lt 改为 struct
     if (i >= (int)cArr.size()) break;
     int di; const char* dn; codeToIconName((int)cArr[i].as<int>(), &di, &dn);
     d.dayIcon[i] = di;

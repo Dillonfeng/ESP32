@@ -82,7 +82,7 @@
 // 引脚分配 - 触摸屏 XPT2046
 // ============================================================
 #define TOUCH_CS_PIN        1       // 触摸片选 → T_CS (GPIO20被USB占用,改用GPIO1)
-#define TOUCH_IRQ_PIN       38      // 触摸中断 → T_IRQ (GPIO19被USB占用,改用GPIO38)
+#define TOUCH_IRQ_PIN       4       // 触摸中断 → T_IRQ (GPIO38被PSRAM SPICS1钳制,改用GPIO4)
 #define TOUCH_SPI_FREQ      2500000 // 2.5MHz SPI时钟
 
 // 触摸校准值 (需要根据实际屏幕校准)

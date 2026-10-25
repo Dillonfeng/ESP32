@@ -99,17 +99,20 @@
 // ##################################################################################
 
 // #define SPI_TOUCH_FREQUENCY  2500000
-// BUILDV5-TOUCHSPEED: 2.5→8MHz。XPT2046 12-bit ADC 支持最高 ~10MHz SPI；
-// getTouch() 耗时从 ~92ms 降到 ~30ms → main loop 帧率 10-20fps → 25-30fps，
-// 配合高频泵(每帧10次 audio.loop) → HLS 下载 ≥150KB/s ≥ 播放消耗 110KB/s。
-#define SPI_TOUCH_FREQUENCY  8000000
+// BUILDV5-TOUCHSPEED: 2.5→8MHz（旧：getTouch 在 main loop 拖帧率，提速配合 HLS 下载）。
+// TOUCH-FIX-V5.3（2026-10-24）：8→2.5MHz。① 触摸已移入独立任务+V3 状态机，
+//   采样不再拖 main loop，提速前提不成立；② XPT2046 手册串行时钟上限 2.5MHz（TFT_eSPI
+//   默认值），8MHz 超规格 → ADC 转换建立不足 → raw 系统性偏低（铁证：30号中心(112,189)
+//   press(115,175) raw rx=2240 vs 期望 2419，偏 179 ADC/14px；校准中心残差 devY=-111）。
+//   降频验证后若漂移/漏按依旧，恢复 8MHz 对照。
+#define SPI_TOUCH_FREQUENCY  2500000
 
 // Comment out the following to disable touch support
 #define SUPPORT_XPT2046
 
 // XPT2046 触摸引脚
 #define TOUCH_CS  1   // GPIO20被USB D+占用,改用GPIO1
-#define TOUCH_IRQ 38  // GPIO19被USB D-占用,改用GPIO38
+#define TOUCH_IRQ 4   // GPIO38被PSRAM SPICS1钳制,改用GPIO4
 
 // ##################################################################################
 //

@@ -161,36 +161,55 @@ _DEFAULT_EVENT_COLOR = SOFT
 def event_color(name):
     return c565(EVENT_COLORS.get(name, _DEFAULT_EVENT_COLOR))
 
-# ---------- 收音机页配色 (与 main.cpp 0x1042/0x0821/0x3186 等 565 值完全一致) ----------
-RADIO_HEADER_BG  = c565(0x1042)   # 顶部标题栏底
-RADIO_SIDE_BG    = c565(0x0821)   # 左侧分类栏底
-RADIO_SIDE_SEL   = c565(0x210C)   # 选中分类底
-RADIO_PLAY_BG    = c565(0x0821)   # 底部播放栏底
-RADIO_LINE       = c565(0x3186)   # 分隔线 (竖/横)
-RADIO_ROW_DIV    = c565(0x2104)   # 电台行分隔线
-RADIO_PLAYING_BG = c565(0x1843)   # 正在播放行底
-RADIO_SB_TRACK   = c565(0x1082)   # 滚动条轨道
-RADIO_LIVE_BG    = c565(0x07E0)   # LIVE 标签底 (绿)
+# ---------- 收音机页配色 (2026-10-22 浅色主题, 与 ui_common.h RGBC 565 值完全一致) ----------
+RADIO_HEADER_BG  = c565(0xFFFF)   # 状态栏底 = C_CARD (白)
+RADIO_SIDE_BG    = c565(0xEF9E)   # 左列底 = C_SIDE 0xECF0F4
+RADIO_SIDE_SEL   = c565(0xE79F)   # 选中分类底 = C_ACCBG 0xE1F3FA
+RADIO_PLAY_BG    = c565(0xFFFF)   # 底部播放栏底 = C_CARD
+RADIO_LINE       = c565(0xE73D)   # 分隔线 = C_LINE 0xE5E7EB
+RADIO_ROW_DIV    = c565(0xE73D)   # 电台行分隔线 = C_LINE
+RADIO_PLAYING_BG = c565(0xE79F)   # 正在播放行底 = C_ACCBG
+RADIO_SB_TRACK   = c565(0xC67A)   # 滚动条轨道 = C_THUMB 0xC4CCD4
+RADIO_LIVE_BG    = c565(0xE249)   # 直播点 = C_LIVE #E5484D -> 565
 RADIO_PAUSE_BG   = c565(0xFBE0)   # PAUSE 标签底 (红)
 RADIO_FAV_OFF    = c565(0x5A5A)   # 未收藏 (灰)
 RADIO_BTN_PLAY   = c565(0x07E0)   # 播放按钮底 (绿)
+RADIO_GROUP_BG   = c565(0xF7DF)   # 组标题底 (C_BG 0xF6F8FA)
+RADIO_GROUP_TX   = c565(0x9D36)   # 组标题字 = C_GROUP 0x9AA5B0
+RADIO_TXT        = c565(0x1946)   # 主文字 = C_TXT 0x1F2937
+RADIO_DIM        = c565(0x6B90)   # 次文字 = C_DIM 0x6B7280
+RADIO_ACC        = c565(0x0CB8)   # 主强调 = C_ACC 0x0E97C4
+RADIO_CARD       = c565(0xFFFF)   # 卡片/列表底 = C_CARD (白)
+RADIO_THUMB      = c565(0xC67A)   # 滚动条 = C_THUMB 0xC4CCD4
+RADIO_FAV        = c565(0xE4C3)   # 收藏星 = C_FAV #E39A1B -> 565
+FS_FREQ_COL      = c565(0x1127)   # 全屏频率大数字 = RGBC(0x16,0x24,0x3F)
+FS_TAG_BG        = c565(0xEF9F)   # 全屏 meta tag 底 = RGBC(0xEA,0xF1,0xFA)
+FS_TAG_TX        = c565(0x4AF0)   # 全屏 meta tag 字 = RGBC(0x4A,0x5F,0x87)
+# 全屏控制按钮几何 (镜像固件 radio_ui.cpp FS_BTN_*, 2026-10-22)
+FS_BTN_Y      = 200
+FS_BTN_DN_X   = 168
+FS_BTN_MAIN_X = 226
+FS_BTN_UP_X   = 284
+FS_BTN_R      = 22
+FS_BTN_MAIN_R = 26
 RED              = c565(0xF800)   # (TFT_RED)
 GREEN            = c565(0x07E0)   # (TFT_GREEN)
 YELLOW           = c565(0xFFE0)   # (TFT_YELLOW)
 DIM              = c565(0x7BEF)   # (COLOR_DIM 暗灰)
 
-# ---------- 收音机几何 (与 main.cpp RADIO_* 一致) ----------
-R_SIDEBAR_W = 70
-R_HEADER_H  = 28
-R_PLAYBAR_H = 80
-R_LIST_X    = 70
-R_LIST_W    = 390
+# ---------- 收音机几何 (与 ui_common.h RADIO_* 一致, 2026-10-22 三分组+全屏对齐) ----------
+R_SIDEBAR_W = 150
+R_HEADER_H  = 24
+R_SUBHDR_H  = 24
+R_PLAYBAR_H = 48
+R_LIST_X    = 150
+R_LIST_W    = 330
 R_SB_W      = 8
-R_ROW_H     = 45                            # 行高 (180//45=4 行, 比 55px 3 行更密)
+R_ROW_H     = 48                            # 行高 (192//48=4 行)
 R_ROWS      = 4
-R_LIST_TOP  = 28                       # = RADIO_HEADER_H
-R_LIST_BOT  = NAV_Y - R_PLAYBAR_H      # = 208
-R_LIST_H    = R_LIST_BOT - R_LIST_TOP  # = 180
+R_LIST_TOP  = 48                       # = RADIO_HEADER_H + RADIO_SUBHDR_H
+R_LIST_BOT  = NAV_Y - R_PLAYBAR_H      # = 288-48 = 240
+R_LIST_H    = R_LIST_BOT - R_LIST_TOP  # = 192
 
 # 温度颜色: 随数值变化 (与 main.cpp tempColor 完全一致)
 # 冰点以下用浅蓝 (0x6CF1) 而非纯蓝 (0x001F), 避免在深色背景上不可读
@@ -876,26 +895,45 @@ STATIONS_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardi
 BACKUP_JSON  = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
                             "海燕收音机_备份_20260912_195414.backup.json")
 
-# ---- 收音机分类结构 (镜像参考项目 HEADER_CATEGORIES / TAIL_CATEGORIES / 定位省份置顶) ----
-#   顶部功能分类: 全部 / 收藏 / 历史 / 个人
-#   地区分类 HEAD: 全国 / 中央 / 电视伴音(侧栏 2 字"伴音") / 国际
-#   定位省份 (RADIO_PINNED) 插到 HEAD 之后第一位, 其余省份按 RADIO_REGION_ORDER
-#   尾部: 海外 / 其它
-RADIO_META         = ["全部", "收藏", "历史", "个人"]
-RADIO_REGION_HEAD  = ["全国", "中央", "电视伴音", "国际"]
-RADIO_REGION_TAIL  = ["海外", "其它"]
+# ---- 收音机分类结构 (2026-10-22 三分组, 镜像固件 buildRadioCats) ----
+#   组0 频道: 全国 / 中央 / 国际 / 海外
+#   组1 省市: 置顶省(RADIO_PINNED) + RADIO_REGION_ORDER + 其它
+#   组2 我的: 收藏 / 个人 / 伴音(电视伴音) / 历史
+RADIO_META         = ["收藏", "个人", "历史"]          # 组2 我的 内顺序 (设计稿: 收藏→个人→伴音→历史)
+RADIO_REGION_HEAD  = ["全国", "中央", "国际", "海外"]  # 组0 频道 (全国+央/际/海外)
+RADIO_REGION_TAIL  = ["其它"]                          # 组1 尾部
 RADIO_REGION_ORDER = ["山东", "浙江", "河北", "江苏", "河南", "吉林", "四川", "安徽", "山西", "辽宁",
                       "湖北", "云南", "新疆", "黑龙江", "湖南", "江西", "广西", "内蒙古", "贵州", "福建",
                       "北京", "陕西", "青海", "上海", "香港", "重庆", "宁夏", "甘肃", "台湾", "海南",
                       "西藏", "天津", "澳门"]
 RADIO_PINNED       = "广东"                        # 定位省份 (backup last_location._key = 广东)
 RADIO_LABEL_MAP    = {"电视伴音": "伴音", "黑龙江": "龙江", "内蒙古": "内蒙"}           # 侧栏 4 字 -> 2 字 (与参考项目一致)
-# 侧栏几何 (侧栏可上下拖动): 顶部 4 个特殊行(全部/收藏/历史/个人)固定,
-# 地区分类列表在下方滚动 (与参考项目一致).
-R_SPECIAL_CNT   = 4                             # 特殊行数
-R_SPECIAL_H     = 22                            # 顶部特殊行(全部/收藏/历史/个人)每行高
-R_ROW_H_SIDE    = 24                            # 地区行每行高: 侧栏铺满到导航栏 (NAV_Y-R_REGION_TOP)=172, 7 行留 4px
-R_REGION_TOP    = R_HEADER_H + R_SPECIAL_CNT * R_SPECIAL_H   # 地区滚动区顶部 = 28 + 4*22 = 116
+# 侧栏几何 (三分组, 镜像固件 sideRowTop/sideTotalH): 组标题行 + 分类行 整列滚动
+R_GROUP_H      = 18                            # 组标题行高 (RADIO_GROUP_H)
+R_HEAD_H2      = 28                            # 左列固定头"频道分类" (SIDEBAR_HEAD_H 28px, 滚动区下移)
+R_GROUP_NAMES  = ["频道", "省市", "我的"]
+R_SPECIAL_CNT  = 4                             # 特殊行数 (行高不同: 组0前4行)
+R_SPECIAL_H    = 28                            # 顶部特殊行(全国/中央/国际/海外)每行高 (RADIO_SPECIAL_H)
+R_ROW_H_SIDE   = 26                            # 地区/我的 分类行每行高 (RADIO_ROW_H_SIDE)
+def side_row_top(i, cats=None):
+    """分类行 i 距侧栏顶的像素偏移 (含组标题行, 镜像固件 sideRowTop; i 必须 < len(cats))."""
+    cats = cats if cats is not None else radio_cats()
+    y = 0
+    for k in range(i):
+        if k == 0 or cats[k].get("group") != cats[k - 1].get("group"):
+            y += R_GROUP_H
+        y += R_SPECIAL_H if k < R_SPECIAL_CNT else R_ROW_H_SIDE
+    if i == 0 or cats[i].get("group") != cats[i - 1].get("group"):
+        y += R_GROUP_H
+    return y
+def side_total_h(cats=None):
+    """侧栏总高 = 最后一个分类的底边 (镜像固件 sideTotalH 正确语义, 无越界)."""
+    cats = cats if cats is not None else radio_cats()
+    n = len(cats)
+    if n == 0:
+        return 0
+    i = n - 1
+    return side_row_top(i, cats) + (R_SPECIAL_H if i < R_SPECIAL_CNT else R_ROW_H_SIDE)
 # 分类配色 (与参考一致; 电台图标底色按"分类"取色, 24-bit hex -> 565)
 RADIO_CAT_COLORS = {
     "交通": 0x3498DB, "综合": 0x34495E, "经济": 0xF39C12, "新闻": 0xE74C3C,
@@ -1087,25 +1125,32 @@ def load_radio():
         return [s for s in channels if s.region_key == key]
 
     cats = []
-    def add_cat(label, key, meta, stations):
-        cats.append({"label": label, "key": key, "meta": meta, "stations": stations})
+    def add_cat(label, key, meta, stations, group):
+        cats.append({"label": label, "key": key, "meta": meta, "stations": stations, "group": group})
 
-    add_cat("全部", "全部", True, pool)
-    if used_backup:
-        add_cat("收藏", "收藏", True, [by_id[i] for i in fav_ids if i in by_id])
-        add_cat("历史", "历史", True, [by_id[i] for i in hist_ids if i in by_id])
-        add_cat("个人", "个人", True, list(user_st))
-    for key in RADIO_REGION_HEAD:
-        add_cat(_radio_label(key), key, False, region_cats(key))
     pinned = _locate_province() or RADIO_PINNED     # 定位省份(完整名), 失败退回 RADIO_PINNED(广东)
+    # ---- 组0 频道: 全国 + 中央/国际/海外 ----
+    add_cat("全国", "全国", True, pool, 0)
+    for key in ["中央", "国际", "海外"]:
+        add_cat(_radio_label(key), key, False, region_cats(key), 0)
+    # ---- 组1 省市: 置顶省 + RORDER + 其它 ----
     if pinned not in RADIO_REGION_HEAD:
-        add_cat(_radio_label(pinned), pinned, False, region_cats(pinned))
+        add_cat(_radio_label(pinned), pinned, False, region_cats(pinned), 1)
     for key in RADIO_REGION_ORDER:
         if key == pinned:
             continue
-        add_cat(_radio_label(key), key, False, region_cats(key))
-    for key in RADIO_REGION_TAIL:
-        add_cat(_radio_label(key), key, False, region_cats(key))
+        add_cat(_radio_label(key), key, False, region_cats(key), 1)
+    add_cat(_radio_label("其它"), "其它", False, region_cats("其它"), 1)
+    # ---- 组2 我的: 收藏 -> 个人 -> 伴音 -> 助眠 -> 历史 (设计稿组序, 2026-10-24 补"助眠"6 台演示) ----
+    if used_backup:
+        add_cat("收藏", "收藏", True, [by_id[i] for i in fav_ids if i in by_id], 2)
+        add_cat("个人", "个人", True, list(user_st), 2)
+    add_cat(_radio_label("电视伴音"), "电视伴音", False, region_cats("电视伴音"), 2)
+    sleep_demo = [_make_station(n, "--", "助眠", "#78A0C8", 9000 + i, True, "助眠")
+                  for i, n in enumerate(["雨声", "海浪", "林间鸟鸣", "篝火", "咖啡馆", "白噪音"])]
+    add_cat("助眠", "助眠", True, sleep_demo, 2)          # 设计稿 6 台演示 (无真实 URL)
+    if used_backup:
+        add_cat("历史", "历史", True, [by_id[i] for i in hist_ids if i in by_id], 2)
 
     _radio_cache = {"cats": cats, "regions": regions}
     return _radio_cache
@@ -1150,53 +1195,108 @@ def _fit(text, maxw):
     return text + "…"
 
 def draw_radio_header(d, cur_cat):
+    """状态栏 (2026-10-22 浅色镜像固件 drawRadioHeader): "网络收音机"+光标 | 时间 | 音量% | WiFi/离线."""
     d.rectangle([0, 0, 479, R_HEADER_H - 1], fill=RADIO_HEADER_BG)
-    cats = radio_cats()
-    if cats:
-        label = radio_cat_label(cur_cat)
-        cnt = len(cats[cur_cat]["stations"]) if cur_cat < len(cats) else 0
-        title = "收音机· %s (%d)" % (label, cnt)
-    else:
-        title = "收音机· (无数据)"
-    hw_text(d, 6, R_HEADER_H // 2, title, WHITE, RADIO_HEADER_BG, anchor="lm")
-    # 右侧: 无网络 (镜像固件 wifiConnected 分支; 预览无 WiFi -> 显示"无网络")
-    hw_text(d, 470, R_HEADER_H // 2, "无网络", RED, RADIO_HEADER_BG, anchor="rm")
-    d.line([R_SIDEBAR_W - 1, R_HEADER_H, R_SIDEBAR_W - 1, R_LIST_BOT - 1], fill=RADIO_LINE)
+    hw_text(d, 6, R_HEADER_H // 2, "网络收音机", RADIO_TXT, RADIO_HEADER_BG, anchor="lm")
+    cw = aa_text_width("网络收音机")
+    d.rectangle([6 + cw + 5, 6, 6 + cw + 8, 17], fill=RADIO_ACC)
+    # 右侧: 时间 | 音量% | WiFi/离线 (镜像固件顺序: 时间最右, 向左 音量 -> WiFi)
+    t_txt = "22:00"            # 预览固定时刻 (与 make_preview 时钟一致即可)
+    v_txt = "100%"
+    w_txt = "离线"             # 预览无 WiFi
+    tw = aa_text_width(t_txt); vw = aa_text_width(v_txt); ww = aa_text_width(w_txt)
+    tx = 470 - tw
+    hw_text(d, tx, R_HEADER_H // 2, t_txt, RADIO_TXT, RADIO_HEADER_BG, anchor="lm")
+    hw_text(d, tx - vw - 10, R_HEADER_H // 2, v_txt, RADIO_DIM, RADIO_HEADER_BG, anchor="lm")
+    hw_text(d, tx - vw - 10 - ww - 10, R_HEADER_H // 2, w_txt, RADIO_LIVE_BG, RADIO_HEADER_BG, anchor="lm")
+    d.line([0, R_HEADER_H, 479, R_HEADER_H], fill=RADIO_LINE)
+
+# 侧栏分类图标 8x8 (镜像 radio_ui.cpp SIDE_ICON): 0全国 1中央 2国际 3海外 4省市 5收藏 6个人 7伴音 8助眠 9历史
+SIDE_ICON = [
+    [0x3C,0x42,0x99,0xA5,0xA5,0x99,0x42,0x3C],   # 0 全国: 地球(圆环+经纬)
+    [0x08,0x1C,0x3E,0x7F,0x3E,0x14,0x36,0x63],   # 1 中央: 五角星(简化)
+    [0x3C,0x42,0x99,0x81,0xFF,0x81,0x42,0x3C],   # 2 国际: 地球+横线
+    [0x18,0x3C,0x7E,0x7E,0x3C,0x18,0x00,0x00],   # 3 海外: 水滴
+    [0x18,0x3C,0x7E,0x7E,0x3C,0x18,0x18,0x18],   # 4 省市: 地图钉
+    [0x08,0x1C,0x3E,0x7F,0x3E,0x14,0x36,0x63],   # 5 收藏: 星
+    [0x0E,0x11,0x11,0x0E,0x00,0x1F,0x21,0x21],   # 6 个人: 人形
+    [0x3C,0x42,0x42,0x42,0x42,0x42,0x3C,0x24],   # 7 伴音: 电视(含底座)
+    [0x06,0x0F,0x09,0x09,0x09,0x09,0x00,0x00],   # 8 助眠: 音符
+    [0x3C,0x42,0x42,0x5A,0x5A,0x42,0x42,0x3C]    # 9 历史: 时钟(带指针)
+]
+def draw_side_icon(d, x, y, ic, fg):
+    if ic < 0 or ic > 9:
+        return
+    for r in range(8):
+        row = SIDE_ICON[ic][r]
+        for c2 in range(8):
+            if row & (0x80 >> c2):
+                d.point([x + c2, y + r], fill=fg)
+def cat_icon_index(key, grp):
+    if key == "全国": return 0
+    if key == "中央": return 1
+    if key == "国际": return 2
+    if key == "海外": return 3
+    if grp == 1: return 4
+    if key == "收藏": return 5
+    if key == "个人": return 6
+    if key in ("电视伴音", "伴音"): return 7
+    if key == "助眠": return 8
+    if key == "历史": return 9
+    return -1
 
 def draw_radio_sidebar(d, cur_cat, region_scroll_top=0):
-    """左侧分类栏: 固定4行(全部/收藏/历史/个人) + 地区行 整列一起滚动 (镜像 main.cpp 2026-09-27)。
+    """左侧分类栏: 三分组(频道/省市/我的) 组标题行+分类行 整列像素滚动 (镜像 main.cpp 2026-10-22)。
     region_scroll_top 为像素偏移。选中分类 = 红色字 + 红色左条。"""
     cats = radio_cats()
-    n_spec = R_SPECIAL_CNT
     n = len(cats)
     S = region_scroll_top
-    top = R_HEADER_H - S
+    top = R_HEADER_H + R_HEAD_H2 - S
     d.rectangle([0, R_HEADER_H, R_SIDEBAR_W - 1, NAV_Y - 1], fill=RADIO_SIDE_BG)
+    # 固定头 "频道分类" (设计稿 lp-head 28px, 弱化字色) + 下分隔线
+    hw_text(d, 10, R_HEADER_H + (R_HEAD_H2 - 16) // 2 + 8, "频道分类", RADIO_DIM, RADIO_SIDE_BG, anchor="lm")
+    d.line([0, R_HEADER_H + R_HEAD_H2 - 1, R_SIDEBAR_W - 1, R_HEADER_H + R_HEAD_H2 - 1], fill=RADIO_LINE)
     for i, c in enumerate(cats):
-        rh = R_SPECIAL_H if i < n_spec else R_ROW_H_SIDE
-        base = i * R_SPECIAL_H if i < n_spec else n_spec * R_SPECIAL_H + (i - n_spec) * R_ROW_H_SIDE
-        ry = top + base
-        y0 = max(ry, R_HEADER_H)
+        # 组标题行 (组首; 区域 = 分类行顶边之上 R_GROUP_H, 镜像固件 drawRadioRegionSidebar)
+        if i == 0 or c["group"] != cats[i - 1]["group"]:
+            gy = top + side_row_top(i) - R_GROUP_H
+            g0 = max(gy, R_HEADER_H + R_HEAD_H2)
+            g1 = min(gy + R_GROUP_H - 1, NAV_Y - 1)
+            if g1 >= g0:
+                d.rectangle([0, g0, R_SIDEBAR_W - 2, g1], fill=RADIO_SIDE_BG)
+                if g0 + 15 <= g1:
+                    hw_text(d, 10, gy + (R_GROUP_H - 16) // 2 + 8, R_GROUP_NAMES[c["group"]],
+                            RADIO_GROUP_TX, RADIO_SIDE_BG, anchor="lm")
+        rh = R_SPECIAL_H if i < R_SPECIAL_CNT else R_ROW_H_SIDE
+        ry = top + side_row_top(i)
+        y0 = max(ry, R_HEADER_H + R_HEAD_H2)
         fy1 = min(ry + rh - 1, NAV_Y - 1)
         if fy1 < y0:
             continue
         sel = (i == cur_cat)
         bg = RADIO_SIDE_SEL if sel else RADIO_SIDE_BG
-        fg = RED if sel else DIM
+        fg = RADIO_TXT if sel else RADIO_DIM
         d.rectangle([0, y0, R_SIDEBAR_W - 2, fy1], fill=bg)
         if sel:
-            d.line([0, y0, 0, fy1], fill=RED)
+            d.line([0, y0, 0, fy1], fill=RADIO_ACC)
         ty = ry + (rh - 16) // 2
         if ty >= y0 and ty + 15 <= fy1:
-            hw_text(d, 4, ty + 8, c["label"], fg, bg, anchor="lm")
+            ic = cat_icon_index(c.get("key", ""), c["group"])
+            if ic >= 0:
+                draw_side_icon(d, 10, ty + 4, ic, RADIO_ACC if sel else RADIO_DIM)
+            hw_text(d, 26, ty + 8, c["label"], fg, bg, anchor="lm")
+            # 2026-10-24 问题①: 数量徽标 (设计稿 <span class="cnt">, 行右缘对齐)
+            cc = str(len(c["stations"]))
+            cw = aa_text_width(cc)
+            hw_text(d, R_SIDEBAR_W - 12 - cw, ty + 8, cc, fg, bg, anchor="lm")
     # 侧栏滚动条 (右侧细条, 整列, 仅当总高 > 视口)
     d.line([R_SIDEBAR_W - 1, R_HEADER_H, R_SIDEBAR_W - 1, NAV_Y - 1], fill=RADIO_LINE)
-    total_h = n_spec * R_SPECIAL_H + max(0, n - n_spec) * R_ROW_H_SIDE
-    view_h = NAV_Y - R_HEADER_H
+    total_h = side_total_h(cats)
+    view_h = NAV_Y - (R_HEADER_H + R_HEAD_H2)
     if total_h > view_h:
         thumb_h = max(12, view_h * view_h // total_h)
         smax = total_h - view_h
-        thumb_y = R_HEADER_H + (view_h - thumb_h) * S // smax
+        thumb_y = R_HEADER_H + R_HEAD_H2 + (view_h - thumb_h) * S // smax
         d.rectangle([R_SIDEBAR_W - 3, thumb_y, R_SIDEBAR_W - 1, thumb_y + thumb_h - 1], fill=WHITE)
     d.line([R_SIDEBAR_W - 1, R_HEADER_H, R_SIDEBAR_W - 1, NAV_Y - 1], fill=RADIO_LINE)
 
@@ -1211,138 +1311,185 @@ def _draw_station_icon(d, cx, cy, st, size=22):
     lbl = cat[:4]
     d.text((cx, cy + half + 3), lbl, font=F10, fill=DIM, anchor="mm")
 
-def draw_radio_station_row(d, st, row_y, playing=False, favorited=False):
-    bg = RADIO_PLAYING_BG if playing else BLACK
-    d.rectangle([R_LIST_X, row_y, R_LIST_X + R_LIST_W - 1, row_y + R_ROW_H - 1], fill=bg)
-    # 圆角方形图标 (按分类取色 + 名首字 + 分类小字), 居中
-    icon_cx, icon_cy = R_LIST_X + 24, row_y + R_ROW_H // 2
-    _draw_station_icon(d, icon_cx, icon_cy, st, 20)
-    # 电台名 + 频率·地区 (46px 行高: 名称上 12 / 信息下 30)
-    name_x = R_LIST_X + 46
-    hw_text(d, name_x, row_y + 12, st.name, WHITE, bg, anchor="lm")
-    info = "%s · %s" % (st.freq, radio_region_name(st))
-    hw_text(d, name_x, row_y + 30, info, DIM, bg, anchor="lm")
-    # 右侧: 播放中=绿三角 / 否则爱心
+def draw_radio_station_row(d, st, row_y, playing=False, favorited=False, clip_y0=None, clip_y1=None):
+    """行绘制 (clip_y0/clip_y1: 可见 y 区间, 像素滚动半行裁剪, 镜像固件 2026-10-22)."""
+    if clip_y0 is None: clip_y0 = R_LIST_TOP
+    if clip_y1 is None: clip_y1 = R_LIST_BOT
+    bg = RADIO_PLAYING_BG if playing else RADIO_CARD
+    c0 = max(row_y, clip_y0); c1 = min(row_y + R_ROW_H, clip_y1)
+    if c1 <= c0: return
+    d.rectangle([R_LIST_X, c0, R_LIST_X + R_LIST_W - 1, c1 - 1], fill=bg)
+    # 直播点 (播放中, 设计稿 #E5484D)
+    tx = R_LIST_X + 12
     if playing:
-        d.polygon([(R_LIST_X + R_LIST_W - 14, row_y + 14),
-                   (R_LIST_X + R_LIST_W - 6, row_y + 10),
-                   (R_LIST_X + R_LIST_W - 6, row_y + 18)], fill=GREEN)
-    else:
-        hc = RED if favorited else DIM
-        ax = R_LIST_X + R_LIST_W - 14
-        ay = row_y + R_ROW_H // 2 - 2
-        d.ellipse([ax - 8, ay - 6, ax, ay + 2], fill=hc)
-        d.ellipse([ax, ay - 6, ax + 8, ay + 2], fill=hc)
-        d.polygon([(ax - 8, ay), (ax + 8, ay), (ax, ay + 8)], fill=hc)
-    d.line([R_LIST_X, row_y + R_ROW_H - 1, R_LIST_X + R_LIST_W - 1, row_y + R_ROW_H - 1], fill=RADIO_ROW_DIV)
+        d.ellipse([R_LIST_X + 10, row_y + 11, R_LIST_X + 16, row_y + 17], fill=RADIO_LIVE_BG)
+        tx = R_LIST_X + 24
+    # 台名 (上) + 分类·地区 (下, 12px)
+    if row_y + 6 >= c0 and row_y + 18 <= c1:
+        hw_text(d, tx, row_y + 12, st.name, RADIO_TXT, bg, anchor="lm")
+    if row_y + 26 >= c0 and row_y + 42 <= c1:
+        catl = _station_cat(st)
+        reg = radio_region_name(st)
+        info = ("正在播放 · %s · %s" % (catl, reg)) if playing else ("%s · %s" % (catl, reg))
+        info = _fit(info, R_LIST_W - 36 - (tx - R_LIST_X))
+        hw_text(d, tx, row_y + 34, info, RADIO_ACC if playing else RADIO_DIM, bg, anchor="lm")
+    # 星标 (右缘, 收藏 #E39A1B)
+    if row_y + 5 >= c0 and row_y + 17 <= c1:
+        hw_text(d, R_LIST_X + R_LIST_W - 28, row_y + 12, "★" if favorited else "☆",
+                RADIO_FAV if favorited else RADIO_DIM, bg, anchor="lm")
+    if row_y + R_ROW_H - 1 >= c0 and row_y + R_ROW_H - 1 < c1:
+        d.line([R_LIST_X, row_y + R_ROW_H - 1, R_LIST_X + R_LIST_W - 1, row_y + R_ROW_H - 1], fill=RADIO_ROW_DIV)
 
 def draw_radio_scrollbar(d, count, list_scroll_top):
     track_x = R_LIST_X + R_LIST_W
     d.rectangle([track_x, R_LIST_TOP, track_x + R_SB_W - 1, R_LIST_BOT - 1], fill=RADIO_SB_TRACK)
     if count > 0:
-        thumb_h = max(20, R_LIST_H * R_ROWS // count)
-        scroll_range = max(1, count - R_ROWS)
-        thumb_y = R_LIST_TOP if scroll_range == 0 else \
-            R_LIST_TOP + (R_LIST_H - thumb_h) * list_scroll_top // scroll_range
-        d.rectangle([track_x + 1, thumb_y, track_x + R_SB_W - 2, thumb_y + thumb_h - 1], fill=WHITE)
+        total_pix = count * R_ROW_H
+        scroll_pix_max = max(1, total_pix - R_LIST_H)
+        thumb_h = max(24, R_LIST_H * R_LIST_H // total_pix)
+        thumb_y = R_LIST_TOP + (R_LIST_H - thumb_h) * list_scroll_top // scroll_pix_max
+        d.rectangle([track_x + 1, thumb_y, track_x + R_SB_W - 2, thumb_y + thumb_h - 1], fill=RADIO_THUMB)
 
 def draw_radio_list(d, cur_cat, list_scroll_top=0, playing_idx=-1, favorites=()):
-    d.rectangle([R_LIST_X, R_LIST_TOP, R_LIST_X + R_LIST_W - 1, R_LIST_BOT - 1], fill=BLACK)
+    d.rectangle([R_LIST_X, R_LIST_TOP, R_LIST_X + R_LIST_W - 1, R_LIST_BOT - 1], fill=RADIO_CARD)
     stations = radio_cat_stations(cur_cat)
     count = len(stations)
     if count == 0:
-        d.text((R_LIST_X + 50, R_LIST_TOP + 50), "暂无电台", font=F16, fill=RED, anchor="lm")
+        hw_text(d, R_LIST_X + R_LIST_W // 2, R_LIST_TOP + R_LIST_H // 2, "该分类暂无电台",
+                RADIO_DIM, RADIO_CARD, anchor="mm")
         return
-    start = list_scroll_top
-    end = min(start + R_ROWS, count)
+    # 2026-10-22 问题③: listScrollTop 为像素偏移 (与固件一致 1:1 跟手)
+    pix_off = list_scroll_top % R_ROW_H
+    start_row = list_scroll_top // R_ROW_H
+    first = start_row - 1 if (pix_off > 0 and start_row > 0) else start_row
+    last = min(start_row + R_ROWS, count)
+    first = max(first, 0)
     fav_set = set(favorites)
-    for i in range(start, end):
-        row_y = R_LIST_TOP + (i - start) * R_ROW_H
+    for i in range(first, last):
+        row_y = R_LIST_TOP + i * R_ROW_H - list_scroll_top
         playing = (i == playing_idx)
         favorited = stations[i].sid in fav_set
         draw_radio_station_row(d, stations[i], row_y, playing, favorited)
     draw_radio_scrollbar(d, count, list_scroll_top)
 
 def draw_radio_playbar(d, cur_cat, playing_idx=-1, playing=False, favorited=False):
+    """底部播放栏 (2026-10-22 浅色镜像固件 drawRadioPlayBar):
+    左 EQ 迷你条 | 台名(正在播放/已暂停) | 音量控制(icon+%) | 右缘圆钮(播放/暂停)."""
     bar_x, bar_y = R_LIST_X, R_LIST_BOT
     bar_w, bar_h = R_LIST_W, R_PLAYBAR_H
     d.rectangle([bar_x, bar_y, bar_x + bar_w - 1, bar_y + bar_h - 1], fill=RADIO_PLAY_BG)
     d.line([bar_x, bar_y, bar_x + bar_w - 1, bar_y], fill=RADIO_LINE)
+    # 左 EQ 迷你条 (4 段, 播放=ACC / 暂停=DIM)
+    for i in range(4):
+        d.rectangle([bar_x + 8 + i * 9, bar_y + bar_h - 11, bar_x + 8 + i * 9 + 6, bar_y + bar_h - 9],
+                    fill=RADIO_ACC if playing else RADIO_DIM)
     stations = radio_cat_stations(cur_cat)
+    vol_x = bar_x + bar_w - 108
     if playing_idx < 0 or playing_idx >= len(stations):
-        # 未播放: 仅控件行 (列表图标/名留白, 居中提示)
-        _draw_playbar_controls(d, bar_x, bar_y + bar_h // 2 - 14, playing=False,
-                               favorited=favorited, progress=0.0)
-        hw_text(d, bar_x + 44, bar_y + 16, "点击电台开始播放", DIM, RADIO_PLAY_BG, anchor="lm")
-        return
-    st = stations[playing_idx]
-    # 行1: 图标 + 电台名 (左) + "线路1 分类" (右)
-    cat = _station_cat(st)
-    _draw_station_icon(d, bar_x + 18, bar_y + 18, st, 18)
-    right_lbl = "线路1 %s" % cat
-    name_x = bar_x + 38
-    name_maxw = (bar_x + bar_w - 10) - aa_text_width(right_lbl) - 8 - name_x
-    hw_text(d, name_x, bar_y + 18, _fit(st.name, name_maxw), WHITE, RADIO_PLAY_BG, anchor="lm")
-    hw_text(d, bar_x + bar_w - 10, bar_y + 18, right_lbl, DIM, RADIO_PLAY_BG, anchor="rm")
-    # 行2: 进度条 (占位, 模拟播放中进度)
-    d.rectangle([bar_x + 4, bar_y + 34, bar_x + bar_w - 5, bar_y + 34 + 2], fill=RADIO_SB_TRACK)
-    d.rectangle([bar_x + 4, bar_y + 34, bar_x + 4 + int((bar_w - 9) * 0.4), bar_y + 34 + 2], fill=GREEN)
-    # 行3: 控件 (≡/上一/播放暂停/下一) + 定时关闭 + 时间
-    _draw_playbar_controls(d, bar_x, bar_y + 52, playing=playing,
-                           favorited=favorited, progress=0.4)
-
-def _draw_playbar_controls(d, bar_x, cy, playing=False, favorited=False, progress=0.0):
-    """底部播放栏控件行: ≡  [上一] [播放/暂停] [下一]  定时关闭  时间.
-    上一/播放/下一 三键以播放栏水平中心 (bar_x+R_LIST_W/2) 为轴居中,
-    定时关闭 + 时间靠右 (不占用居中的三键)."""
-    cx0 = bar_x + R_LIST_W // 2                 # 播放栏水平中心 (=bar_x+195)
-    # 播放列表 (≡) 左端
-    d.line([bar_x + 12, cy - 4, bar_x + 24, cy - 4], fill=WHITE)
-    d.line([bar_x + 12, cy, bar_x + 24, cy], fill=WHITE)
-    d.line([bar_x + 12, cy + 4, bar_x + 24, cy + 4], fill=WHITE)
-    # 上一曲 ◀| (左指三角 + 左竖线, 中心 = cx0-45)
-    px = cx0 - 56
-    d.polygon([(px + 18, cy - 6), (px + 18, cy + 6), (px + 8, cy)], fill=WHITE)
-    d.rectangle([px + 5, cy - 6, px + 8, cy + 6], fill=WHITE)
-    # 播放/暂停 (大圆按钮, 居中)
-    pp_cx, pp_cy = cx0, cy
-    d.ellipse([pp_cx - 15, pp_cy - 15, pp_cx + 15, pp_cy + 15], fill=RADIO_BTN_PLAY)
-    if not playing:
-        d.polygon([(pp_cx - 4, pp_cy - 7), (pp_cx + 6, pp_cy), (pp_cx - 4, pp_cy + 7)], fill=WHITE)
+        # 未播放: 台名区留空提示
+        hw_text(d, bar_x + 54, bar_y + 10, "点击电台开始播放", RADIO_DIM, RADIO_PLAY_BG, anchor="lm")
+        hw_text(d, bar_x + 54, bar_y + 35, "左列选分类 · 右列点电台", RADIO_DIM, RADIO_PLAY_BG, anchor="lm")
     else:
-        d.rectangle([pp_cx - 6, pp_cy - 6, pp_cx - 3, pp_cy + 6], fill=WHITE)
-        d.rectangle([pp_cx + 2, pp_cy - 6, pp_cx + 5, pp_cy + 6], fill=WHITE)
-    # 下一曲 ▶| (中心 = cx0+45)
-    nx = cx0 + 38
-    d.polygon([(nx, cy - 6), (nx, cy + 6), (nx + 10, cy)], fill=WHITE)
-    d.rectangle([nx + 10, cy - 6, nx + 13, cy + 6], fill=WHITE)
-    # 定时关闭 (下一曲右侧) + 时间 (最右, 右对齐)
-    hw_text(d, cx0 + 55, cy, "定时关闭", DIM, RADIO_PLAY_BG, anchor="lm")
-    d.text((bar_x + 384, cy), "00:00 / 00:00", font=F10, fill=DIM, anchor="rm")
+        st = stations[playing_idx]
+        nm = _fit(st.name, (vol_x - (bar_x + 54) - 12))
+        hw_text(d, bar_x + 54, bar_y + 8, nm, RADIO_TXT, RADIO_PLAY_BG, anchor="lm")
+        hw_text(d, bar_x + 54, bar_y + 33, "正在播放" if playing else "已暂停",
+                RADIO_ACC if playing else RADIO_DIM, RADIO_PLAY_BG, anchor="lm")
+    # 音量控制 (icon + %)
+    vcy = bar_y + bar_h // 2
+    d.rectangle([vol_x, bar_y + 1, vol_x + 60 - 1, bar_y + bar_h - 2], fill=RADIO_PLAY_BG)
+    d.rectangle([vol_x, vcy - 4, vol_x + 4, vcy + 4], fill=RADIO_ACC)
+    d.polygon([(vol_x + 4, vcy), (vol_x + 10, vcy - 7), (vol_x + 10, vcy + 7)], fill=RADIO_ACC)
+    d.line([vol_x + 13, vcy - 5, vol_x + 15, vcy - 2], fill=RADIO_ACC); d.line([vol_x + 15, vcy - 2, vol_x + 15, vcy + 2], fill=RADIO_ACC); d.line([vol_x + 15, vcy + 2, vol_x + 13, vcy + 5], fill=RADIO_ACC)
+    d.line([vol_x + 18, vcy - 8, vol_x + 21, vcy - 2], fill=RADIO_ACC); d.line([vol_x + 21, vcy - 2, vol_x + 21, vcy + 2], fill=RADIO_ACC); d.line([vol_x + 21, vcy + 2, vol_x + 18, vcy + 8], fill=RADIO_ACC)
+    hw_text(d, vol_x + 28, vcy, "100%", RADIO_DIM, RADIO_PLAY_BG, anchor="lm")
+    # 右缘圆钮 (播放/暂停)
+    ccx, ccy = bar_x + bar_w - 24, bar_y + bar_h // 2
+    d.ellipse([ccx - 17, ccy - 17, ccx + 17, ccy + 17], fill=RADIO_ACC)
+    if playing:
+        d.rectangle([ccx - 5, ccy - 6, ccx - 1, ccy + 6], fill=RADIO_CARD)
+        d.rectangle([ccx + 2, ccy - 6, ccx + 6, ccy + 6], fill=RADIO_CARD)
+    else:
+        d.polygon([(ccx - 4, ccy - 7), (ccx + 7, ccy), (ccx - 4, ccy + 7)], fill=RADIO_CARD)
 
 def draw_radio_fullscreen(d, cur_cat, playing_idx=-1, favorited=False):
-    d.rectangle([0, 0, 479, NAV_Y - 1], fill=(0, 0, 0))   # 半透明黑幕 (PIL 无 alpha, 用纯黑近似)
+    """全屏播放页 (2026-10-22 设计稿): 顶栏38px(返回|正在播放|收藏星) +
+    左L频谱竖条 | 台名24px/频率42px+MHz/meta/控制按钮−播放+ | 右R频谱竖条 +
+    底部30px 双击提示. 镜像固件 drawStationFullscreen. 频谱用静态模拟竖条."""
+    d.rectangle([0, 0, 479, NAV_Y - 1], fill=RADIO_CARD)
     stations = radio_cat_stations(cur_cat)
     if playing_idx < 0 or playing_idx >= len(stations):
         return
     st = stations[playing_idx]
-    cx, cy = 240, 140
-    d.rounded_rectangle([60, 40, 60 + 359, 40 + 199], radius=8, fill=c565(0x1042))
-    col = ((st.r >> 3) << 5) | ((st.g >> 2) << 1) | (st.b >> 3)
-    if col == 0:
-        col = 0xCCCC
-    d.ellipse([cx - 40, 80 - 40, cx + 40, 80 + 40], fill=c565(col))
-    hw_glyphs(d, cx, 80, _station_icon(st), WHITE, c565(col), 20, anchor="mm")
-    hw_glyphs(d, cx, 130, st.name, WHITE, c565(0x1042), 20, anchor="mm")
-    info = "%s · %s" % (st.freq, radio_region_name(st))
-    hw_text(d, cx, 165, info, DIM, c565(0x1042), anchor="mm")
-    fav_text = "★ 已收藏" if favorited else "☆ 收藏"
-    hw_text(d, cx, 195, fav_text, YELLOW if favorited else DIM, c565(0x1042), anchor="mm")
-    hw_text(d, cx, 225, "点屏幕任意处关闭", DIM, c565(0x1042), anchor="mm")
+    # 顶栏 38px
+    d.rectangle([0, 0, 479, 37], fill=RADIO_CARD)
+    d.line([0, 38, 479, 38], fill=RADIO_LINE)
+    d.rounded_rectangle([8, 6, 8 + 64, 6 + 26], radius=13, fill=RADIO_SIDE_BG)
+    d.line([20, 19, 25, 14], fill=RADIO_TXT)
+    d.line([20, 19, 25, 24], fill=RADIO_TXT)
+    hw_text(d, 30, 19, "返回", RADIO_TXT, RADIO_SIDE_BG, anchor="lm")
+    hw_text(d, 232, 19, "正在播放", RADIO_ACC, RADIO_CARD, anchor="mm")
+    d.ellipse([232 - 40 - 3, 16, 232 - 40 + 3, 22], fill=RADIO_LIVE_BG)
+    hw_text(d, 441, 15, "★" if favorited else "☆", RADIO_FAV if favorited else RADIO_DIM,
+            RADIO_CARD, anchor="mm")
+    # 主体: L/R 频谱 VU 横条 (30 条 54x4, 自下而上堆叠, 7彩+灰底槽+白峰值, 镜像固件 updateSpectrum)
+    lit_l, lit_r = 22, 18                      # 静态模拟: 播放中 L/R 电平
+    for gx, lit in ((10, lit_l), (404, lit_r)):
+        for i in range(30):
+            y = 256 - 10 - (i + 1) * 5
+            col = _fs_color(i) if i < lit else FS_TRACK_COL
+            d.rounded_rectangle([gx + 6, y, gx + 6 + 54 - 1, y + 4 - 1], radius=2, fill=col)
+        # 峰值余晖: 点亮条顶部 1.6px 白 (镜像固件)
+        py = 256 - 10 - (lit + 1) * 5 + 4 - 1
+        d.rectangle([gx + 6, py, gx + 6 + 54 - 1, py + 1], fill=WHITE)
+    # L/R 声道标签 (设计稿 ch-label, canvas 下方)
+    hw_text(d, 10 + 33, 256 - 4, "L", RADIO_DIM, RADIO_CARD, anchor="mm")
+    hw_text(d, 404 + 33, 256 - 4, "R", RADIO_DIM, RADIO_CARD, anchor="mm")
+    # 台名 16px (字库原生 font16; font24 已清除, 镜像固件 drawStationFullscreen)
+    hw_glyphs(d, 240, 78, st.name, RADIO_TXT, RADIO_CARD, 16, anchor="mm")
+    # 频率 24px + MHz 16px (字库原生字号; 设计稿全屏无 FM 前缀)
+    freq_txt = st.freq if st.freq else "网络电台"
+    if freq_txt.startswith("FM"):
+        freq_txt = freq_txt[2:].strip()
+    hw_glyphs(d, 240, 125, freq_txt, FS_FREQ_COL, RADIO_CARD, 24, anchor="mm")
+    if st.freq:
+        hw_glyphs(d, 240, 136, "MHz", RADIO_ACC, RADIO_CARD, 16, anchor="mm")
+    # meta 行: 地区 tag + 分类 tag
+    my = 158
+    reg = radio_region_name(st)
+    catl = _station_cat(st)
+    labels = [x for x in (reg, catl) if x]
+    mx0 = 240 - (len(labels) * 92) // 2
+    for j, lab in enumerate(labels[:2]):
+        bx = mx0 + j * 92
+        d.rounded_rectangle([bx - 42, my - 2, bx + 42, my + 16], radius=4, fill=FS_TAG_BG)
+        hw_text(d, bx, my + 7, lab[:4], FS_TAG_TX, FS_TAG_BG, anchor="mm")
+    # 控制按钮: 音量− | 播放/暂停 | 音量+ (中心 FS_BTN_Y=200)
+    for bx, r, col in ((168, 22, RADIO_SIDE_BG), (226, 26, RADIO_ACC), (284, 22, RADIO_SIDE_BG)):
+        d.ellipse([bx - r, 200 - r, bx + r, 200 + r], fill=col)
+    d.rectangle([161, 199, 175, 203], fill=RADIO_TXT)                       # − 横
+    d.rectangle([219, 188, 224, 212], fill=RADIO_CARD)                      # ‖ 左
+    d.rectangle([229, 188, 234, 212], fill=RADIO_CARD)                      # ‖ 右
+    d.line([277, 200, 291, 200], fill=RADIO_TXT)                            # + 横
+    d.line([284, 193, 284, 207], fill=RADIO_TXT)                            # + 竖
+    hw_text(d, 240, 234, "100%", RADIO_DIM, RADIO_CARD, anchor="mm")
+    # 底部提示条 30px
+    d.rectangle([0, NAV_Y, 479, NAV_Y + 29], fill=RADIO_CARD)
+    d.line([0, NAV_Y, 479, NAV_Y], fill=RADIO_LINE)
+    hw_text(d, 240, NAV_Y + 15, "双击此处 · 返回列表", RADIO_DIM, RADIO_CARD, anchor="mm")
+
+FS_TRACK_COL = c565(((231 >> 3) << 5) | ((235 >> 2) << 1) | (241 >> 3))   # 未点亮灰底槽 rgba(130,150,185,.2)
+
+def _fs_color(i):
+    """频谱段颜色 (镜像固件 FS_SEGCOLOR 7 彩)."""
+    hues = [(0x00,0xBD,0xD4),(0x4C,0xAF,0x50),(0x8B,0xC3,0x4A),(0xFF,0xC1,0x07),
+            (0xFF,0x98,0x00),(0xF4,0x43,0x36),(0x9C,0x27,0xB0)]
+    r,g,b = hues[min(6, i * 7 // 30)]
+    return c565(((r>>3)<<5)|((g>>2)<<1)|(b>>3))
 
 def draw_radio_scene(cur_cat=0, list_scroll_top=0, region_scroll_top=0,
                     playing_idx=-1, playing=False, favorites=(), fullscreen=False):
-    """收音机页面 (镜像参考项目: 分类侧栏 全部/收藏/历史/个人 + 地区分类, 电台列表, 播放栏, 全屏)."""
+    """收音机页面 (2026-10-22 三分组 + 浅色 + 像素滚动 + 设计稿全屏; 全屏时不画导航栏, 镜像固件)."""
     img = Image.new("RGB", (480, 320), (0, 0, 0))
     d = ImageDraw.Draw(img)
     draw_radio_header(d, cur_cat)
@@ -1354,7 +1501,8 @@ def draw_radio_scene(cur_cat=0, list_scroll_top=0, region_scroll_top=0,
     draw_radio_playbar(d, cur_cat, playing_idx, playing, cur_fav)
     if fullscreen:
         draw_radio_fullscreen(d, cur_cat, playing_idx, cur_fav)
-    draw_nav(d, sel=2)   # 导航栏选中"收音机"
+    else:
+        draw_nav(d, sel=2)   # 导航栏选中"收音机" (全屏页无导航, 镜像固件 modeRadio)
     return img
 
 # 预览日期: 默认取"今天"(与设备 NTP 一致, 方便对照),

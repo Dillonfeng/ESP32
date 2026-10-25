@@ -31,6 +31,76 @@ using weather::WData;
 #define M_PI 3.14159265358979323846
 #endif
 
+// BUILDV5-TZFIX (2026-10-22): 无锁 UTC+8 时间换算, 替代 localtime_r/mktime。
+// 铁证: cap 抓包 Backtrace = modeClock→localtime_r→__tz_lock→lock_acquire→
+// xQueueSemaphoreTake ← esp_crosscore_isr —— newlib tz 锁在 SMP 跨核中断下
+// 会在中断上下文取 FreeRTOS 队列锁 → 崩溃。中国固定 UTC+8 无夏令时,
+// 用纯算术 civil_from_days (Howard Hinnant) 换算, 零锁、任何线程/ISR 安全。
+inline void epochToLocalNoLock(time_t now, struct tm &out) {
+  int64_t s = (int64_t)now + 8LL * 3600;          // UTC+8 本地秒
+  int64_t days = s / 86400;                       // 1970-01-01 起的天数(本地)
+  int64_t sod = s % 86400;
+  out.tm_hour = (int)(sod / 3600);
+  out.tm_min  = (int)((sod % 3600) / 60);
+  out.tm_sec  = (int)(sod % 60);
+  out.tm_wday = (int)((days + 4) % 7);            // 1970-01-01=周四 → +4, 0=周日
+  // civil_from_days (Hinnant): days → y/m/d
+  int64_t z = days + 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  int64_t doe = z - era * 146097;
+  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int64_t y = yoe + era * 400;
+  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  int64_t mp = (5 * doy + 2) / 153;
+  int m1 = (int)(mp + (mp < 10 ? 3 : -9));   // Hinnant: 1-based month (1..12)
+  out.tm_mday = (int)(doy - (153 * mp + 2) / 5 + 1);
+  out.tm_mon  = m1 - 1;                      // tm_mon 须 0-based (0..11)
+  out.tm_year = (int)(y + (m1 <= 2 ? 1 : 0) - 1900);
+}
+// 无锁星期: 0=周日..6=周六 (Hinnant weekday_from_days)
+inline int weekdayFromEpochNoLock(time_t now) {
+  int64_t days = ((int64_t)now + 8LL * 3600) / 86400;
+  return (int)((days + 4) % 7);
+}
+// 无锁 y/m/d → 星期 (0=周日), 替代 mktime+localtime_r (同 tz 锁问题)
+inline int weekdayFromYMD(int y, int m, int d) {
+  y -= (m <= 2);
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  int64_t yoe = y - era * 400;
+  int64_t doy = (int64_t)(153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  int64_t days = era * 146097 + doe - 719468;
+  return (int)(((days + 4) % 7 + 7) % 7);
+}
+// 无锁 y/m/d → 1970-01-01 起天数 (Hinnant days_from_civil)
+inline int64_t daysFromYMD(int y, int m, int d) {
+  y -= (m <= 2);
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  int64_t yoe = y - era * 400;
+  int64_t doy = (int64_t)(153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+// 无锁 days → y/m/d (Hinnant civil_from_days), 结果写 *y*mo*d
+inline void ymdFromDays(int64_t days, int* y, int* mo, int* d) {
+  int64_t z = days + 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  int64_t doe = z - era * 146097;
+  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int64_t yy = yoe + era * 400;
+  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  int64_t mp = (5 * doy + 2) / 153;
+  *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+  int mm = (int)(mp + (mp < 10 ? 3 : -9));
+  yy += (mm <= 2);
+  *y = (int)yy; *mo = mm;
+}
+// 无锁日期±delta天 (替代 mktime+localtime_r 链)
+inline void addDaysNoLock(int* y, int* m, int* d, int delta) {
+  int64_t days = daysFromYMD(*y, *m, *d) + delta;
+  ymdFromDays(days, y, m, d);
+}
+
 #define DEBUG_UI 0
 
 #define I2S_BCK_PIN     6
@@ -41,7 +111,6 @@ using weather::WData;
 
 extern TFT_eSPI tft;
 extern XFont font16;
-extern XFont font24;
 extern XFont font32;
 extern Audio audio;
 
@@ -111,6 +180,11 @@ void saveClockStyle(uint8_t v);
 #define RADIO_SPECIAL_H    28
 #define RADIO_ROW_H_SIDE   26
 #define RADIO_REGION_TOP   (RADIO_HEADER_H + RADIO_SPECIAL_CNT * RADIO_SPECIAL_H)
+// 2026-10-22: 左列分组标题 (设计稿 频道/省市/我的 三分组)。组标题行占 GROUP_H,
+// 行偏移由 sideRowY() 统一计算 (radio_ui.cpp), 绘制/命中/滚动共用。
+#define RADIO_GROUP_H      18
+#define RADIO_GROUP_CNT    3
+#define SIDEBAR_HEAD_H     28     // 2026-10-24: 左列固定头"频道分类" (设计稿 lp-head 28px), 滚动区下移
 #define RADIO_ROW_H        48
 #define RADIO_STATION_ROWS 4
 #define RADIO_FULLSCREEN   1
@@ -143,6 +217,7 @@ struct RadioCat {
   bool meta;
   int  count;
   uint16_t* sids;
+  int  group;            // 2026-10-22: 左列分组 0=频道 1=省市 2=我的 (设计稿三分组)
 };
 extern RadioCat radioCats[RMAX_CATS];
 extern int radioCatCount;
@@ -229,13 +304,18 @@ void playStationAt(int sid);
 void stopRadio();
 void radioPause();               // 暂停 (保留 currentPlayingSid, 播放条可续播)
 void radioToggleMute();          // 静音切换
+void radioVolumeDelta(int d);    // 2026-10-22: 全屏控制按钮 音量±5 (0..21, 解除静音)
 void radioToggleFav(int sid);    // 星标收藏/取消 (NVS 持久化 + 收藏分类实时同步)
 void radioPushHist(int sid);     // 成功起播后自动记历史 (保留最近 30 个, NVS 持久化)
 void radioNvsLoad();             // 开机读回 NVS 收藏/历史
 void buildRadioCats();
+void addSleepStations();            // 2026-10-24 问题①: 追加设计稿"助眠"6 台 (buildRadioCats 前调用)
 const char* radioPinnedKey();
 RadioStation* stn(int sid);
 RadioCat* catv(int i);
+// 左列分组行模型 (radio_ui.cpp): 含组标题行的行偏移/总高, 绘制/命中/滚动共用
+int sideRowTop(int i);
+int sideTotalH();
 int  curCount();
 uint16_t curSidAt(int i);
 RadioStation* curStnAt(int i);

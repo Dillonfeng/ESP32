@@ -64,6 +64,7 @@
 
 ## ⚠️ 务必遵守的约定
 0. **上节"调试铁律"优先**：模拟器与硬件必须互为目标+镜像；硬件做不到的效果不要只在模拟器美化。
+0a. **用户在场且"现场/现象"敏感时（如正在播放、正在断流重现），任何会复位设备的操作（烧录/复位/长按 EN）必须先征得用户同意，或先抓 log 再动设备**（2026-10-24 教训：断流现场未抓 log 就烧录 → 现场破坏 + 中途 TaskStop 烧录留下半写 flash 黑屏）。**烧录一旦开始必须烧完，严禁中途 TaskStop**（esptool 擦写中中断 = flash 部分写入 → 设备黑屏无法启动）。
 1. **`main.cpp` 与 `make_preview.py` 必须 lockstep**：颜色值、月相取模、节气/节日配色、农历逻辑两侧一致，否则预览与实机不符。
 2. **不要运行 `scripts/rebuild_main.py`** — 会覆盖 main.cpp 的手动 split-flap 改动。
 3. 预览用环境变量覆盖 mock 值：
@@ -83,6 +84,37 @@
    - 环境变量 `PREVIEW_TIME=HH:MM:SS` 可指定起始时刻。
 
 ## 已完成 (历史)
+- **收音机全屏字体发虚根治 + 音量粒度细化（2026-10-24；编译 SUCCESS 90.87s，烧录 COM4 SUCCESS 85.48s，lint 0 警告，preview lockstep 完成；待用户实机验收）**：
+  - **用户 2 问题**：① 全屏字体发虚（"把所有的字都用字库里有的字体"）；② 音量调节粒度太粗。
+  - **① 字体发虚根因 = 用了字库没有的字号（缩放/放大路径）**：频率 42px `almBigText`（drawBigChar dst 上限 40 clamp + 16px 源非整倍上采样发虚）、MHz 13px/音量 12px/底部 12px 走 `almScaledText` 面积平均降采样、台名 24px 走 almBigText 回退 font16 放大 24px——全部非字库原生字号。
+  - **font24 已彻底清除（决定性事实）**：`data/font_simhei_24.font` **不存在**（data 只有 16/64）；`XFont font24(&tft)` 定义只存在于 `src/*.bak` 备份；`ui_common.h` L114 `extern XFont font24;` 是清除后残留 → 首次编译 `undefined reference to font24`。**修法 = 台名改 font16 16px 原生 AA + 删除 extern 残留**（不再重建 font24；电台名汉字不在 font32 361 字子集，64px 源缩放会缺字回退 16px 源放大同样发虚）。
+  - **改后字号（全部字库原生）**：台名 `font16` 16px（居中 y=70，fitText 默认 font16 测宽）；频率 `almBigText(240,113,fr,24,...,true)`（**font32 64px 源面积平均下采样，数字清晰**）+ MHz `font16` 16px（240+fw/2+8, 128）；收藏星 `font16` 16px（441-8, 7 顶栏中心 y=15）；音量% `font16` 16px（FS_BTN_Y+26）；底部提示 `font16` 16px（NAV_BAR_Y+7）；播放条音量%（cy-8）/副行"正在播放"（y+25）/"左列选分类"（y+27）；列表行 info `font16` 16px（rowY+26，裁剪 rowY+26..rowY+42）。
+  - **② 音量粒度**：`radioVolumeDelta` 两处 ±5→±1（radio_ui.cpp 播放条+全屏按钮）；范围仍 0..21（显示 % = radioVolume*100/21）；live_preview 音量步进 ±5→±1 同步。
+  - **验证**：`check_hw_patterns.py` R1-R5 0 警告；`pio run` SUCCESS（90.87s，err 仅 weather_ui.cpp 循环变量 warning 无碍）；`flash_font.log` = `Hash of data verified` + `[SUCCESS] 85.48s`（COM4）；preview 出图逐项核对：台名 16px（中心 78）/频率 24px（125）/MHz 16px（136）/100%（234）/底部（305）/★（15）全部正确。
+  - **⚠️ 待用户实机验收**：① 全屏所有字清晰（台名 16px 略小于设计稿 24px 但原生 AA，频率 24px 大数字突出）；② 音量 ±1 档细调；③ 播放条/列表行 info 16px 两行不重叠（48px 行高：台名 +6..+22、info +26..+42）。
+  - **⚠️ 教训**：**extern 声明不产生定义，删定义留 extern → 链接失败**；清字体先查 data/ 文件 + 全工程定义/引用三处一致。preview `hw_glyphs` 是矢量渲染不受字库限制，仅镜像布局字号。
+- **触摸漂移根因根治：SPI 触摸频率 8MHz→2.5MHz + 日期偏移 tm_mon bug（2026-10-24；两次编译+烧录实机验证通过，用户确认"都正常了"）**：
+  - **① 触摸漂移/单双击误判根因 = `SPI_TOUCH_FREQUENCY 8000000` 超 XPT2046 规格**：
+    - **历史**：BUILDV5-TOUCHSPEED 为提速 getTouch（旧架构在 main loop 拖帧率）把 2.5→8MHz。触摸移入独立任务+V3 状态机后提速前提已不成立，但 8MHz 一直留着。
+    - **铁证链**：用户点 30 号正中心(112,189) → 8MHz 下 `press(115,175) raw(2240,1184)`：**y 偏上 14px**（raw rx=2240 vs 期望 2419，偏 179 ADC）；校准中心残差 devY=-111 raw（≈8px）；30 号格子 y=174..204 仅 30px 高 → 点 30 号常被识别成 23 号（r3）。**降回 2.5MHz 后** `press(107,187) raw(2405,1122)`：**y 只差 2px，30 号正确命中**。x 方向基本准（107 vs 112）。
+    - **根因**：XPT2046 手册串行时钟上限 2.5MHz（TFT_eSPI 默认 2500000）；8MHz 超规格 → ADC 转换建立不足 → **raw 系统性偏低（Y 通道尤甚）→ 屏幕中下部坐标偏上 8~14px** → 30px 高格子跨行误判 + 抖动影响单双击。
+    - **修法**：`include/User_Setup.h` `#define SPI_TOUCH_FREQUENCY 2500000`（保留 8MHz 注释 + 还原对照说明）。**教训：改动"提速"类参数前先查外设数据手册规格上限；性能前提消失后要回退实验参数。**
+  - **② 日期显示 +1 月（10/24 显示 11/24）= `epochToLocalNoLock` 的 tm_mon 存了 1-based 月份**：
+    - **铁证（PC 复算）**：2026-10-24 00:00 UTC epoch=1792800000 → days=20750 → civil_from_days：yoe=26, y=2026, doy=237, mp=7 → Hinnant `m = mp+(mp<10?3:-9) = 10` **是 1-based 月份**；代码直接存入 `tm_mon`（须 0-based）→ 调用方 `tm_mon+1` 显示 11 月。
+    - **修法**（`src/ui_common.h` L55-57）：`int m1 = mp+(mp<10?3:-9); out.tm_mon = m1-1; out.tm_year = y+(m1<=2?1:0)-1900;`（年修正用 1-based m1 判断，与 Hinnant `y+=(m<=2)` 一致——原代码用误存值判断碰巧对）。
+    - **审计**：全部 9 处 `tm_mon` 调用方均 `tm_mon+1`（0-based 约定）✓；`ymdFromDays`（*mo 1-based 返回）无此问题；`weekdayFromYMD/daysFromYMD` 入参 1-based 正确。
+    - **⚠️ 教训：移植 Hinnant civil_from_days 时，`m` 是 1-based，存 tm 结构必须 -1；年份修正判断也用 1-based 的 m。**
+  - **调试过程沉淀**：触摸排查完整链路 = 校准 raw 审计（4 角线性好但中心残差 -111）→ 对比 press raw vs 物理位置（决定性）→ 查采样参数超规格。**新工具 `scripts/_read_serial.py`（纯读串口不复位，参数 port seconds）**：_run_cap.py 每次硬复位设备（用户体验差），纯读模式保留现场抓点击 log。
+- **收音机 UI 三问题对齐设计稿（2026-10-22；build_ui6 SUCCESS 65.55s，lint R1-R5 0 警告；preview lockstep 完成，未烧录实机）**：
+  - **用户 3 问题**：① 左列无"我的"类别及子菜单；② 双击电台全屏播放页与设计稿不一致；③ 右列电台列表滚动方式（行索引跳变）与左列（像素 1:1 跟手）不一致。设计稿 = https://4m5gmbx3ra8da.doubao.link/app/app_17g7jt0w5v1（已下载源码 `D:\ESP32-S3\design_ref\index.html` + `app.zip`）。
+  - **宏统一（前置根因）**：main.cpp 与 ui_common.h **重复定义同一批 RADIO_* 布局宏且值不同**（main 旧值 70/28/80/45/22/24 vs ui_common 新 150/24/48/48/28/26）→ 绘制区与触摸命中区错位（"选不中/不灵敏"布局层根因）。修：删 main.cpp 全部重复 RADIO_* + ANALOG_FRAME_MS，唯一权威 ui_common.h。
+  - **① 左列三分组**：RadioCat 加 `int group`（0=频道 1=省市 2=我的）；ui_common.h 加 `RADIO_GROUP_H 18 / RADIO_GROUP_CNT 3` + sideRowTop/sideTotalH 声明。buildRadioCats 重排（radio_db.cpp）：组0 全国+中央/国际/海外 → 组1 置顶省(RPINNED"广东")+RORDER[33省]+"其它" → 组2 收藏→个人(extra is_user)→伴音(电视伴音 label"伴音")→历史。drawRadioRegionSidebar 画组标题（GNAMES[]={"频道","省市","我的"}，C_GROUP 弱化色；**组标题行区域 = 分类行顶边之上 GROUP_H**：`gy=top+sideRowTop(i)-RADIO_GROUP_H`）；handleRadioTap 侧栏命中逐分类行 sideRowTop 比对（组标题不可点）。
+  - **② 全屏对齐设计稿**：radioVolumeDelta(int d)（0..21，自动解除静音）；频谱 L/R 竖条（FS_SEG_N=30/FS_X_L=10/FS_X_R=404/FS_BASE_Y=256/FS_MAX_H=160，7 彩段自下而上 + 峰值余晖）；顶栏38px（返回 chip / "正在播放"直播点 / 收藏星 drawFsFavChip）；台名 24px + **频率 42px（RGBC(0x16,0x24,0x3F)）+MHz** + meta tag（RGBC(0xEA,0xF1,0xFA)/0x4A5F87）+ 三按钮（FS_BTN_Y=200，−/播放暂停/音量+，FS_BTN_DN_X=168/MAIN=226/UP=284，R=22/26）+ 音量% + 底部30px"双击此处 · 返回列表"；命中：返回(8,6..72,32)|收藏星(410,6..472,32)|按钮区|底部双击 300ms lastFsTap 返回，**其余区域不响应**。
+  - **③ 右列像素滚动**：listScrollTop 语义改"像素偏移"。drawRadioList：pixOff=listScrollTop%ROW_H、startRow=/ROW_H、顶半行 first=startRow-1、底半行 last=startRow+ROWS、drawStationRow(rowY) 带 clipY0/c1 半行裁剪（TFT_eSPI **无 setClipRect**，手动裁剪）；命中 rowIdx=(listScrollTop+(ty-LIST_TOP))/ROW_H；drawRadioScrollbar 像素（totalPix=count*ROW_H、thumbH=max(24,listH*listH/totalPix)）；拖动 1:1 像素 + 吸附 snap=(listScrollTop+ROW_H/2)/ROW_H*ROW_H。
+  - **⚠️ sideTotalH 越界 bug（本次发现并修）**：旧 `sideRowTop(radioCatCount)` 读残留槽 group（越界，多算 1 个组标题 18px）。修 = `if(count<=0)return 0; i=count-1; return sideRowTop(i)+行高(i)`。preview side_total_h 同款正确公式。
+  - **preview lockstep 全量完成**：make_preview.py 常量改浅色（**精确 565 值由 RGBC 换算**：C_SIDE 0xECF0F4→0xEF9E / C_ACCBG 0xE1F3FA→0xE79F / C_LINE 0xE5E7EB→0xE73D / C_ACC 0x0E97C4→0x0CB8 / C_TXT 0x1F2937→0x1946 / C_DIM 0x6B7280→0x6B90 / C_FAV 0xE39A1B→0xE4C3 / C_LIVE 0xE5484D→0xE249 / C_GROUP 0x9AA5B0→0x9D36 / C_THUMB 0xC4CCD4→0xC67A / C_BG 0xF6F8FA→0xF7DF；**g 通道必须 <<5**）；三分组模型（cats 加 group：组0 全国+央/际/海外、组1 置顶+RORDER+其它、组2 收藏/个人/伴音/历史）+ side_row_top/side_total_h（**i 必须 < len(cats)，total 用 i=n-1**）；draw_radio_sidebar 组标题（gy=top+side_row_top(i)-R_GROUP_H）+ R_GROUP_H=18/R_SPECIAL_H=28/R_ROW_H_SIDE=26；draw_radio_station_row clip_y0/c1 半行裁剪 + 直播点/台名/分类·地区（播放中前缀"正在播放 · "）/星标；draw_radio_list 像素滚动；draw_radio_scrollbar 像素（thumbH=24）；draw_radio_header 浅色"网络收音机"+光标+时间|音量%|离线；draw_radio_playbar 新布局（EQ 迷你条|台名/正在播放|音量 icon+%|右缘圆钮）；draw_radio_fullscreen 全新（顶栏/频谱静态竖条/频率42/MHz/meta/三按钮/底部提示；**全屏时不画导航栏**，镜像固件）；live_preview 侧栏/列表命中、拖拽（右列 1:1 像素+吸附、左列 side_row_top/side_total_h）、滚动条跳转像素、全屏命中（返回/收藏/三按钮/底部双击 300ms）、播放条命中（圆钮/音量/台名进全屏）、状态 radio_vol/radio_last_fs_ms。
+  - **验证**：build_ui6 SUCCESS 65.55s（含 sideTotalH 修复）；lint R1-R5 0 警告；py_compile make_preview/live_preview 通过；preview 出图逐图核对：preview_radio_idle 三分组标题"频道/省市"显示 + 浅色列表 + 新播放条；preview_radio_fullscreen 顶栏返回/正在播放/★ + 频谱 + 频率"网络电台"+MHz + 广东/新闻 tag + −/‖/+ 三钮 + 100% + 底部"双击此处·返回列表"。⚠️ PIL：C:\Python314 无 PIL 且 site-packages 只读 → 用 `D:\ESP32-S3\.platformio\penv\Scripts\python.exe -m pip install pillow`（venv 可写），跑 preview 用 platformio 的 python。
+  - **⚠️ 未烧录实机**：COM4 待确认后烧录；待用户验收：三分组显示与组序、"我的"组（收藏/个人/伴音/历史）、全屏布局/双击底部返回/音量±、右列 1:1 跟手滚动与吸附。**"助眠"分类**：stations.bin 无 region，设计稿有示例（雨声/海浪/白噪音），待拍板：占位空分类/暂不加/扩 extra 台。全屏"正在播放"直播点 blink 动效当前静态实现。
 - **黄历弹层 宜/忌"重复项"根治 + 西方节日大数字变红（BUILD23，2026-10-02；编译 SUCCESS RAM 32.3% / Flash 52.3%，实机 boot 验证 BUILD23-YIJI-FEST + [Hol] cached 2025/2026/2027 + Setup done.，无 crash）**：
   - **用户报告 2 个问题**：① "10月28号有两个出行"（宜项重复）；② "西方节日能显示了，为啥没显示节假日颜色"（万圣节等大数字没变红）。
   - **① 宜/忌 重复项（根因 = YI 池含重复项 + 旧 3 连续取法）**：

@@ -115,7 +115,7 @@ void drawCalendar() {
   if (!font16.isReady()) return;
   time_t now = time(nullptr);
   struct tm t;
-  localtime_r(&now, &t);
+  epochToLocalNoLock(now, t);   // BUILDV5-TZFIX: 无锁 UTC+8
   int ty = t.tm_year + 1900, tmn = t.tm_mon + 1, td = t.tm_mday;
   if (calYear <= 0) { calYear = ty; calMon = tmn; }
   if (calSelY <= 0) { calSelY = ty; calSelM = tmn; calSelD = td; }   // 默�?��?�中今天
@@ -150,20 +150,8 @@ void drawCalendar() {
   bool leap = (calYear % 4 == 0 && calYear % 100 != 0) || (calYear % 400 == 0);
   if (calMon == 2 && leap) dim = 29;
   calDim = dim;
-  // 该月 1 号的星期 (0=周日), �?mktime 计算, 跨月/跨年都�?��??
-  int firstW = 0;
-  {
-    struct tm t1;
-    memset(&t1, 0, sizeof(t1));
-    t1.tm_year = calYear - 1900;
-    t1.tm_mon = calMon - 1;
-    t1.tm_mday = 1;
-    t1.tm_isdst = -1;
-    time_t tt1 = mktime(&t1);
-    struct tm t1l;
-    localtime_r(&tt1, &t1l);
-    firstW = t1l.tm_wday;   // 0=Sun
-  }
+  // 该月 1 号的星期 (0=周日), 无锁算法, 跨月/跨年都正确
+  int firstW = weekdayFromYMD(calYear, calMon, 1);   // BUILDV5-TZFIX: 替代 mktime+localtime_r
   calFirstW = firstW;
   char dn[3];
   for (int day = 1; day <= dim; day++) {
@@ -393,11 +381,7 @@ static void almBigNum(int x0, int y0, int day, uint16_t col) {
 // ---- almanac festival box: whole contiguous holiday run shares one festival name ----
 // (Spring Festival run 2/15-23 all show "chunjie"; National Day 10/1-7 all show "guoqingjie".)
 static void almAddDay(int* y, int* m, int* d, int delta) {
-  struct tm t; memset(&t, 0, sizeof(t));
-  t.tm_year = *y - 1900; t.tm_mon = *m - 1; t.tm_mday = *d; t.tm_isdst = -1;
-  time_t tt = mktime(&t) + (long)delta * 86400L;
-  struct tm r; localtime_r(&tt, &r);
-  *y = r.tm_year + 1900; *m = r.tm_mon + 1; *d = r.tm_mday;
+  addDaysNoLock(y, m, d, delta);   // BUILDV5-TZFIX: 无锁, 替代 mktime+localtime_r (tz锁×跨核中断崩溃)
 }
 
 static bool almRealFest(int y, int m, int d, char* f, int fsz) {
@@ -490,11 +474,7 @@ static void drawAlmPopup(int y, int m, int d) {
 
   char lcol_main[16]; snprintf(lcol_main, sizeof(lcol_main), "%s月%s", lunarMonths[lm - 1], lunarDays[ldn - 1]);
 
-  struct tm t0; memset(&t0, 0, sizeof(t0)); t0.tm_year = y - 1900; t0.tm_mon = m - 1; t0.tm_mday = d; t0.tm_isdst = -1;
-
-  time_t tt0 = mktime(&t0); struct tm tl; localtime_r(&tt0, &tl);
-
-  const char* wday = weekHdr[tl.tm_wday];
+  const char* wday = weekHdr[weekdayFromYMD(y, m, d)];   // BUILDV5-TZFIX: 无锁星期, 替代 mktime+localtime_r
 
   char yistr[8]; snprintf(yistr, sizeof(yistr), "%d", y);
 
@@ -579,7 +559,7 @@ static void drawAlmPopup(int y, int m, int d) {
     int _htd = holiday::dayType(y, m, d);
     if (_htd == HOL_OFF || _htd == HOL_WORK) numCol = ALM_RED;   // 放假/补班 -> 红
     else if (fest[0]) numCol = ALM_RED;                          // BUILD23: 任何节日(含西方 万圣节/黑五/母亲节...) -> 红 (镜像 preview fest)
-    else if (tl.tm_wday == 0 || tl.tm_wday == 6) numCol = ALM_WKND;
+    else if (weekdayFromYMD(y, m, d) == 0 || weekdayFromYMD(y, m, d) == 6) numCol = ALM_WKND;   // BUILDV5-TZFIX: 无锁星期
     else numCol = ALM_JI;
   }
   almBigText(LC, 122, String(lcol_main), 24, numCol, ALM_PAPER, true);
@@ -709,7 +689,7 @@ void handleCalendarTap(uint16_t tx, uint16_t ty) {
         Serial.printf("calendar almanac -> %d-%d-%d\n", calYear, calMon, day);
       } else {
         calSelY = calYear; calSelM = calMon; calSelD = day;   // single tap = select
-        time_t now2 = time(nullptr); struct tm tt2; localtime_r(&now2, &tt2);
+        time_t now2 = time(nullptr); struct tm tt2; epochToLocalNoLock(now2, tt2);   // BUILDV5-TZFIX
         redrawCalSelection(tt2.tm_year + 1900, tt2.tm_mon + 1, tt2.tm_mday);   // partial: no full flash
         Serial.printf("calendar sel -> %d-%d-%d\n", calYear, calMon, day);
       }
@@ -725,7 +705,7 @@ void handleCalendarTap(uint16_t tx, uint16_t ty) {
       if (tx >= btX - 2 && tx < btX + btW + 2) {
         time_t now = time(nullptr);
         struct tm t;
-        localtime_r(&now, &t);
+        epochToLocalNoLock(now, t);   // BUILDV5-TZFIX
         calYear = t.tm_year + 1900; calMon = t.tm_mon + 1;
         calSelY = calYear; calSelM = calMon; calSelD = t.tm_mday;
         drawCalendar();
@@ -765,7 +745,7 @@ void handlePickerTap(uint16_t tx, uint16_t ty) {
         // 选中日默�? 今天�?在月 -> 今天; 否则 -> 1�?
         time_t now = time(nullptr);
         struct tm t;
-        localtime_r(&now, &t);
+        epochToLocalNoLock(now, t);   // BUILDV5-TZFIX: 无锁
         int ty = t.tm_year + 1900, tmn = t.tm_mon + 1, td = t.tm_mday;
         if (ty == calYear && tmn == calMon) { calSelY = calYear; calSelM = calMon; calSelD = td; }
         else { calSelY = calYear; calSelM = calMon; calSelD = 1; }
