@@ -1,9 +1,10 @@
-#include "ui_common.h"
+﻿#include "ui_common.h"
+#include "sd_storage.h"   // 项目数据: SD 优先 / LittleFS 回退
 
 String readURLForSid(int sid) {
   RadioStation* s = stn(sid); if (!s) return "";
   if (s->in_bin) {
-    File f = LittleFS.open("/stations.bin", "r"); if (!f) return "";
+    File f = sdstore::openRead("/stations.bin"); if (!f) return "";
     f.seek(s->url_offset);
     uint8_t nl = f.read(); f.seek(f.position() + nl);
     uint16_t ul = f.read() | (f.read() << 8);
@@ -13,7 +14,7 @@ String readURLForSid(int sid) {
   int ei = (int)s->url_offset; return (ei >= 0 && ei < extraUrlCount) ? String(extraUrl[ei]) : String();
 }
 bool loadRadioDB() {
-  File f = LittleFS.open("/stations.bin", "r");
+  File f = sdstore::openRead("/stations.bin");
   if (!f) { Serial.println(F("stations.bin not found!")); return false; }
   uint8_t magic[9]; f.read(magic, 8); magic[8] = 0;
   if (strcmp((char*)magic, "ESP32RDB") != 0 || f.read() != 2) { Serial.println(F("bad format")); f.close(); return false; }
@@ -31,7 +32,10 @@ bool loadRadioDB() {
     f.seek(f.position() + 6);
   }
   regionCount = numRegions;
-  Serial.printf("stations.bin: %d regions, %lu stations\n", numRegions, numStations);
+  Serial.printf("stations.bin: %d regions, %lu stations, size=%u B, 1st region '%s' off=%u cnt=%u\n",
+                numRegions, numStations, (unsigned)f.size(),
+                regionEntries[0].name, (unsigned)regionEntries[0].first_offset,
+                (unsigned)regionEntries[0].count);
   f.close(); return true;
 }
 // ---- 定位省份(完整名) -> regionCat 键: geo::pinned() 非空则用之, 否则退回 RPINNED(兜底"广东")。
@@ -114,7 +118,7 @@ void buildRadioCats() {
   addCat(RLBL[2], RLBL[2], true, histSids, histCount, 2); // 历史
 }
 bool loadRadioMeta() {
-  File f = LittleFS.open("/radio_meta.bin", "r");
+  File f = sdstore::openRead("/radio_meta.bin");
   if (!f) { Serial.println(F("radio_meta.bin not found")); return false; }
   uint8_t magic[9]; f.read(magic, 8); magic[8] = 0;
   if (strcmp((char*)magic, "ESP32RDT") != 0 || f.read() != 1) { Serial.println(F("radio_meta bad")); f.close(); return false; }
@@ -144,7 +148,7 @@ bool loadRadioMeta() {
   for (int i = 0; i < histCnt; i++) hist[i] = f.read() | (f.read() << 8);
   radioStnTotal = 0;
   for (uint16_t ri = 0; ri < regionCount && radioStnTotal < RMAX_STN; ri++) {
-    File sf = LittleFS.open("/stations.bin", "r"); if (!sf) break;
+    File sf = sdstore::openRead("/stations.bin"); if (!sf) break;
     sf.seek(regionEntries[ri].first_offset);
     for (uint16_t c = 0; c < regionEntries[ri].count && radioStnTotal < RMAX_STN; c++) {
       uint32_t recStart = sf.position();
@@ -239,20 +243,21 @@ void radioPushHist(int sid) {
   buildRadioCats();                     // 历史分类实时同步
 }
 void radioPause() {   // 暂停: 停流但保留 currentPlayingSid, 播放条 ▶ 可续播同一台
+  Serial.printf("[RADIO] pause cur=%d pending=%d\n", currentPlayingSid, pendingPlaySid);
   radioPlaying = false;
   audio.stopSong();
-  digitalWrite(STATUS_LED_PIN, LOW);
+  STATUS_LED_OFF();
 }
 void radioToggleMute() {
   radioMuted = !radioMuted;
   audio.setVolume(radioMuted ? 0 : (uint8_t)radioVolume);
   Serial.printf("[RADIO] mute -> %d (vol=%d)\n", radioMuted, radioVolume);
 }
-void radioVolumeDelta(int d) {   // 2026-10-22: 全屏音量±按钮 (0..21, 调音量自动解除静音)
+void radioVolumeDelta(int d) {   // 2026-10-28: 全屏音量±按钮 (0..RADIO_VOL_MAX=64, 每步±1≈1.6%, 调音量自动解除静音)
   radioMuted = false;
   int nv = radioVolume + d;
   if (nv < 0) nv = 0;
-  if (nv > 21) nv = 21;
+  if (nv > RADIO_VOL_MAX) nv = RADIO_VOL_MAX;
   radioVolume = nv;
   audio.setVolume((uint8_t)radioVolume);
   Serial.printf("[RADIO] vol -> %d\n", radioVolume);
@@ -266,9 +271,15 @@ void playStationAt(int sid) {
   // audio.connecttohost() 阻塞(连流要几秒), 若点下就立刻连会吞掉双击窗口,
   // 使"双击正在播放的电台"的第二下被当成新单击, 打不开播放界面(全屏)。
   musicPlaying = false;               // 点电台 -> 停掉节日音乐 (收音机优先)
+  Serial.printf("[RADIO] play req sid=%d cur=%d playing=%d pending=%d now=%lu\n",
+                sid, currentPlayingSid, radioPlaying, pendingPlaySid, (unsigned long)millis());
+  // 2026-10-28 修复: 同一台已在等待起播时, 不重置 pendingPlayAt ——
+  // 否则用户单击后 600ms 内(双击窗口外)连点同台, 每次都会重置计时器 -> 永不 flush -> 不播放
+  // (表现为"按钮一直是播放图标" + "环球资讯不播放")
+  if (pendingPlaySid == sid) return;
   pendingPlaySid = sid; pendingPlayAt = millis();
 }
-void stopRadio() { radioPlaying = false; audio.stopSong(); currentPlayingSid = -1; digitalWrite(STATUS_LED_PIN, LOW); }  // BUILDV5-NETTASK: 先停泵再停流
+void stopRadio() { radioPlaying = false; audio.stopSong(); currentPlayingSid = -1; STATUS_LED_OFF(); }  // BUILDV5-NETTASK: 先停泵再停流
 
 
 

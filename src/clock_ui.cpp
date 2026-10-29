@@ -1,4 +1,23 @@
 #include "ui_common.h"
+#include "gy39.h"
+
+// 2026-10-25: 日期条温湿度来源 —— GY-39 本地传感优先, 其次天气缓存, 最后 mock。
+static void envTempHum(int& t, int& h) {
+  const gy39::Data& g = gy39::get();
+  if (g.ok) {
+    t = (int)lroundf(g.tempC);
+    h = (int)lroundf(g.humidity);
+    return;
+  }
+  const WData& w = weather::get();
+  if (w.ok) {
+    t = (int)lroundf(w.temp);
+    h = w.humidity;
+    return;
+  }
+  t = mockTempC;
+  h = mockHumidity;
+}
 
 // ========== 时钟模块内部状态 (BUILD61: 从 main.cpp 拆出) ==========
 static uint16_t *analogFace = nullptr;
@@ -665,6 +684,30 @@ void drawMoonIcon(int cx, int cy, int R, double phase) {
   tft.drawCircle(cx, cy, R, MOON_EDGE);
 }
 
+// 日期条第2行右侧: 湿度 + 温度 (右对齐)。
+// 独立成函数, 便于秒级局部刷新(只擦这一小块, 不整条重绘 -> 不闪)。
+// s_envLeft 记录上次温度文本左缘, 旧值更宽时也能擦干净。
+static int s_envLeft = 10000;
+static void drawEnvCells(int x1, int cy2) {
+  int envT = 0, envH = 0;
+  envTempHum(envT, envH);                              // GY-39 优先
+  if (envT < -40) envT = -40; if (envT > 99) envT = 99;
+  if (envH < 0) envH = 0;     if (envH > 100) envH = 100;
+  char hms[10], tms[10];
+  snprintf(hms, sizeof(hms), "%d%%", envH);
+  snprintf(tms, sizeof(tms), "%d°C", envT);
+  int hR   = x1 - 12;
+  int wH   = font16.textWidth(hms), wT = font16.textWidth(tms);
+  int tR   = hR - wH - 8;
+  int left = tR - wT;
+  int clrL = (s_envLeft < left) ? s_envLeft : left;
+  if (clrL < hR - 120) clrL = hR - 120;   // 限制擦除宽度, 不盖到左侧节气/月相长文本
+  tft.fillRect(clrL - 1, ROW2_TOP + 1, (hR + 2) - (clrL - 1), ROW2_H - 2, DATE_STRIP);
+  font16.drawStringFast(hR - wH, cy2 - 8, hms, humidColor(envH), DATE_STRIP);
+  font16.drawStringFast(tR - wT, cy2 - 8, tms, tempColor(envT), DATE_STRIP);
+  s_envLeft = left;
+}
+
 // 日期�? 两�?�布�?
 //   �?: �?�?+星期 | 农历+干支
 //   �?: 节气(当前/下一+天数) | 月相(图标+名称)
@@ -746,16 +789,11 @@ static void drawDateRow(int year, int mon, int mday, int wday) {
   } else {
     font16.drawStringFast(tx, cy2 - 8, "--", SOFT_C, DATE_STRIP);
   }
-  // 右侧: 湿度 | 温度 | 月相�?| 月相图标 (�?右向�?, �?make_preview.py draw_date �?�?
+  // 右侧: 湿度 | 温度 (从右向左) + 月相名 + 月相图标
   int mi = (int)(mp * 8.0 + 0.5) % 8;
-  char hms[8], tms[8];
-  snprintf(hms, sizeof(hms), "%d%%", mockHumidity);
-  snprintf(tms, sizeof(tms), "%d°C", mockTempC);
-  int hR = x1 - 12;                                   // 湿度右缘
-  font16.drawStringFast(hR - font16.textWidth(hms), cy2 - 8, hms, humidColor(mockHumidity), DATE_STRIP);
-  int tR = hR - font16.textWidth(hms) - 8;           // 温度右缘
-  font16.drawStringFast(tR - font16.textWidth(tms), cy2 - 8, tms, tempColor(mockTempC), DATE_STRIP);
-  int mR = tR - font16.textWidth(tms) - 8;           // 月相名右�?
+  drawEnvCells(x1, cy2);
+
+  int mR = s_envLeft - 8;                            // 月相名右缘 (温度左缘再左移 8px)
   int mTw = font16.textWidth(nl_moon_text[mi]);
   font16.drawStringFast(mR - mTw, cy2 - 8, nl_moon_text[mi], 0xDE72, DATE_STRIP);  // 淡金
   int R = 9;
@@ -931,6 +969,21 @@ void modeClock() {
   if (mday != lastDay || mon != lastMon || year != lastYear) {
     lastDay = mday; lastMon = mon; lastYear = year;
     drawDateRow(year, mon, mday, wday);
-    checkFestivalMusic(year, mon, mday);   // 跨日 -> �?查节�?节气音乐
+    checkFestivalMusic(year, mon, mday);   // 跨日 -> 检查节日/节气音乐
+  }
+
+  // GY-39 温湿度整数值变化时局部刷新 (原 30s 节流 -> 太迟钝; 现 2s 内即时刷新,
+  // 只重绘温湿度小块, 不整条重绘 -> 既快又不闪)
+  static unsigned lastEnvSeq = 0xFFFFFFFFu;
+  static uint32_t lastEnvMs = 0;
+  unsigned envSeq = gy39::seq();
+  if (envSeq != lastEnvSeq && millis() - lastEnvMs >= 2000) {
+    lastEnvSeq = envSeq;
+    lastEnvMs = millis();
+    if (!modeChanged) {
+      tft.startWrite();
+      drawEnvCells(DATE_RIGHT, ROW2_TOP + ROW2_H / 2);
+      tft.endWrite();
+    }
   }
 }

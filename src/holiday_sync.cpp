@@ -7,6 +7,7 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include "holiday_sync.h"
+#include "sd_storage.h"   // 节假日缓存: SD 优先 / LittleFS 回退
 #include "ui_common.h"   // BUILDV5-TZFIX: epochToLocalNoLock
 
 namespace holiday {
@@ -91,7 +92,7 @@ void loadAllYears() {
   for (int y = curYear - 1; y <= curYear + 1; y++) {
     char path[24];
     snprintf(path, sizeof(path), "/holidays_%d.json", y);
-    File f = LittleFS.open(path, "r");
+    File f = sdstore::openRead(path);
     if (!f) continue;
     if (f.size() > 16000) { f.close(); continue; }   // 异常大文件忽略
     String data = f.readString();
@@ -133,7 +134,8 @@ void doPendingSyncs() {
 } // anon
 
 void init() {
-  fsReady = LittleFS.begin();   // 幂等: setup 里已挂载则立即返回 true
+  bool lfs = LittleFS.begin();   // 幂等: setup 里已挂载则立即返回 true
+  fsReady = lfs || sdstore::mounted();   // SD 挂载成功也可作为缓存载体
   struct tm t;
   time_t now = time(nullptr);
   if (now > 1000000000) {

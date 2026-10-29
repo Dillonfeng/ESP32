@@ -557,14 +557,18 @@ def main():
         if rdrag["on"]:
             rdrag["on"] = False
             if rdrag["zone"] == "side":
-                # 吸附: 视口顶所在行的行顶对齐视口顶 (镜像 main.cpp sideRowTop, 避免停在半行)
+                # 2026-10-29 吸附到底修正 (与固件 main.cpp 同步):
+                # 已滚到内容底(smax 半行内)直接停到底, 否则最后分类(历史)拖不到底总退回
                 total_h = mp.side_total_h()
                 smax = max(0, total_h - (mp.NAV_Y - (mp.R_HEADER_H + mp.R_HEAD_H2)))
-                snap = 0
-                for k in range(len(_cats0)):
-                    if mp.side_row_top(k) <= radio_region_scroll[0]:
-                        snap = mp.side_row_top(k)
-                radio_region_scroll[0] = min(snap, smax)
+                if radio_region_scroll[0] >= smax - 13:
+                    radio_region_scroll[0] = smax
+                else:
+                    snap = 0
+                    for k in range(len(_cats0)):
+                        if mp.side_row_top(k) <= radio_region_scroll[0]:
+                            snap = mp.side_row_top(k)
+                    radio_region_scroll[0] = min(snap, smax)
             elif rdrag["zone"] == "list":
                 # 2026-10-22 问题③: 右列释放吸附到行顶 (与左侧一致)
                 sts = _radio_stations(radio_cat[0])

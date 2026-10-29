@@ -84,6 +84,28 @@
    - 环境变量 `PREVIEW_TIME=HH:MM:SS` 可指定起始时刻。
 
 ## 已完成 (历史)
+- **全屏三问题终修：连点同台重置计时器（按钮恒▶+环球不播放）+ 音量%间距 + L/R 避让（2026-10-28 三批；编译 SUCCESS 67.23s 增量，烧录 COM4 SUCCESS 84.62s，lint 0 警告，preview lockstep 核对通过；待用户实机验收）**：
+  - **用户 3 问题**：① 音量%和播放键距离"没变"；② 能暂停了但播放/暂停按钮不变（一直显示播放图标）；③ 单击双击逻辑"整个都乱了"，环球资讯直接不播放。
+  - **②③ 根因（同一处）= `playStationAt`（radio_db.cpp L264）连点同台时每次 `pendingPlayAt = millis()` 重置计时器**：用户单击电台后需等 `RADIO_PLAY_FLUSH_MS(600)` 才 flush 连流；若 600ms 内（双击窗口 500ms 之外）再点同一台，`pendingPlayAt` 被重置 → `modeRadio()` flush 条件 `millis()-pendingPlayAt>=600` 永不满足 → `pendingPlaySid` 永不消费 → 永不 `connecttohost` → `radioPlaying` 恒 false → **主按钮恒画 ▶ + 环球资讯不播放 + "单击双击乱"（点了有重绘反应但不出声）**。修法 = `playStationAt` 开头（`currentPlayingSid==sid && radioPlaying` 早退之后）加 **`if (pendingPlaySid == sid) return;`**——同一台已在等待起播时不重置计时器，让 flush 正常到期连流；换台（pendingPlaySid 不同）仍重置。
+  - **① 音量%间距"没变"根因 = 上轮 +26→+30 只下移 4px（主按钮底 226 vs 音量% 顶 230 仅 4px）**：修法 = 音量% `FS_BTN_Y+30→+36`（顶 236，距主按钮底 226 共 **10px 明显可见**）；L/R 标签 `FS_BASE_Y+4→+8`（中心 264，与音量%底 252 间距 4px、与底部提示 288 间距 16px）。preview lockstep：音量中心 238→244、L/R 中心 260→264。
+  - **验证**：lint 0 警告；py_compile 过；preview 出图 OCR 核对（主按钮底 218 → 音量% 顶 230 → **12px 间距**、L/R 中心 272、chips 中心 151 全部拉开）；编译 SUCCESS 67.23s（radio_db.cpp + radio_ui.cpp + preview 三处增量）；烧录 SUCCESS 84.62s COM4。
+  - **⚠️ 待用户实机验收**：① 单击电台 600ms 内连点同台也能正常起播（不再"点了没声"）；② 全屏/播放条按钮随暂停/恢复正确切换 ‖/▶；③ 音量% 与主按钮明显分开、L/R 不压音量%；④ 双击打开全屏后点主按钮能正常恢复播放（回归确认 600ms flush 恢复链路）。
+  - **⚠️ 教训**：**"点击没反应/按钮状态不变"先查延迟起播链路的计时器重置**——任何"连点会重新计时"的逻辑（`pendingPlayAt=millis()` 无条件重置）都会在用户无反馈连点下陷入"永不触发"；同目标应幂等返回不重置。**"间距没变"的布局微调必须按像素算净距**（+4px 在 480×320 屏上肉眼不可感知，主按钮底到音量顶净距 ≤4px 等于没改）。
+- **音量"仍步进5"根治：音频库档位 21→64 + 全屏 MHz 与频率重叠修复（2026-10-28；编译 SUCCESS 772.88s 全量，烧录 COM4 SUCCESS 80.81s，lint 0 警告，preview lockstep；待用户实机验收）**：
+  - **用户反馈**：① 上一轮已把 ±5→±1，但实机音量仍"步进5"；② 全屏播放布局互相覆盖。
+  - **① 音量根因 = 音频库总档位只有 21**（`radioVolume*100/21` ≈ 4.76%/档 → 显示取整 5% 步进）：`legacy\ESP32-audioI2S` `Audio.h` L518-519 `m_vol=21/m_vol_steps=21` 默认；`Audio.cpp` `setVolumeSteps(steps)` 设 `m_vol_steps`、`setVolume(vol)` 钳到 `m_vol_steps`、音量曲线 `pow(m_vol,2)/pow(m_vol_steps,2)` 平方。**±5→±1 只改了步长参数，没改总档位 → 每档仍 4.76%**。
+  - **修法（档位 21→64，每步 ≈1.6%）**：ui_common.h 加 `#define RADIO_VOL_MAX 64`；main.cpp setup `audio.setVolumeSteps(RADIO_VOL_MAX)` + `radioVolume=RADIO_VOL_MAX; audio.setVolume(RADIO_VOL_MAX)`（初始 30≈47%）；radio_db.cpp `radioVolumeDelta` 钳位 0..RADIO_VOL_MAX；radio_ui.cpp 全部 4 处 `*100/21` → `*100/RADIO_VOL_MAX`。live_preview 范围保持 0..100（±1 已改）。
+  - **② 全屏覆盖根因 = 频率 24px（almBigText 顶 113 → 底 137）与 MHz（font16 顶 128）重叠 9px**：修法 = MHz `y 128→117`（垂直居中于频率行 113+12-8）；preview lockstep 用 `aa_text_width(freq)*24//16` 算频率宽、MHz `anchor="lm"` 放 `(240+fw//2+8, 125)` 同行。
+  - **验证**：lint 0 警告；py_compile 通过；preview 出图核对"网络电台"+"MHz"同行右缘不重叠（OCR：频率 390,340..557,420 / MHz 577,354..667,407）；编译 SUCCESS 772.88s（⚠️ 首次 Start-Process 编译失败 `Git not found in PATH` → 先 `$env:Path="C:\Program Files\Git\bin;"+$env:Path` 再 Start-Process，且 CMake 重配置触发全量编译 ~13min）；烧录 SUCCESS 80.81s `Hash of data verified`。
+  - **⚠️ 待用户实机验收**：① 音量 ±1 每步 ~1.6%（播放条/全屏按钮，音量% 每按变 1-2%）；② 全屏频率+MHz 同行不重叠；③ 初始音量 ~47% 与原 48% 相当。
+  - **⚠️ 教训**：**"步进粗"先查总档位而不是步长参数**（±1 但 21 档 = 每档 4.76% 仍粗）；音频库音量上限由 `setVolumeSteps` 控制，改档位必须 `setVolumeSteps` + 全部 `*100/21` 引用同步。**Git 在 `C:\Program Files\Git\bin` 但不在默认 PATH**，Start-Process 跑 pio 前必须手动拼入。
+- **全屏三问题：暂停无法恢复 + 音量%贴按钮 + meta 标签压按钮（2026-10-28 二批；编译 SUCCESS 68.47s 增量，烧录 COM4 SUCCESS 84.29s，lint 0 警告，preview lockstep；待用户实机验收）**：
+  - **用户 3 问题**：① 播放/暂停按钮能暂停但无法恢复播放；② 音量数字与播放按钮靠太近；③ "中央 新闻" meta 标签覆盖播放按钮上方，要求统一布局。
+  - **① 暂停无法恢复根因 = `modeRadio()`（radio_ui.cpp L85）flush 连流条件含 `!showingFullscreen`**：全屏内点主按钮 → `radioPause()` 停流 → 再点 → `playStationAt()` 设 `pendingPlaySid` → 但 flush 被 `!showingFullscreen` 挡住 → **pendingPlaySid 永不消费 → 无法恢复**。修法 = **去掉 `!showingFullscreen`**（列表双击打开全屏时会显式 `pendingPlaySid=-1` 取消，无双击冲突）；全屏内恢复同样等 `RADIO_PLAY_FLUSH_MS(600)` 后连流。
+  - **② 布局统一（全屏纵排重排）**：meta chips `my 158→146`（底 162 vs 按钮顶 174，间距 12px）；音量% `FS_BTN_Y+26→+30`（顶 230 底 246）；L/R 标签 `FS_BASE_Y-4→+4`（中心 260，与音量% 间距 6px、与底部提示 20px）。preview lockstep 三处同步（my 146 / 音量中心 238 / L-R 中心 260）。
+  - **验证**：lint 0 警告；py_compile 过；preview 出图核对 chips(中心150)/音量%(233)/L-R(260) 全部拉开；编译 SUCCESS 68.47s（仅 radio_ui.cpp 增量）；烧录 SUCCESS 84.29s `Hash of data verified`。
+  - **⚠️ 待用户实机验收**：① 全屏内点 ‖ 暂停 → 再点恢复播放（不再无法恢复）；② 音量% 与主按钮、meta chips 与按钮间距正常；③ 列表页单击→双击→全屏恢复正常（回归确认去 !showingFullscreen 无副作用）。
+  - **⚠️ 教训**：**全屏内"恢复播放"也走延迟起播路径**——凡 `pendingPlaySid` 的消费者条件含"不在全屏"就会在全屏内断掉恢复链路；去掉条件前确认双击打开全屏路径会显式取消 pending（L306 `pendingPlaySid=-1`）。
 - **收音机全屏字体发虚根治 + 音量粒度细化（2026-10-24；编译 SUCCESS 90.87s，烧录 COM4 SUCCESS 85.48s，lint 0 警告，preview lockstep 完成；待用户实机验收）**：
   - **用户 2 问题**：① 全屏字体发虚（"把所有的字都用字库里有的字体"）；② 音量调节粒度太粗。
   - **① 字体发虚根因 = 用了字库没有的字号（缩放/放大路径）**：频率 42px `almBigText`（drawBigChar dst 上限 40 clamp + 16px 源非整倍上采样发虚）、MHz 13px/音量 12px/底部 12px 走 `almScaledText` 面积平均降采样、台名 24px 走 almBigText 回退 font16 放大 24px——全部非字库原生字号。

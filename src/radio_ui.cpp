@@ -1,4 +1,4 @@
-#include "ui_common.h"
+﻿#include "ui_common.h"
 
 // ============================================================================
 // 收音机 UI -- 2026-10-20 按 doubao app_17g7jt0w5v1 设计稿重构 (浅色主题)
@@ -12,8 +12,32 @@
 int radioFailCnt = 0;        // 起播连接失败计数 (3 次彻底停)
 uint32_t radioWasRunAt = 0;  // watchdog timer base
 
+// ===== 2026-10-29 帧缓冲方案回退 (直绘) =====
+// 花屏 regression: BISECT-1 推常量纯色无条纹 => pushImage 分块链路正常, 但恢复 memcpy 读 g_fb 后花屏。
+// 为最快消除 regression, 直接回退帧缓冲: fb* 原语全部改直绘 tft (调用点不动),
+// xfont compositeGlyph 的 s_fbTarget 恒 null 自动走 pushImage 直推。代价: 拖动闪烁(问题①)回到旧状态。
+static void fbEnsure() { }
+static void fbBegin() { }
+static void fbEnd() { }
+static inline void fbFillRect(int x, int y, int w, int h, uint16_t c) {
+  if (w <= 0 || h <= 0) return;
+  int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+  int x1 = x + w, y1 = y + h; if (x1 > 480) x1 = 480; if (y1 > NAV_BAR_Y) y1 = NAV_BAR_Y;
+  if (x1 <= x0 || y1 <= y0) return;
+  tft.fillRect(x0, y0, x1 - x0, y1 - y0, c);
+}
+static inline void fbHLine(int x, int y, int w, uint16_t c) { fbFillRect(x, y, w, 1, c); }
+static inline void fbVLine(int x, int y, int h, uint16_t c) { fbFillRect(x, y, 1, h, c); }
+static inline void fbPixel(int x, int y, uint16_t c) {
+  if (x < 0 || x >= 480 || y < 0 || y >= NAV_BAR_Y) return; tft.drawPixel(x, y, c);
+}
+static inline void fbCircle(int x, int y, int r, uint16_t c) { tft.fillCircle(x, y, r, c); }
+// 帧缓冲推屏不再需要 (绘制已直推屏幕); 保留空实现避免调用点改动
+static void fbPushRect(int sx, int sy, int w, int h) { (void)sx; (void)sy; (void)w; (void)h; }
+
 void updateSpectrum();    // 全屏 VU 表刷新 (后文定义)
 void refreshMiniEq();     // 播放条均衡器动画 (后文定义)
+static void drawFsVolumeLabel();  // 全屏音量%局部刷新 (后文定义, handleRadioTap 提前调用)
 
 // ===== 设计稿浅色配色 =====
 #define RGBC(r,g,b) ((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3))
@@ -34,9 +58,9 @@ static const uint16_t C_WIFI   = RGBC(0x2E,0x8B,0x57);   // WiFi 绿
 // ===== 全屏控制按钮 (2026-10-22 设计稿: − / 播放暂停 / +) =====
 // 定义在此供 handleRadioTap 与 drawStationFullscreen 共用
 #define FS_BTN_Y   200
-#define FS_BTN_DN_X 168
-#define FS_BTN_MAIN_X 226
-#define FS_BTN_UP_X 284
+#define FS_BTN_DN_X 182
+#define FS_BTN_MAIN_X 240
+#define FS_BTN_UP_X 298
 #define FS_BTN_R   22
 #define FS_BTN_MAIN_R 26
 static unsigned long lastFsTap = 0;   // 全屏底部提示条双击返回判定
@@ -67,13 +91,46 @@ void pumpRadio() {
   if (audio.isRunning()) radioWasRunAt = millis();
   else if (millis() - radioWasRunAt > 8000) {
     stopRadio();
-    Serial.println("[RADIO] stream dead >8s -> stopped");
+    // 2026-10-28: 断流自动取证 —— 停流瞬间 dump 缓冲水位/堆, 事后看 log 即可定位 (无需现场抓包)
+    ringLog("[RADIO] stream dead >8s -> stopped buff_f=%u buff_free=%u heap=%u psram=%u",
+            (unsigned)audio.inBufferFilled(), (unsigned)audio.inBufferFree(),
+            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+    Serial.printf("[RADIO] stream dead >8s -> stopped buff_f=%u buff_free=%u heap=%u psram=%u\n",
+                  (unsigned)audio.inBufferFilled(), (unsigned)audio.inBufferFree(),
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+    dumpRing();
+    saveStallDump("stream dead");
     return;
   }
+  // 2026-10-28 死流 watchdog: isRunning true 但数据不推进 (缓冲水位+播放时间戳 8s 无变化)
+  // = audio.loop 卡死在网络锁 (streamDetection connected() lwip 锁), 传统 8s/30s watchdog 失效
+  // → 强制 stopSong 打断锁等待, 自动重连当前台
+  static uint32_t s_lastProgMs = 0; static uint32_t s_lastT = 0; static uint32_t s_lastFill = 0; static bool s_progInit = false;
+  uint32_t nowMs = millis();
+  uint32_t fill = audio.inBufferFilled();
+  uint32_t tNow = audio.getAudioCurrentTime();
+  if (!s_progInit) { s_lastProgMs = nowMs; s_lastT = tNow; s_lastFill = fill; s_progInit = true; }
+  else if (tNow == s_lastT && fill == s_lastFill && nowMs - s_lastProgMs > 8000) {
+    ringLog("[RADIO] dead-flow buff_f=%u t=%u -> restart sid=%d",
+            (unsigned)fill, (unsigned)tNow, currentPlayingSid);
+    Serial.printf("[RADIO] dead-flow buff_f=%u t=%u -> restart sid=%d\n",
+                  (unsigned)fill, (unsigned)tNow, currentPlayingSid);
+    int sid = currentPlayingSid;
+    dumpRing();
+    saveStallDump("dead-flow");
+    stopRadio();
+    s_progInit = false;
+    if (sid >= 0) playStationAt(sid);   // 自动重连 (走延迟起播 flush 链路)
+    return;
+  }
+  if (tNow != s_lastT || fill != s_lastFill) { s_lastProgMs = nowMs; s_lastT = tNow; s_lastFill = fill; }
   // BUILD16 watchdog: "connected but silent" (isRunning true 但 30s 无解码输出 = 毒流)
   if (millis() - radioWasRunAt > 30000 && audio.getAudioCurrentTime() == 0) {
     stopRadio();
+    ringLog("[RADIO] no audio output >30s after connect -> stopped");
     Serial.println("[RADIO] no audio output >30s after connect -> stopped");
+    dumpRing();
+    saveStallDump("no-audio-30s");
     return;
   }
 }
@@ -81,9 +138,12 @@ void pumpRadio() {
 void modeRadio() {
   if (!radioInited) return;
 
-  // 延迟起播刷入: 双击窗口(RADIO_DBL_MS)已关闭且未进入全屏 -> 真正连流
-  if (pendingPlaySid >= 0 && !showingFullscreen && millis() - pendingPlayAt >= RADIO_PLAY_FLUSH_MS) {
+  // 延迟起播刷入: 双击窗口(RADIO_DBL_MS)已关闭 -> 真正连流
+  // 2026-10-28 修复: 去掉 !showingFullscreen —— 全屏内点主按钮"恢复播放"时 pendingPlaySid 同样要能被消费,
+  // 旧条件在全屏内永不 flush -> 暂停后无法恢复。列表页双击打开全屏时会显式 pendingPlaySid=-1 取消。
+  if (pendingPlaySid >= 0 && millis() - pendingPlayAt >= RADIO_PLAY_FLUSH_MS) {
     int sid = pendingPlaySid; pendingPlaySid = -1;
+    Serial.printf("[RADIO-FLUSH] sid=%d playing=%d full=%d now=%lu\n", sid, radioPlaying, showingFullscreen, (unsigned long)millis());
     RadioStation* s = stn(sid);
     if (s) {
       String url = readURLForSid(sid);
@@ -99,15 +159,22 @@ void modeRadio() {
           radioFailCnt = 0;
           radioWasRunAt = millis();
           radioPushHist(sid);              // 设计稿: 历史自动记录 (含收藏分类重建)
-          digitalWrite(STATUS_LED_PIN, HIGH);
+          STATUS_LED_ON();
+          // 2026-10-28 修复: 恢复播放瞬间强制重绘全屏 —— 旧实现 flush 成功后 radioPlaying=true
+          // 但 modeDrawn 仍 true(起播重绘发生在 connect 前, 按钮画的是▶), 按钮一直停在播放图标,
+          // 只有点音量键等触发重绘才更新为‖ (用户实测"点音量键状态才恢复")
+          if (showingFullscreen) modeDrawn[MODE_RADIO] = false;
         } else {
           radioFailCnt++;
           Serial.printf("[RADIO] connect FAILED (try %d/3)\n", radioFailCnt);
           if (radioFailCnt >= 3) {
             radioFailCnt = 0;
             radioPlaying = false; currentPlayingSid = -1;
-            if (!musicPlaying) digitalWrite(STATUS_LED_PIN, LOW);
+            if (!musicPlaying) STATUS_LED_OFF();
             Serial.println("[RADIO] 3x connect failed -> stopped");
+            // 3x 失败后 stn(-1) 会让 drawStationFullscreen 自动退出全屏(L665), 但 modeDrawn 仍是
+            // true -> 列表不重绘, 残留全屏画面。强制重绘列表 + 导航。
+            modeDrawn[MODE_RADIO] = false; navDirty = true;
           }
         }
         listScrollDirty = true;
@@ -136,8 +203,9 @@ void modeRadio() {
   if (tmv.tm_min != s_lastMin) { s_lastMin = tmv.tm_min; drawRadioHeader(); }
 
   // 2026-09-27: 侧栏/列表局部刷新, startWrite/endWrite 包整段 (硬件反模式 R1)
-  if (sideScrollDirty) { tft.startWrite(); drawRadioRegionSidebar(); tft.endWrite(); sideScrollDirty = false; }
-  if (listScrollDirty) { tft.startWrite(); drawRadioList(); drawRadioPlayBar(); tft.endWrite(); listScrollDirty = false; }
+  // 2026-10-29: 滚动区已改帧缓冲合成 -> 函数内部自含 startWrite+分块推屏, 无需外层包裹
+  if (sideScrollDirty) { drawRadioRegionSidebar(); sideScrollDirty = false; }
+  if (listScrollDirty) { drawRadioList(); drawRadioPlayBar(); listScrollDirty = false; }
 
   // 播放条迷你均衡器动画 (~8fps, 只刷 40x30 小区)
   static unsigned long s_eqLast = 0;
@@ -222,22 +290,28 @@ void handleRadioTap(uint16_t tx, uint16_t ty) {
   if (showingFullscreen) {
     // 返回 chip (左上 8,6..72,32)
     if (tx >= 8 && tx <= 72 && ty >= 6 && ty <= 32) {
-      showingFullscreen = false; modeDrawn[MODE_RADIO] = false; return;
+      Serial.printf("[RADIO-TAP] fs back\n");
+      showingFullscreen = false; modeDrawn[MODE_RADIO] = false; navDirty = true; return;
     }
     // 收藏星 (右上 410,6..472,32)
     if (tx >= 410 && tx <= 472 && ty >= 6 && ty <= 32) {
+      Serial.printf("[RADIO-TAP] fs fav sid=%d\n", currentPlayingSid);
       radioToggleFav(currentPlayingSid);
       modeDrawn[MODE_RADIO] = false; return;
     }
     // 控制按钮: 音量− | 播放/暂停 | 音量+ (中心 FS_BTN_Y=200)
     if (ty >= FS_BTN_Y - FS_BTN_MAIN_R - 4 && ty <= FS_BTN_Y + FS_BTN_MAIN_R + 4) {
       if (tx >= FS_BTN_DN_X - FS_BTN_R - 6 && tx <= FS_BTN_DN_X + FS_BTN_R + 6) {
-        radioVolumeDelta(-1); modeDrawn[MODE_RADIO] = false; return;
+        Serial.printf("[RADIO-TAP] fs vol-\n");
+        radioVolumeDelta(-1); drawFsVolumeLabel(); return;   // 只刷音量% (频谱柱由 updateSpectrum 每帧自更新)
       }
       if (tx >= FS_BTN_UP_X - FS_BTN_R - 6 && tx <= FS_BTN_UP_X + FS_BTN_R + 6) {
-        radioVolumeDelta(1); modeDrawn[MODE_RADIO] = false; return;
+        Serial.printf("[RADIO-TAP] fs vol+\n");
+        radioVolumeDelta(1); drawFsVolumeLabel(); return;
       }
       if (tx >= FS_BTN_MAIN_X - FS_BTN_MAIN_R - 4 && tx <= FS_BTN_MAIN_X + FS_BTN_MAIN_R + 4) {
+        Serial.printf("[RADIO-TAP] fs main playing=%d cur=%d pending=%d\n",
+                      radioPlaying, currentPlayingSid, pendingPlaySid);
         if (radioPlaying) radioPause();
         else if (currentPlayingSid >= 0) playStationAt(currentPlayingSid);
         modeDrawn[MODE_RADIO] = false; return;
@@ -246,10 +320,12 @@ void handleRadioTap(uint16_t tx, uint16_t ty) {
     // 底部提示条 (NAV_BAR_Y..NAV_BAR_Y+30): 双击返回 (设计稿 fs-hint)
     if (ty >= NAV_BAR_Y && ty < NAV_BAR_Y + 30) {
       unsigned long now = millis();
-      if (now - lastFsTap < 300) { lastFsTap = 0; showingFullscreen = false; modeDrawn[MODE_RADIO] = false; }
+      Serial.printf("[RADIO-TAP] fs hint now=%lu last=%lu d=%lu\n", now, lastFsTap, now - lastFsTap);
+      if (now - lastFsTap < 300) { lastFsTap = 0; showingFullscreen = false; modeDrawn[MODE_RADIO] = false; navDirty = true; }
       else lastFsTap = now;
       return;
     }
+    Serial.printf("[RADIO-TAP] fs ignored tx=%d ty=%d\n", tx, ty);
     return;   // 其余区域不响应 (设计稿: 只有控件可点)
   }
   if (ty < RADIO_HEADER_H) return;                    // 状态栏
@@ -326,7 +402,7 @@ void drawRadioHeader() {
   int x = 474 - font16.textWidth(buf);
   font16.drawString(x, 4, buf, C_TXT, C_CARD);
   char vb[10];
-  if (radioMuted) strcpy(vb, "静音"); else snprintf(vb, sizeof(vb), "%d%%", radioVolume * 100 / 21);
+  if (radioMuted) strcpy(vb, "静音"); else snprintf(vb, sizeof(vb), "%d%%", radioVolume * 100 / RADIO_VOL_MAX);
   x -= (font16.textWidth(vb) + 10);
   font16.drawString(x, 4, vb, radioMuted ? C_LIVE : C_DIM, C_CARD);
   const char* wt = wifiConnected ? "WiFi" : "离线";
@@ -357,7 +433,7 @@ static void drawSideIcon(int x, int y, int icon, uint16_t fg, uint16_t bg) {
   for (int r = 0; r < 8; r++) {
     uint8_t row = SIDE_ICON[icon][r];
     for (int c = 0; c < 8; c++)
-      if (row & (0x80 >> c)) tft.drawPixel(x + c, y + r, fg);
+      if (row & (0x80 >> c)) fbPixel(x + c, y + r, fg);   // 2026-10-29: 帧缓冲输出 (拖动防闪烁)
   }
 }
 static int catIconIndex(const char* key, int grp) {
@@ -375,12 +451,17 @@ static int catIconIndex(const char* key, int grp) {
 }
 
 void drawRadioRegionSidebar() {
-  tft.fillRect(0, RADIO_HEADER_H, RADIO_SIDEBAR_W, NAV_BAR_Y - RADIO_HEADER_H, C_SIDE);
-  int S = regionScrollTop;
-  int top = RADIO_HEADER_H + SIDEBAR_HEAD_H - S;
-  // 固定头 "频道分类" (设计稿 lp-head 28px, 弱化字色) + 下分隔线
+  Serial.printf("[SIDE] catCnt=%d scroll=%d cur=%d special=%d\n", radioCatCount, regionScrollTop, currentCat, RADIO_SPECIAL_CNT);
+  // 固定头 "频道分类" (设计稿 lp-head 28px, 弱化字色) + 下分隔线 —— 不滚动, 直绘屏幕
+  tft.fillRect(0, RADIO_HEADER_H, RADIO_SIDEBAR_W, SIDEBAR_HEAD_H, C_SIDE);
   font16.drawString(10, RADIO_HEADER_H + (SIDEBAR_HEAD_H - 16) / 2, "频道分类", C_DIM, C_SIDE);
   tft.drawFastHLine(0, RADIO_HEADER_H + SIDEBAR_HEAD_H - 1, RADIO_SIDEBAR_W - 1, C_LINE);
+  // 2026-10-29 BUILDV5-FB: 滚动区整列帧缓冲合成 -> 单次分块推屏 (拖动防闪烁)
+  fbBegin();
+  fbFillRect(0, RADIO_HEADER_H + SIDEBAR_HEAD_H, RADIO_SIDEBAR_W,
+             NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H), C_SIDE);
+  int S = regionScrollTop;
+  int top = RADIO_HEADER_H + SIDEBAR_HEAD_H - S;
   // 组标题 (频道/省市/我的): 每组首个分类前一行, 弱化字色
   const char* GNAMES[RADIO_GROUP_CNT] = { "频道", "省市", "我的" };
   for (int i = 0; i < radioCatCount; i++) {
@@ -391,7 +472,7 @@ void drawRadioRegionSidebar() {
       int gy0 = (gy > RADIO_HEADER_H + SIDEBAR_HEAD_H) ? gy : RADIO_HEADER_H + SIDEBAR_HEAD_H;
       int gy1 = (gy + RADIO_GROUP_H - 1 < NAV_BAR_Y - 1) ? gy + RADIO_GROUP_H - 1 : NAV_BAR_Y - 1;
       if (gy1 >= gy0) {
-        tft.fillRect(0, gy0, RADIO_SIDEBAR_W - 2, gy1 - gy0 + 1, C_SIDE);
+        fbFillRect(0, gy0, RADIO_SIDEBAR_W - 2, gy1 - gy0 + 1, C_SIDE);
         int g = radioCats[i].group;
         const char* gn = (g >= 0 && g < RADIO_GROUP_CNT) ? GNAMES[g] : "";
         font16.drawString(10, gy + (RADIO_GROUP_H - 16) / 2, gn, C_GROUP, C_SIDE);
@@ -405,8 +486,8 @@ void drawRadioRegionSidebar() {
     bool sel = (i == currentCat);
     uint16_t bg = sel ? C_ACCBG : C_SIDE;
     uint16_t fg = sel ? C_ACC : C_DIM;
-    tft.fillRect(0, y0, RADIO_SIDEBAR_W - 2, fy1 - y0 + 1, bg);
-    if (sel) tft.fillRect(0, y0, 3, fy1 - y0 + 1, C_ACC);
+    fbFillRect(0, y0, RADIO_SIDEBAR_W - 2, fy1 - y0 + 1, bg);
+    if (sel) fbFillRect(0, y0, 3, fy1 - y0 + 1, C_ACC);
     int tyy = ry + (rh - 16) / 2;
     if (tyy >= y0 && tyy + 15 <= fy1) {
       int ic = catIconIndex(radioCats[i].key, radioCats[i].group);
@@ -427,9 +508,12 @@ void drawRadioRegionSidebar() {
     int thumbH = max(14, viewH * viewH / totalH);
     int smax = totalH - viewH;
     int thumbY = RADIO_HEADER_H + SIDEBAR_HEAD_H + (viewH - thumbH) * regionScrollTop / smax;
-    tft.fillRect(RADIO_SIDEBAR_W - 5, thumbY, 3, thumbH, C_THUMB);
+    fbFillRect(RADIO_SIDEBAR_W - 5, thumbY, 3, thumbH, C_THUMB);
   }
-  tft.drawFastVLine(RADIO_SIDEBAR_W - 1, RADIO_HEADER_H + SIDEBAR_HEAD_H, NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H), C_LINE);
+  fbVLine(RADIO_SIDEBAR_W - 1, RADIO_HEADER_H + SIDEBAR_HEAD_H, NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H), C_LINE);
+  fbEnd();
+  fbPushRect(0, RADIO_HEADER_H + SIDEBAR_HEAD_H, RADIO_SIDEBAR_W,
+             NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H));
 }
 
 // ============================================================
@@ -437,25 +521,26 @@ void drawRadioRegionSidebar() {
 // ============================================================
 static void drawRadioSubHeader() {
   int x = RADIO_LIST_X, w = RADIO_LIST_W;
-  tft.fillRect(x, RADIO_HEADER_H, w, RADIO_SUBHDR_H, C_CARD);
+  fbFillRect(x, RADIO_HEADER_H, w, RADIO_SUBHDR_H, C_CARD);   // 2026-10-29: 帧缓冲输出
   font16.drawStringFast(x + 10, RADIO_HEADER_H + 4, catLabel(currentCat), C_TXT, C_CARD);
   char c[16]; snprintf(c, sizeof(c), "%d 台", curCount());
   int cw = font16.textWidth(c);
   font16.drawStringFast(x + w - 10 - cw, RADIO_HEADER_H + 4, c, C_DIM, C_CARD);
-  tft.drawFastHLine(x, RADIO_LIST_TOP - 1, w, C_LINE);
+  fbHLine(x, RADIO_LIST_TOP - 1, w, C_LINE);
 }
 
 void drawStationRow(int rowY, RadioStation* st, bool playing, bool favorited, int clipY0, int clipY1) {
   // clipY0/clipY1: 该行在屏幕上的可见 y 区间 (已与列表区求交), 用于像素滚动时的半行裁剪
+  // 2026-10-29: 全部输出改帧缓冲 (拖动防闪烁), 坐标不变 (帧缓冲=屏幕坐标)
   if (!st || clipY1 <= clipY0) return;
   int x = RADIO_LIST_X, w = RADIO_LIST_W;
   uint16_t bg = playing ? C_ACCBG : C_CARD;
-  tft.fillRect(x, clipY0, w, clipY1 - clipY0, bg);
+  fbFillRect(x, clipY0, w, clipY1 - clipY0, bg);
   int top = max(rowY, clipY0), bot = min(rowY + RADIO_ROW_H, clipY1);
   if (bot <= top) return;
   // 直播点 (播放中, 设计稿 #E5484D)
   int tx = x + 12;
-  if (playing) { tft.fillCircle(x + 13, rowY + 14, 3, C_LIVE); tx = x + 24; }
+  if (playing) { fbCircle(x + 13, rowY + 14, 3, C_LIVE); tx = x + 24; }
   // 台名 (上) + 分类·地区 (下, 12px 缩放小字)
   if (rowY + 6 >= top && rowY + 18 <= bot)
     font16.drawStringFast(tx, rowY + 6, st->name, C_TXT, bg);
@@ -470,16 +555,20 @@ void drawStationRow(int rowY, RadioStation* st, bool playing, bool favorited, in
   if (rowY + 5 >= top && rowY + 17 <= bot)
     font16.drawStringFast(x + w - 28, rowY + 5, favorited ? "★" : "☆", favorited ? C_FAV : C_DIM, bg);
   if (rowY + RADIO_ROW_H - 1 >= top && rowY + RADIO_ROW_H - 1 < bot)
-    tft.drawFastHLine(x, rowY + RADIO_ROW_H - 1, w, C_LINE);
+    fbHLine(x, rowY + RADIO_ROW_H - 1, w, C_LINE);
 }
 
 void drawRadioList() {
+  // 2026-10-29 BUILDV5-FB: 子标题+列表+滚动条整列帧缓冲合成 -> 单次分块推屏 (拖动防闪烁)
+  fbBegin();
   drawRadioSubHeader();
   int x = RADIO_LIST_X, y = RADIO_LIST_TOP, w = RADIO_LIST_W, h = RADIO_LIST_H;
-  tft.fillRect(x, y, w, h, C_CARD);
+  fbFillRect(x, y, w, h, C_CARD);
   int count = curCount();
   if (count == 0) {
     font16.drawStringFast(x + w / 2 - 56, y + h / 2 - 8, "该分类暂无电台", C_DIM, C_CARD);
+    fbEnd();
+    fbPushRect(x, RADIO_HEADER_H, w, RADIO_LIST_BOT - RADIO_HEADER_H);
     return;
   }
   // 2026-10-22 问题③: listScrollTop 为"像素偏移" (与左列 regionScrollTop 一致的 1:1 跟手).
@@ -497,6 +586,8 @@ void drawRadioList() {
                    curSidAt(i) == currentPlayingSid && radioPlaying, isFavSid(curSidAt(i)), c0, c1);
   }
   drawRadioScrollbar();
+  fbEnd();
+  fbPushRect(x, RADIO_HEADER_H, w, RADIO_LIST_BOT - RADIO_HEADER_H);
 }
 
 void drawRadioScrollbar() {
@@ -507,7 +598,7 @@ void drawRadioScrollbar() {
   int scrollPixMax = totalPix - listH;
   int thumbH = max(24, listH * listH / totalPix);
   int thumbY = RADIO_LIST_TOP + (listH - thumbH) * listScrollTop / scrollPixMax;
-  tft.fillRect(RADIO_LIST_X + RADIO_LIST_W - 4, thumbY, 3, thumbH, C_THUMB);
+  fbFillRect(RADIO_LIST_X + RADIO_LIST_W - 4, thumbY, 3, thumbH, C_THUMB);   // 2026-10-29: 帧缓冲
 }
 
 // ============================================================
@@ -542,7 +633,7 @@ static void drawVolumeCtl(int x, int y, int h) {
     tft.drawLine(x + 12, cy - 7, x + 22, cy + 7, C_LIVE);
   }
   char vb[10];
-  if (radioMuted) strcpy(vb, "静音"); else snprintf(vb, sizeof(vb), "%d%%", radioVolume * 100 / 21);
+  if (radioMuted) strcpy(vb, "静音"); else snprintf(vb, sizeof(vb), "%d%%", radioVolume * 100 / RADIO_VOL_MAX);
   font16.drawString(x + 26, cy - 8, vb, radioMuted ? C_LIVE : C_DIM, C_CARD);   // 16px 原生
 }
 void drawRadioPlayBar() {
@@ -611,7 +702,7 @@ void updateSpectrum() {   // 仅全屏时由 modeRadio 调用 (~25fps 节流)
   float tr = g_vuR / 28000.0f; g_vuR = 0; if (tr > 1) tr = 1; tr = sqrtf(tr);
   s_smL = (tl > s_smL) ? tl : s_smL - 0.05f; if (s_smL < 0) s_smL = 0;   // 攻击瞬时/释放缓
   s_smR = (tr > s_smR) ? tr : s_smR - 0.05f; if (s_smR < 0) s_smR = 0;
-  float gain = radioPlaying ? (radioVolume * 100 / 21) / 100.0f : 0.0f;  // 暂停/音量0 → VU 熄灭
+  float gain = radioPlaying ? (radioVolume * 100 / RADIO_VOL_MAX) / 100.0f : 0.0f;  // 暂停/音量0 → VU 熄灭
   int litL = (int)(s_smL * FS_VU_N * gain + 0.5f); if (litL > FS_VU_N) litL = FS_VU_N; if (litL < 0) litL = 0;
   int litR = (int)(s_smR * FS_VU_N * gain + 0.5f); if (litR > FS_VU_N) litR = FS_VU_N; if (litR < 0) litR = 0;
   tft.startWrite();
@@ -647,6 +738,14 @@ static void drawFsFavChip() {
   font16.drawString(441 - 8, 7, fav ? "★" : "☆", fav ? C_FAV : C_DIM, C_CARD);   // 16px 原生 (顶栏中心 y=15)
 }
 
+// 2026-10-28 修复: 音量± 只局部重绘音量% (不整屏刷新; 频谱柱由 updateSpectrum 每帧随音量增益自更新)
+static void drawFsVolumeLabel() {
+  char vb[8]; snprintf(vb, sizeof(vb), "%d%%", radioVolume * 100 / RADIO_VOL_MAX);
+  const char* vtx = radioMuted ? "静音" : vb;
+  tft.fillRect(240 - 44, FS_BTN_Y + 36 - 1, 88, 18, C_BG);   // 清旧文本区 (88px 覆盖 "100%"/"静音")
+  font16.drawString(240 - font16.textWidth(vtx) / 2, FS_BTN_Y + 36, vtx, radioMuted ? C_LIVE : C_DIM, C_BG);
+}
+
 void drawStationFullscreen() {
   tft.fillRect(0, 0, 480, NAV_BAR_Y, C_BG);
   RadioStation* st = (currentPlayingSid >= 0) ? stn(currentPlayingSid) : nullptr;
@@ -670,28 +769,43 @@ void drawStationFullscreen() {
   String nm(st->name); fitText(nm, 280);
   font16.drawString(240 - font16.textWidth(nm.c_str()) / 2, 70, nm, C_TXT, C_BG);
   // 频率 24px (font32 64px 源含全部 ASCII 数字, 面积平均下采样清晰) + MHz 16px (字库原生字号; 无 FM 前缀)
+  // 2026-10-28 三批: "频率+MHz" 作为整体左右居中 (旧实现频率中心=240, MHz 附右侧 -> 整体右偏 ~17px)
   String fr = st->freq[0] ? String(st->freq) : String("网络电台");
   if (fr.startsWith("FM")) fr = fr.substring(2);
   fr.trim();
   String frUn = st->freq[0] ? "MHz" : "";
-  int fw = almBigText(240, 113, fr, 24, RGBC(0x16,0x24,0x3F), C_BG, true);
-  if (frUn.length())
-    font16.drawString(240 + fw / 2 + 8, 128, frUn, C_ACC, C_BG);
-  // meta 行: 地区 tag / 分类 tag / 网络 (12px)
-  int my = 158;
-  int mx = 240;
-  const char* reg = regionNameOf(st);
-  if (reg && reg[0]) {
-    int rw = font16.textWidth(reg);
-    tft.fillRoundRect(mx - rw / 2 - 8, my - 2, rw + 16, 18, 4, RGBC(0xEA,0xF1,0xFA));
-    font16.drawStringFast(mx - rw / 2, my, reg, RGBC(0x4A,0x5F,0x87), RGBC(0xEA,0xF1,0xFA));
-    mx += rw / 2 + 8 + 22;
+  // 频率宽 (与 almBigText 内部 total 一致: ASCII adv=dst*7/10=16, CJK adv=dst=24)
+  int fw = 0;
+  for (unsigned i = 0; i < fr.length(); i++) {
+    uint8_t c0 = fr[i];
+    if (c0 < 0x80) fw += 16;              // dst*7/10 = 24*7/10 = 16
+    else { fw += 24; i += 2; }            // CJK 3 字节
   }
+  int mhzW = frUn.length() ? font16.textWidth("MHz") : 0;
+  int totalW = fw + (mhzW ? 8 + mhzW : 0);
+  int xFreq = 240 - totalW / 2 + fw / 2;   // 频率中心 (整体居中)
+  int xMHz  = 240 - totalW / 2 + fw + 8;   // MHz 左缘
+  almBigText(xFreq, 113, fr, 24, RGBC(0x16,0x24,0x3F), C_BG, true);
+  if (mhzW)
+    font16.drawString(xMHz, 117, frUn, C_ACC, C_BG);   // MHz 垂直居中于 24px 频率行 (113+12-8)
+  // meta 行: 地区 tag / 分类 tag (12px) — 2026-10-28 三批: 双 chip 整体左右居中 (旧实现首 chip 中心=240 -> 整体右偏)
+  int my = 146;
+  const char* reg = regionNameOf(st);
   const char* cat = stationCatLabel(st);
-  if (cat && cat[0] && strcmp(cat, reg) != 0) {
-    int cw2 = font16.textWidth(cat);
-    tft.fillRoundRect(mx - cw2 / 2 - 8, my - 2, cw2 + 16, 18, 4, RGBC(0xEA,0xF1,0xFA));
-    font16.drawStringFast(mx - cw2 / 2, my, cat, RGBC(0x4A,0x5F,0x87), RGBC(0xEA,0xF1,0xFA));
+  if (cat && (!cat[0] || (reg && strcmp(cat, reg) == 0))) cat = nullptr;
+  int rw = reg ? font16.textWidth(reg) : 0;
+  int cw = cat ? font16.textWidth(cat) : 0;
+  int gap = 16;
+  int cTotal = (reg ? rw + 16 : 0) + (cat ? gap + (cw + 16) : 0);
+  int mx = 240 - cTotal / 2;               // 整体左缘
+  if (reg) {
+    tft.fillRoundRect(mx, my - 2, rw + 16, 18, 4, RGBC(0xEA,0xF1,0xFA));
+    font16.drawStringFast(mx + 8, my, reg, RGBC(0x4A,0x5F,0x87), RGBC(0xEA,0xF1,0xFA));
+    mx += rw + 16 + gap;
+  }
+  if (cat) {
+    tft.fillRoundRect(mx, my - 2, cw + 16, 18, 4, RGBC(0xEA,0xF1,0xFA));
+    font16.drawStringFast(mx + 8, my, cat, RGBC(0x4A,0x5F,0x87), RGBC(0xEA,0xF1,0xFA));
   }
   // 控制按钮: 音量− | 播放/暂停 | 音量+
   tft.fillCircle(FS_BTN_DN_X, FS_BTN_Y, FS_BTN_R, C_CARD);
@@ -706,15 +820,13 @@ void drawStationFullscreen() {
     tft.fillTriangle(FS_BTN_MAIN_X - 8, FS_BTN_Y - 12, FS_BTN_MAIN_X + 10, FS_BTN_Y, FS_BTN_MAIN_X - 8, FS_BTN_Y + 12, TFT_WHITE);
   }
   tft.fillCircle(FS_BTN_UP_X, FS_BTN_Y, FS_BTN_R, C_CARD);
-  tft.drawLine(FS_BTN_UP_X - 7, FS_BTN_Y, FS_BTN_UP_X + 7, FS_BTN_Y, C_TXT);
-  tft.drawLine(FS_BTN_UP_X, FS_BTN_Y - 7, FS_BTN_UP_X, FS_BTN_Y + 7, C_TXT);
-  // 音量% 16px (字库原生; 主按钮下方)
-  char vb[8]; snprintf(vb, sizeof(vb), "%d%%", radioVolume * 100 / 21);
-  const char* vtx = radioMuted ? "静音" : vb;
-  font16.drawString(240 - font16.textWidth(vtx) / 2, FS_BTN_Y + 26, vtx, radioMuted ? C_LIVE : C_DIM, C_BG);
-  // L/R 声道标签 (设计稿 ch-label, canvas 下方)
-  font16.drawString(FS_X_L + 30, FS_BASE_Y - 4, "L", C_DIM, C_BG);
-  font16.drawString(FS_X_R + 30, FS_BASE_Y - 4, "R", C_DIM, C_BG);
+  tft.fillRect(FS_BTN_UP_X - 7, FS_BTN_Y - 1, 14, 3, C_TXT);   // + 横 (3px, 与 − 号 14×3 一致)
+  tft.fillRect(FS_BTN_UP_X - 1, FS_BTN_Y - 7, 3, 14, C_TXT);   // + 竖 (3px)
+  // 音量% 16px (字库原生; 主按钮下方 — 2026-10-28 二批: +30→+36, 与主按钮底(226)拉开 10px 明显可见)
+  drawFsVolumeLabel();
+  // L/R 声道标签 (设计稿 ch-label, canvas 下方 — 2026-10-28 二批: +4→+8 中心 264, 避让下移的音量%)
+  font16.drawString(FS_X_L + 30, FS_BASE_Y + 8, "L", C_DIM, C_BG);
+  font16.drawString(FS_X_R + 30, FS_BASE_Y + 8, "R", C_DIM, C_BG);
   // ---- 频谱: L/R VU 横条 ----
   fsResetSpectrum();
   // ---- 底部提示条: "双击此处 · 返回列表" (16px 原生) ----

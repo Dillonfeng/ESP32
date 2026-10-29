@@ -10,6 +10,10 @@
 // ============================================================
 // 构造与析构
 // ============================================================
+// 2026-10-29 BUILDV5-FB: 帧缓冲输出模式静态成员定义 (nullptr=默认推屏幕)
+uint16_t* XFont::s_fbTarget = nullptr;
+int       XFont::s_fbW = 0;
+int       XFont::s_fbH = 0;
 
 XFont::XFont(TFT_eSPI* tft)
     : _tft(tft)
@@ -799,7 +803,22 @@ void XFont::compositeGlyph(int x, int y, int idx, uint16_t fg, uint16_t bg) cons
                                   ((bb * (255 - m) + fb * m) / 255);
         }
     }
-    _tft->pushImage(x, y, 16, 16, _buf);
+    // 2026-10-29 BUILDV5-FB: 帧缓冲输出模式 (radio 列表拖动防闪烁)。
+    // s_fbTarget 非空时字形像素写入帧缓冲 (坐标=缓冲内屏幕坐标, 裁剪到行宽),
+    // 否则推屏幕 (默认, 全项目其他绘制路径不变)。
+    if (XFont::s_fbTarget) {
+        for (int oy = 0; oy < 16; oy++) {
+            int yy = y + oy;
+            if (yy < 0 || yy >= XFont::s_fbH) continue;   // 越界保护 (帧缓冲高度)
+            for (int ox = 0; ox < 16; ox++) {
+                int xx = x + ox;
+                if (xx < 0 || xx >= XFont::s_fbW) continue;
+                XFont::s_fbTarget[yy * XFont::s_fbW + xx] = _buf[oy * 16 + ox];
+            }
+        }
+    } else {
+        _tft->pushImage(x, y, 16, 16, _buf);
+    }
 }
 
 // 把一个 16x16 AA 灰度字形"缩小"绘制 (面积平均 + 逐通道 565 合成), 用于日历角标等

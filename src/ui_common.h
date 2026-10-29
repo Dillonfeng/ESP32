@@ -103,16 +103,30 @@ inline void addDaysNoLock(int* y, int* m, int* d, int delta) {
 
 #define DEBUG_UI 0
 
-#define I2S_BCK_PIN     6
-#define I2S_LRC_PIN     7
-#define I2S_DOUT_PIN    8
-#define STATUS_LED_PIN  2
+// 2026-10-25: I2S = 18/5/45 (43/44 归还 UART0/CH340, 否则串口日志被 I2S 顶掉)
+#define I2S_BCK_PIN     18
+#define I2S_LRC_PIN     5
+#define I2S_DOUT_PIN    45
+// 2026-10-25 (最终): GPIO2 改作 GY-39 UART2-TX (接模块 DR), 单色状态灯取消。
+// 状态指示只保留板载 WS2812B (GPIO48)。宏保留下面的空实现, 各模块调用点不用改。
+#define STATUS_LED_PIN      -1
+#define STATUS_LED_ON()     ((void)0)
+#define STATUS_LED_OFF()    ((void)0)
+#define STATUS_RGB_PIN  48     // 板载 WS2812B-5050RGB (原理图 LED2, DIN ← IO48)
 #define TFT_BL_PIN      21
 
 extern TFT_eSPI tft;
 extern XFont font16;
 extern XFont font32;
 extern Audio audio;
+
+// 2026-10-28: 断流自取证 —— RAM 环形日志 + LittleFS 落盘 (main.cpp 定义)
+// 异常停流 (库内 Stream lost / stream dead / dead-flow) 自动 dump + 写 /stall.txt,
+// 串口 'D' 命令随时 dumpRing; boot 自动输出上次 /stall.txt。断流后任意时刻可取回证据。
+void ringLog(const char* fmt, ...);
+void dumpRing();
+void saveStallDump(const char* why);
+void dumpStallFile();
 
 // BUILDV5-HLSFIX: 全局 SPI 总线互斥——XPT2046 触摸采样(touchScanTask) 与
 // TFT_eSPI 显示绘制(main loop) 共享 FSPI 总线；TFT_eSPI 的 locked 标志是单线程
@@ -244,6 +258,7 @@ extern int currentPlayingSid;
 extern bool radioPlaying;
 extern bool radioInited;
 extern int radioVolume;
+#define RADIO_VOL_MAX 64    // 2026-10-28: 音量档位 21→64 (audio.setVolumeSteps), 每步 ≈1.6%
 extern bool radioMuted;          // 播放条静音 (点按音量区切换)
 extern uint16_t g_vuL, g_vuR;    // audio_process_i2s 钩子采样 L/R 峰值 (0..32767)
 extern bool musicPlaying;
@@ -287,6 +302,8 @@ void handleCalendarTap(uint16_t tx, uint16_t ty);
 void handlePickerTap(uint16_t tx, uint16_t ty);
 void modeWeather();
 void drawWeatherScreen();
+void handleWeatherTap(uint16_t tx, uint16_t ty);   // 天气页触摸 (刷新/7天预报入口/返回)
+bool weatherCoverActive();                          // 7天预报二级页全屏覆盖中 (导航栏触摸让路)
 void modeRadio();
 void pumpRadio();
 void handleRadioTap(uint16_t tx, uint16_t ty);
@@ -327,7 +344,6 @@ uint16_t catColor565(const char* cat);
 bool isFavSid(int sid);
 void checkFestivalMusic(int year, int mon, int mday);
 void loadFestivalConfig();
-void sdProbe();
 
 // ========== 时钟布局常量 ==========
 #define CARD_W        56

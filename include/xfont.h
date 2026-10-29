@@ -59,6 +59,17 @@ public:
     // 获取字符像素数据（旧 1-bit 模式, AA 模式返回空）
     String getPixelData(const String& str);
 
+    // 2026-10-29 BUILDV5-FB: 帧缓冲输出模式 —— radio 列表/侧栏拖动防闪烁。
+    // 拖动帧整列在 PSRAM 帧缓冲内合成后单次推屏, 消除 ST7796S 无 TE 同步时
+    // "fillRect 擦→画" 中间态被面板扫到的半屏闪烁 (调试铁律 R2 精神的帧级实现)。
+    // s_fbTarget 非空时 AA 文字写入该缓冲 (坐标=缓冲内屏幕坐标, 行宽 s_fbW/高 s_fbH),
+    // 否则推屏幕 (默认, 全项目其他绘制不受影响)。
+    static uint16_t* s_fbTarget;   // 帧缓冲目标 (nullptr=屏幕)
+    static int       s_fbW;        // 帧缓冲行宽 (像素)
+    static int       s_fbH;        // 帧缓冲高度 (像素, 越界保护)
+    static void fbBegin(uint16_t* buf, int w, int h) { s_fbTarget = buf; s_fbW = w; s_fbH = h; }
+    static void fbEnd() { s_fbTarget = nullptr; }
+
 private:
     TFT_eSPI* _tft;
     File _fontFile;

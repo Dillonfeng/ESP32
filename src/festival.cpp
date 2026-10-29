@@ -1,10 +1,11 @@
-#include "ui_common.h"
+﻿#include "ui_common.h"
+#include "sd_storage.h"   // 项目数据: SD 优先 / LittleFS 回退
 
 JsonDocument festivalDoc;
 
 void loadFestivalConfig() {
   festivalDoc.clear();
-  File f = LittleFS.open("/festival.json", "r");
+  File f = sdstore::openRead("/festival.json");
   if (!f) { Serial.println("[Fest] festival.json not found (no festival music)"); return; }
   if (f.size() > 8192) { Serial.printf("[Fest] festival.json too large: %u B\n", f.size()); f.close(); return; }
   String data = f.readString();
@@ -47,7 +48,7 @@ void checkFestivalMusic(int year, int mon, int mday) {
     if (musicPlaying) {  // 今天没有事件, 停掉
       musicPlaying = false;   // BUILDV5-NETTASK: 先停 netTask 泵（避免与 loop 并发）
       audio.stopSong();
-      if (!radioPlaying) digitalWrite(STATUS_LED_PIN, LOW);
+      if (!radioPlaying) STATUS_LED_OFF();
     }
     return;
   }
@@ -72,70 +73,16 @@ void checkFestivalMusic(int year, int mon, int mday) {
   }
   fmsTries = 0; fmsAt = millis();
   musicPlaying = true;
-  digitalWrite(STATUS_LED_PIN, HIGH);
+  STATUS_LED_ON();
 }
 
 // ============================================================
 // 收藏
 // ============================================================
 
-
-// ============================================================
-// SD card DIAG probe (on-board slot, CS=GPIO6, shares the display's
-// FSPI SPI bus: MISO=13 / MOSI=11 / SCLK=12). Runs ONCE at boot,
-// before initTFT() so the SPI bus is re-init'd cleanly by the TFT
-// afterwards. Dumps the card's file tree to the serial log, then
-// unmounts. If the card/CS is wrong it prints a clear FAIL line.
-// ============================================================
-static int  sdDepth = 0;
-static int  sdCount = 0;
-static void sdList(const char* path) {
-  if (sdCount >= 200) { Serial.printf("[SD] ... (cap 200)\n"); return; }
-  File dir = SD.open(path);
-  if (!dir) { Serial.printf("[SD] open %s FAIL\n", path); return; }
-  if (!dir.isDirectory()) { dir.close(); return; }
-  File e;
-  while ((e = dir.openNextFile())) {
-    if (sdCount >= 200) { e.close(); break; }
-    sdCount++;
-    String name = e.name();
-    String full = String(path) + "/" + name;
-    if (e.isDirectory()) {
-      Serial.printf("[SD] DIR   %s/\n", full.c_str());
-      e.close();
-      if (sdDepth < 2) { sdDepth++; sdList(full.c_str()); sdDepth--; }
-    } else {
-      Serial.printf("[SD] FILE  %-40s %u B\n", full.c_str(), (unsigned)e.size());
-      e.close();
-    }
-  }
-  dir.close();
-}
-
-void sdProbe() {
-  Serial.println("==================== SD PROBE ====================");
-  // The display uses the FSPI host (=VSPI=host1 on S3) on pins SCLK=12 / MISO=13 /
-  // MOSI=11. The global `SPI` object is on that host too but with *default* pins, so
-  // we build our own SPIClass bound to FSPI and explicitly set the display's pins.
-  // begin(sclk,miso,mosi) also pre-inits the bus; SD.begin() re-calls spi.begin()
-  // which is a no-op once _initted, so the pins we set here are what the SD uses.
-  SPIClass sdSpi(FSPI);
-  sdSpi.begin(12 /*SCLK*/, 13 /*MISO*/, 11 /*MOSI*/);
-  bool ok = SD.begin(6 /*CS*/, sdSpi, 20000000 /*20MHz, safe*/, "/sdcard", 16, false);
-  if (!ok) {
-    Serial.println("[SD] FAIL: SD.begin() returned false (no card? wrong CS? CS=6)");
-    Serial.println("  -> try another CS pin, or confirm the card is inserted & formatted FAT");
-    Serial.println("===============================================");
-    return;
-  }
-  Serial.printf("[SD] OK  cardSize=%llu B  total=%llu B  used=%llu B\n",
-                (unsigned long long)SD.cardSize(),
-                (unsigned long long)SD.totalBytes(),
-                (unsigned long long)SD.usedBytes());
-  sdList("/sdcard");
-  SD.end();   // release the bus so initTFT() can re-init it cleanly
-  Serial.println("===============================================");
-}
+// SD 卡诊断/挂载已由 sd_storage.cpp (sdstore::init) 常驻接管;
+// 旧的 sdProbe() 一次性探测+卸载实现已移除 (挂载后立即 SD.end() 会让
+// 后续项目文件无法落在卡上)。
 
 // ============================================================
 // setup / loop

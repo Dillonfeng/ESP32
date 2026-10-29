@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ESP32-S3 网络收音�?- 主程�?v2
  * ===============================
  * �?�?: ESP32-S3-N16R8 + ST7796S 480x320 + XPT2046 + PCM5102A + INMP441
@@ -19,6 +19,7 @@
 
 #include <Arduino.h>
 #include <esp_log.h>          // BUILDV5-STEP3-TFIX2: esp_log_level_set 全局日志开关
+#include <stdarg.h>           // 2026-10-28: ringLog 断流自取证 (vsnprintf)
 #include <SPI.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
@@ -44,6 +45,9 @@ using weather::WData;  // WData 在 weather 命名空间内, 天气页绘制代�
 #include "esp_task_wdt.h"     // BUILDV5-TWDTRESET: netTask 豁免 TASK_WDT（防网络阻塞复位）
 #include "ui_common.h"   // BUILD61: 拆出模块共享声明
 #include "touch_driver.h"  // BUILDV5-TOUCHDRV: 自写 XPT2046 驱动（触摸独立任务）
+#include "sd_storage.h"    // 2026-10-25: 板载 TF 卡存储 (SD 优先/LittleFS 回退)
+#include "gy39.h"          // 2026-10-25: GY-39 气象传感器 (UART2)
+#include "backlight.h"     // 2026-10-25: 背光自动亮度 / 夜间熄屏
 #include "driver/i2s.h"
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -54,10 +58,13 @@ using weather::WData;  // WData 在 weather 命名空间内, 天气页绘制代�
 #define DEBUG_UI 0
 
 // ========== 引脚定义 ==========
-#define I2S_BCK_PIN     6
-#define I2S_LRC_PIN     7
-#define I2S_DOUT_PIN    8
-#define STATUS_LED_PIN  2
+// 2026-10-25: I2S = 18/5/45。43/44 是 UART0(CH340) 的 RXD0/TXD0,
+// 被 I2S 占用后串口日志全无, 故 BCK/LRC 改用原 KEY1/KEY3 的 18/5。
+#define I2S_BCK_PIN     18
+#define I2S_LRC_PIN     5
+#define I2S_DOUT_PIN    45
+// STATUS_LED_PIN 由 ui_common.h 提供 (= -1, 单色灯已取消, GPIO2 给 GY-39 TX)
+#define STATUS_RGB_PIN  48     // 板载 WS2812B-5050RGB (原理图 LED2, DIN ← IO48)
 #define TFT_BL_PIN      21
 
 // ========== 全局对象 ==========
@@ -161,7 +168,7 @@ int currentCat = 0;
 int currentPlayingSid = -1;   // 播放中的全局 sid (-1=无)
 bool radioPlaying = false;
 bool radioInited = false;
-int radioVolume = 10;
+int radioVolume = 30;     // 2026-10-28: 0..RADIO_VOL_MAX(64), 30≈47% (原 10/21≈48%)
 bool musicPlaying = false;
 int regionScrollTop = 0;
 int listScrollTop = 0;
@@ -346,8 +353,8 @@ void initTFT() {
   tft.setSwapBytes(true);
   tft.fillScreen(TFT_BLACK);
   tft.setTextFont(1);
-  pinMode(TFT_BL_PIN, OUTPUT);
-  digitalWrite(TFT_BL_PIN, HIGH);
+  // 2026-10-25: 背光改由 backlight 模块用 LEDC PWM 控制 (自动亮度/夜间熄屏)
+  backlight::init();
 }
 
 void initTouch() {
@@ -363,7 +370,7 @@ void initTouch() {
    //   FreeRTOS 双核优先级继承断言 bug（netTask 已同款固定 core1，见 L710）。
   //   拖动列表=触摸采样+高频重绘同时压锁→触发；日历点击低频未触发。
   touchDriverInit();
-  xTaskCreate(&touchScanTask, "touchScan", 4096, NULL, 3, NULL);  // 改回不固定核（验证：固定core1后屏幕完全没反应）
+  xTaskCreatePinnedToCore(&touchScanTask, "touchScan", 4096, NULL, 3, NULL, 0);  // 固定 Core0: netTask(Core1) 卡 lwip 锁(忙等)时触摸仍响应 (2026-10-28: 原不固定核, netTask 卡 15s 时同核触摸饿死 → press 后无 release)
 }
 
 // BUILDV5-NETTASK: 独立下载泵任务（单任务调 audio.loop，main loop 彻底不调）。
@@ -373,6 +380,63 @@ void initTouch() {
 // 单次阻塞只影响 netTask 自身，UI 帧率恢复；下载速率 = 泵频率 × 每次推进包数
 // → 潜在 300KB/s（受网络带宽与水位限制）。切台时 main loop 先置 radioPlaying=false
 // 停泵 → 完成切台 → 置 true 恢复，避免 stopSong/connecttohost 与 loop 状态机并发。
+volatile uint32_t g_lastNetLoopDt = 0;  // netTask 写: 上次 audio.loop 耗时(ms); main loop [DIAG] 断流取证读
+
+// 2026-10-28: 断流自取证 —— RAM 环形日志 + LittleFS 落盘。
+// 断流是偶发事件, 不依赖"断流前抓包": 关键事件持续入环 (96 条 × 88B ≈ 8.5KB,
+// [DIAG] 每 2s 一条 → 约 3.2 分钟窗口), 异常停流 (库内 Stream lost / stream dead /
+// dead-flow) 自动 dumpRing 到串口 + saveStallDump 写 /stall.txt; 串口 'D' 命令随时
+// dump; boot 自动输出上次 /stall.txt —— 断流后任意时刻可取回证据, 不靠抓包时机。
+static char s_ring[96][88];
+static volatile int s_ringW = 0;
+static volatile int s_ringN = 0;
+
+void ringLog(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(s_ring[s_ringW], 88, fmt, ap);
+  va_end(ap);
+  s_ringW = (s_ringW + 1) % 96;
+  if (s_ringN < 96) s_ringN++;
+}
+void dumpRing() {
+  if (g_printMutex) xSemaphoreTake(g_printMutex, portMAX_DELAY);
+  Serial.printf("[RING] ---- %d entries (oldest->newest) ----\n", s_ringN);
+  int n = s_ringN < 96 ? s_ringN : 96;
+  int start = (s_ringW - n + 96 * 2) % 96;
+  for (int i = 0; i < n; i++) Serial.printf("%s\n", s_ring[(start + i) % 96]);
+  Serial.printf("[RING] ---- end ----\n");
+  if (g_printMutex) xSemaphoreGive(g_printMutex);
+}
+void saveStallDump(const char* why) {
+  File f = LittleFS.open("/stall.txt", "w");
+  if (f) {
+    f.printf("== STALL t=%lu ms: %s ==\n", (unsigned long)millis(), why);
+    int n = s_ringN < 96 ? s_ringN : 96;
+    int start = (s_ringW - n + 96 * 2) % 96;
+    for (int i = 0; i < n; i++) f.printf("%s\n", s_ring[(start + i) % 96]);
+    f.close();
+    if (g_printMutex) xSemaphoreTake(g_printMutex, portMAX_DELAY);
+    Serial.printf("[STALL] saved /stall.txt (%s, %d entries)\n", why, n);
+    if (g_printMutex) xSemaphoreGive(g_printMutex);
+  }
+}
+void dumpStallFile() {
+  if (LittleFS.exists("/stall.txt")) {
+    File f = LittleFS.open("/stall.txt", "r");
+    if (f) {
+      if (g_printMutex) xSemaphoreTake(g_printMutex, portMAX_DELAY);
+      Serial.printf("[STALL] ---- last stall dump ----\n");
+      while (f.available()) Serial.write(f.read());
+      Serial.printf("\n[STALL] ---- end ----\n");
+      if (g_printMutex) xSemaphoreGive(g_printMutex);
+      f.close();
+    }
+  } else {
+    Serial.println("[STALL] no /stall.txt on LittleFS");
+  }
+}
+
 void netTask(void* arg) {
   // BUILDV5-TWDTRESET (2026-10-12): 豁免本任务 TASK_WDT——netTask 泵 audio.loop 时，
   // cnr 分片切换网络阻塞 7-9s（L667/L804 实证）会触发 CONFIG_ESP_TASK_WDT_TIMEOUT_S=5
@@ -390,6 +454,7 @@ void netTask(void* arg) {
       audio.loop();
       uint32_t dt = millis() - t0;
       lastDt = dt;
+      g_lastNetLoopDt = dt;   // main loop [DIAG] 断流取证
       if (dt > 500) {
         Serial.printf("[NET-BLK] audio.loop took %ums heap=%u\n", dt, (unsigned)ESP.getFreeHeap());
       }
@@ -432,6 +497,16 @@ void handleTouch() {
   // 触摸不再被 audio.loop 阻塞 → 点击/拖动灵敏）
   bool isDown = s_touchDown;
   uint16_t tx = s_touchX, ty = s_touchY;
+  // 2026-10-25: 夜间熄屏时, 第一次按下只负责唤醒背光 (吞掉本次点击, 避免误触导航)。
+  if (backlight::isOff()) {
+    if (isDown && !touchWasDown) {
+      backlight::wake();
+      touchWasDown = true;
+      return;
+    }
+    if (!isDown) touchWasDown = false;
+    return;
+  }
   // 触摸坐标 = 屏幕坐标 (getTouch 已按 rotation(3) 校准), 与 live preview 1:1 一致, 无需翻转.
   // 之前此处曾多翻 180 度 -> 点底部导航栏被映射到顶部, 点日历变成切换时钟样式 (已移除).
   if (isDown && !touchWasDown) {
@@ -459,15 +534,21 @@ void handleTouch() {
 
     // 2026-09-27: 侧栏拖拽结束吸附 -> 视口顶所在行的行顶对齐视口顶, 避免停在半行
     // 2026-10-22: 行偏移含分组标题行, 统一用 sideRowTop/sideTotalH
+    // 2026-10-29 吸附到底修正: 已滚到内容底(smax 半行内) -> 直接停到底。
+    // 旧逻辑取"<=scroll 的最大分类行顶", 当 smax 落在某行内(尾部不足一行高)时,
+    // 拖到底会被回弹到上一个行顶 -> "我的"组最后分类(历史)拖不上来/总退回。
     if (touchDidScroll && touchScrollZone == 2 && currentMode == MODE_RADIO) {
       int totalH = sideTotalH();
       int smax = max(0, totalH - (NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H)));
       int snap = 0;
-      for (int k = 0; k < radioCatCount; k++) {
-        int t = sideRowTop(k);
-        if (t <= regionScrollTop) snap = t;
+      if (regionScrollTop >= smax - 13) snap = smax;
+      else {
+        for (int k = 0; k < radioCatCount; k++) {
+          int t = sideRowTop(k);
+          if (t <= regionScrollTop) snap = t;
+        }
+        if (snap > smax) snap = smax;
       }
-      if (snap > smax) snap = smax;
       if (snap != regionScrollTop) { regionScrollTop = snap; sideScrollDirty = true; }
     }
     // 2026-10-22 问题③: 右列拖拽结束同样吸附到行顶 (与左列一致, 不悬停在半行)
@@ -481,7 +562,7 @@ void handleTouch() {
     if (touchDidScroll) touchScrollZone = 0;   // 拖拽结束 -> 复位分区 (避免下次按下误判)
     if (!touchDidScroll && dur < 800 && abs(dy) < 15 && abs(dx) < 15) {
       Serial.printf("[TOUCH] tap @ (%d,%d) dur=%lu mode=%d\n", touchStartX, touchStartY, (unsigned long)dur, (int)currentMode);  // 临时调试: 确认触摸坐标与屏幕坐标一致
-      if (touchStartY >= NAV_BAR_Y) {
+      if (touchStartY >= NAV_BAR_Y && !weatherCoverActive() && !showingFullscreen) {
         int btnIdx = touchStartX / NAV_BTN_WIDTH;
         if (btnIdx >= 0 && btnIdx < MODE_COUNT) {
           if (btnIdx != currentMode) {
@@ -493,6 +574,9 @@ void handleTouch() {
           }
           drawNavBar();
         }
+      } else if (currentMode == MODE_WEATHER) {
+        // 天气页: 刷新按钮 / 7天预报入口 / 二级页返回 (二级页全屏时导航栏触摸也让路到这里)
+        handleWeatherTap(touchStartX, touchStartY);
       } else if (currentMode == MODE_RADIO) {
         handleRadioTap(touchStartX, touchStartY);
       } else if (currentMode == MODE_CALENDAR && touchStartY < NAV_BAR_Y) {
@@ -564,7 +648,8 @@ void setup() {
   delay(500);
   // BUILDUI8-CRASH-DIAG: 临时全开 esp_log（含 WDT "Print CPU" / esp_timer / lwip），定位 boot 后 ~7s 卡死持锁者
   // esp_log_level_set("*", ESP_LOG_NONE); // 关所有 esp_log 打印（Audio 库 S2DBG 刷屏），我们自己的 Serial.printf 不受影响
-  sdProbe();  // DIAG: read the on-board SD card (CS=GPIO6, shared SPI bus) and dump contents
+  // 2026-10-25: 旧的 sdProbe() (挂载后立即 SD.end() 的诊断) 已移除,
+  // 改由 sdstore::init() 在 initTFT() 之后常驻挂载板载 TF 卡。
   // BUILD41-DIAG-AAC-RATE: BUILD40 confirmed fixed_mclk=0 does NOT fix the
   // slow playback (MEAS still ~16000). All I2S driver register tweaks failed
   // (BUILD38 tx_update pulse, BUILD39 stop+update+start, BUILD40 fixed_mclk=0)
@@ -588,25 +673,34 @@ void setup() {
   // 这样在没有串口监视器时也能直接看出黑屏停在哪�?步�??
   initTFT();
 
-  // PENIRQ-WAKE（2026-10-18）：XPT2046 复位后 PENIRQ 输出级可能卡住（一直高电平），
-  //   手动短接 GPIO38→GND 可"唤醒"。在 SPI 总线初始化后做：先拉低 GPIO4（2026-10-21：
-  //   GPIO38 实测点击变 0 但芯片 IN1 恒 1 = octal PSRAM SPICS1 复用钳制，改用 GPIO4），
-  //   再通过 SPI 发个读 X 的命令"唤醒" XPT2046，然后改回输入上拉。
-  Serial.println("[PENIRQ] wake up: GPIO4 LOW + SPI wakeup...");
-  pinMode(TOUCH_IRQ, OUTPUT);
-  digitalWrite(TOUCH_IRQ, LOW);
-  delay(100);
-  // 通过 SPI 发个读 X 的命令"唤醒" XPT2046
-  pinMode(TOUCH_CS, OUTPUT);
-  digitalWrite(TOUCH_CS, LOW);
-  tft.getSPIinstance().transfer(0xD0);  // 读 X 命令
-  tft.getSPIinstance().transfer(0);
-  tft.getSPIinstance().transfer(0);
-  digitalWrite(TOUCH_CS, HIGH);
-  delay(100);
+  // 2026-10-25: 全局锁提前到 initTouch()/任何跨任务 SPI 访问之前创建
+  // (SD 卡与显示屏共享 FSPI, 触摸采样任务在 initTouch 里启动后, 后续
+  //  SD/DB 读取必须持锁串行化)。
+  g_spiMutex = xSemaphoreCreateMutex();
+  g_printMutex = xSemaphoreCreateMutex();
+
+  // 单色状态灯已取消: GPIO2 改作 GY-39 UART2-TX (接模块 DR), 不能再当 LED 输出
+#if STATUS_LED_PIN >= 0
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW);
+#endif
+  
+  // 板载 WS2812 状态灯: 上电先熄灭 (软复位后不会残留上次的颜色)
+  rgbLedWrite(STATUS_RGB_PIN, 0, 0, 0);
+  // 自检: 开机亮红 600ms —— 用来区分"软件没驱动"还是"LED/电平不工作"
+  rgbLedWrite(STATUS_RGB_PIN, 255, 0, 0);
+  delay(600);
+  rgbLedWrite(STATUS_RGB_PIN, 0, 0, 0);
+
+  // 2026-10-25: GY-39 (UART2, 不占 SPI 总线, 可在锁外初始化)
+  gy39::init();
+
+  // 2026-10-25: 旧 "PENIRQ-WAKE"（把 GPIO4 强制拉低 100ms + 发 0xD0）已移除。
+  //   实测：该序列跑完后 XPT2046 的 PENIRQ 一直保持低电平 → 触摸状态机认为
+  //   "手指一直按着"，所有新点击被吞掉。改为在 touchDriverInit() 里用 0x80
+  //   软复位清芯片状态，不再驱动 IRQ 线。
   pinMode(TOUCH_IRQ, INPUT_PULLUP);
-  delay(10);
-  Serial.printf("[PENIRQ] after wake: GPIO4=%d\n", digitalRead(TOUCH_IRQ));
+  Serial.printf("[PENIRQ] boot initial GPIO4=%d\n", digitalRead(TOUCH_IRQ));
 
   tft.setTextFont(2);                 // 内置 16px 字体 (User_Setup.h �?LOAD_FONT2)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -621,8 +715,16 @@ void setup() {
   if (fsOk) tft.print(String(LittleFS.totalBytes() / 1024)); else tft.print("FAIL");
   tft.println(" KB");
 
-  // 1b) 节日/节气 音乐配置 (�?�? 缺失/损坏则不�?
-  if (fsOk) loadFestivalConfig();
+  // 1a) 板载 TF 卡 (2026-10-25): 常驻挂载, 项目数据优先存卡上。
+  // 失败自动回退 LittleFS; 卡上缺文件时从 Flash 迁移一次。
+  bool sdOk = sdstore::init();
+  if (sdOk) sdstore::seedFromFlash();
+  Serial.printf("[FS] backend=%s sd=%d\n", sdstore::backend(), (int)sdOk);
+  tft.print("SD: ");
+  tft.println(sdOk ? "OK" : "NONE");
+
+  // 1b) 节日/节气 音乐配置 (缺失/损坏则不播)
+  if (fsOk || sdOk) loadFestivalConfig();
 
   // 1c) 时钟样式 (NVS 持久�? 翻页 / 指针, 点击时钟页可切换)
   clockStyle = getClockStyle();
@@ -661,20 +763,40 @@ void setup() {
   }
 
   // 4b) 节假�?放假/补班) 同�??: 加载缓存; 联网后由 loop 里的 tick() 定时同�??
+  // 2026-10-25: 三者都会读 SD 上的缓存文件, 与触摸采样共享 FSPI -> 持锁串行
+  if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
   holiday::init();
   geo::init();   // geo: IP-locate province for radio sidebar pin (cache read; tick() fetches after wifi)
   weather::init();   // weather: open-meteo 实时天气 (读缓存; tick() 联网后拉取 + 30min 刷新)
+  if (g_spiMutex) xSemaphoreGive(g_spiMutex);
 
   // 5) 电台数据�?(bad format / 内存不足�?new[] 会崩�?
   Serial.println("Loading radio DB...");
+  if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);   // stations.bin 可能来自 SD
   bool dbOk = loadRadioDB();
   bool metaOk = loadRadioMeta();
+  if (g_spiMutex) xSemaphoreGive(g_spiMutex);
   if (dbOk && metaOk) tft.printf("%d cat / %d stn\n", radioCatCount, radioStnTotal);
   else tft.println("DB: MISSING");
   Serial.printf("DB cats=%d stn=%d\n", radioCatCount, radioStnTotal);
   audio.setPinout(I2S_BCK_PIN, I2S_LRC_PIN, I2S_DOUT_PIN);
-  radioVolume = 21;     // 2026-10-20: 音量状态与 UI 同步 (播放条显示百分比, 点按可静音)
-  audio.setVolume(21); // BUILDV5-FIX: v4 lib defaults volume=0 (silent); v2/v3 defaulted to 21=max
+  audio.setVolumeSteps(RADIO_VOL_MAX); // 2026-10-28: 档位 21→64, 音量 ±1 每步 ≈1.6% (原每档 4.76%≈显示5% 太粗)
+  radioVolume = RADIO_VOL_MAX; // 2026-10-20: 音量状态与 UI 同步 (播放条显示百分比, 点按可静音)
+  audio.setVolume(RADIO_VOL_MAX); // BUILDV5-FIX: v4 lib defaults volume=0 (silent); v2/v3 defaulted to 21=max
+  // 2026-10-28: 接音频库 info 回调 —— 库内 "Stream lost"/连接失败/slow stream 等事件打到串口,
+  // 填补断流取证缺口 (此前应用层未接回调, 库内停流路径零 log, 断流瞬间无法定位)
+  Audio::audio_info_callback = [](Audio::msg_t i) {
+    const char* en = (i.e >= 0 && i.e < 16) ? Audio::eventStr[(int)i.e] : "?";
+    ringLog("[AUDIO] e=%d %s %s", (int)i.e, en, i.msg ? i.msg : "");
+    if (g_printMutex) xSemaphoreTake(g_printMutex, portMAX_DELAY);
+    Serial.printf("[AUDIO] e=%d %s %s\n", (int)i.e, en, i.msg ? i.msg : "");
+    if (g_printMutex) xSemaphoreGive(g_printMutex);
+    // 库内停流事件 (Stream lost) → 立即 dump 三环节 ring + 落盘 (断流自动取证)
+    if (i.msg && strstr(i.msg, "Stream lost")) {
+      dumpRing();
+      saveStallDump("Stream lost");
+    }
+  };
   // HLS buffer tuning (CNR/CRI m3u8, 10s segments / separate HTTP GET each):
   // 400KB PSRAM buffer ~= 25s @128kbps. Old 64KB setting gave only ~3.5s
   // headroom -> any segment-fetch hiccup underran the I2S DMA (stutter /
@@ -688,6 +810,8 @@ void setup() {
 
   tft.println("READY - start main UI");
   Serial.println("Setup done.");
+  // 2026-10-28: boot 自动输出上次断流自取证 (stall.txt 由异常停流时 saveStallDump 写入, 永不丢)
+  dumpStallFile();
   // CLKFIX 2026-10-16: boot 内存基线——定位"播放后内部 RAM 碎片化(maxBlock 38KB)导致时钟缓冲分配失败"的碎片源
   Serial.printf("[MEM] boot: internalFree=%uKB internalMax=%uKB psramFree=%uKB psramMax=%uKB\n",
                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
@@ -711,14 +835,43 @@ void setup() {
   // 总线（TFT_eSPI locked 标志单线程假设 + SPIClass 锁 IDF5.5 不可靠 → cap_fix8
   // 链A pushSwapBytePixels 崩溃）。main loop 绘制段(touch消费+modeXxx)与 touch
   // 采样都持本锁 → SPI 访问串行。
-  g_spiMutex = xSemaphoreCreateMutex();
-  g_printMutex = xSemaphoreCreateMutex();
+  // 2026-10-25: 锁已在 initTFT() 之后提前创建 (SD/DB 读取需要), 此处不再重复创建。
   // BUILDV5-HLSFIX: 预热 newlib tzset——cap_fix9 链C 实证 main loop(modeClock 时间格式化)
   // 与另一核首次并发调 localtime_r → _tzset_unlocked 崩溃。
   // BUILDV5-TZFIX (2026-10-22): 全部 localtime_r 调用已改为无锁 epochToLocalNoLock,
   // 不再触碰 newlib tz 锁, 此预热窗口已消除; 保留空预热注释占位 (无锁函数无需预热)。
   Serial.printf("[NET] spiMutex=%d printMutex=%d\n", g_spiMutex != nullptr, g_printMutex != nullptr);
   modeChanged = true;
+}
+
+// ========== 板载 RGB 状态灯 (WS2812B-5050RGB, 原理图 LED2, DIN←GPIO48) ==========
+// GPIO2 那颗是单色 LED, 只能亮/灭; 板载 WS2812 才能用颜色区分状态:
+//   绿色常亮 = 正常出声 (radioPlaying/musicPlaying 且 audio.isRunning())
+//   橙色闪烁 = 已点播但音频流没在跑 (连接中/缓冲/断流)
+//   熄灭     = 未播放
+// 200ms 评估一次: rgbLedWrite 走 RMT 并重装通道, 不必每帧刷。
+static void statusLedTick() {
+  static uint32_t lastMs = 0;
+  static bool     blinkOn = false;
+  static uint8_t  lr = 255, lg = 255, lb = 255;
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastMs) < 200) return;
+  lastMs = now;
+
+  bool active = radioPlaying || musicPlaying;
+  uint8_t r = 0, g = 0, b = 0;
+  if (active && audio.isRunning()) {
+    g = 128;                                  // 绿: 正在出声
+  } else if (active) {
+    blinkOn = !blinkOn;
+    if (blinkOn) { r = 128; g = 40; }          // 橙: 断流/缓冲
+  } else {
+    blinkOn = false;                          // 未播放: 灭
+  }
+  if (r != lr || g != lg || b != lb) {
+    rgbLedWrite(STATUS_RGB_PIN, r, g, b);
+    lr = r; lg = g; lb = b;
+  }
 }
 
 void loop() {
@@ -737,6 +890,26 @@ void loop() {
   static uint32_t s_memLast = 0;
   static uint32_t s_lowLast = 0;
   static uint32_t s_lowMin = 0xFFFFFFFF;
+  static uint32_t s_diagLast = 0;
+  // 2026-10-28 断流三环节取证 (每 2s, main loop=CPU0 独立于 netTask 存活):
+  //   入口 = 泵状态(radioPlaying/musicPlaying) + 上次 audio.loop 耗时 g_lastNetLoopDt
+  //   缓冲 = inBufferFilled/inBufferFree (填充/空闲字节)
+  //   出口 = audio.isRunning() + getAudioCurrentTime() (播放时间戳, 前进=在播, 停=出口断)
+  // 断流瞬间/之后看 log 即可定位: 入口停&缓冲耗光 = 下载断; 入口正常&时间戳停 = 出口卡(lwip 锁);
+  // 缓冲满&时间戳停 = 解码问题。
+  if (millis() - s_diagLast >= 2000) {
+    s_diagLast = millis();
+    ringLog("[DIAG] in=%d/%d/%lums buff=%u/%u out=%d/%lus",
+            radioPlaying, musicPlaying, (unsigned long)g_lastNetLoopDt,
+            (unsigned)audio.inBufferFilled(), (unsigned)audio.inBufferFree(),
+            audio.isRunning(), (unsigned long)audio.getAudioCurrentTime());
+    if (g_printMutex) xSemaphoreTake(g_printMutex, portMAX_DELAY);
+    Serial.printf("[DIAG] in=%d/%d/%lums buff=%u/%u out=%d/%lus\n",
+                  radioPlaying, musicPlaying, (unsigned long)g_lastNetLoopDt,
+                  (unsigned)audio.inBufferFilled(), (unsigned)audio.inBufferFree(),
+                  audio.isRunning(), (unsigned long)audio.getAudioCurrentTime());
+    if (g_printMutex) xSemaphoreGive(g_printMutex);
+  }
   if (millis() - s_lowLast >= 2000) {
     s_lowLast = millis();
     uint32_t f = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -786,6 +959,10 @@ void loop() {
       else if (c == 't' || c == 'T') {               // BUILDV5-STEP3-TFIX4: 原始触摸数据转储
         touchDiag(15);
       }
+      else if (c == 'D' || c == 'd') {               // 2026-10-28: 断流自取证 dump (RAM ring + /stall.txt)
+        dumpRing();
+        dumpStallFile();
+      }
       else if (c == 'c' || c == 'C') {               // BUILDV5-CALIB: 图形化触摸校准
         radioPlaying = false; musicPlaying = false;
         audio.stopSong();
@@ -802,7 +979,7 @@ void loop() {
           radioPlaying = true;
           musicPlaying = false;
           s_autoPump = true;
-          digitalWrite(STATUS_LED_PIN, HIGH);
+          STATUS_LED_ON();
         }
       }
   }
@@ -851,7 +1028,7 @@ void loop() {
   if (musicPlaying) {
     if (!audio.isRunning()) {   // BUILD14: 节日流死 -> 停 (checkFestivalMusic 负责重试)
       musicPlaying = false;
-      if (!radioPlaying) digitalWrite(STATUS_LED_PIN, LOW);
+      if (!radioPlaying) STATUS_LED_OFF();
     }
   }
 
@@ -861,6 +1038,12 @@ void loop() {
   // BUILDV5-HLSFIX: 锁释放移到本行——覆盖 L798 drawNavBar（cap_fix10 实证 navDirty
   // 重绘在锁外与 touchScanTask 并发 → 链A TFT pushSwapBytePixels 崩溃）
   if (g_spiMutex) xSemaphoreGive(g_spiMutex);
+
+  // 2026-10-25: GY-39 收帧/交替下发 (UART2, 不占 SPI) + 背光自动亮度/夜间熄屏。
+  // 放在 SPI 锁外: UART 与 LEDC 都不碰 FSPI 总线, 不会与触摸/绘制冲突。
+  gy39::tick();
+  backlight::tick();
+  statusLedTick();   // 板载 WS2812: 绿=出声 / 橙闪=断流缓冲 / 灭=停止
 
   // BUILDV5-STEP3: audio.loop 已由 netTask 独立泵（main loop 不再调——单任务泵下
   // 分片切换网络阻塞 7-9s 卡死 main loop：task_wdt + 触摸丢失 + 缓冲耗尽无声，

@@ -35,6 +35,20 @@ void touchDriverInit() {
   //   PENIRQ 开漏输出 → 内部上拉。按下/抬起由硬件信号判定（替代 Z2 压力采样），
   //   XY 采样前永远没有 0xC0(Z2) 事务 → 彻底绕开已证实的残留污染链。
   pinMode(TOUCH_IRQ, INPUT_PULLUP);
+  // 2026-10-25: XPT2046 软复位 (0x80 控制字节) —— 取代旧的"强制拉低 IRQ + 0xD0"唤醒。
+  //   旧做法实测会把 PENIRQ 锁在低电平(状态机误判为一直按着)。这里只发复位命令,
+  //   不驱动 IRQ 线; 前后各读一次电平写日志, 用于区分"硬件被拉低" vs "芯片状态"。
+  int irqBefore = digitalRead(TOUCH_IRQ);
+  for (int i = 0; i < 2; i++) {
+    s_spi->beginTransaction(SPISettings(SPI_TOUCH_FREQUENCY, MSBFIRST, SPI_MODE0));
+    digitalWrite(TOUCH_CS, LOW);
+    s_spi->transfer(0x80);              // 控制字节: 软复位 / 清 PD 位
+    digitalWrite(TOUCH_CS, HIGH);
+    s_spi->endTransaction();
+    delay(2);
+  }
+  Serial.printf("[PENIRQ] irq before=%d after-reset=%d\n",
+                irqBefore, digitalRead(TOUCH_IRQ));
   // BUILDV5-CALIB: 读取 NVS 校准（校准模式写入，重启后自动生效）
   Preferences pref;
   if (pref.begin("tcal", true)) {
@@ -210,6 +224,14 @@ void touchScanTask(void* arg) {
                                                     // 连跑；采样间留 5ms 让 PENIRQ 有恢复窗口
     lastProc = now;
     bool irqLow = (digitalRead(TOUCH_IRQ) == LOW); // 电平轮询（无 SPI）
+    // 诊断: PENIRQ 每次电平变化打一行 (低频, 不刷屏) —— 用来判断
+    // "触摸没反应" 是 IRQ 线没接好(完全无变化) 还是状态机/坐标问题.
+    static int lastIrqLvl = -2;
+    if ((int)irqLow != lastIrqLvl) {
+      Serial.printf("[TSM] PENIRQ=%d (0=pressed) t=%lums\n",
+                    (int)irqLow, (unsigned long)now);
+      lastIrqLvl = (int)irqLow;
+    }
     switch (st) {
       case TS_IDLE:
         if (irqLow) {

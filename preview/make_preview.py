@@ -187,9 +187,9 @@ FS_TAG_BG        = c565(0xEF9F)   # 全屏 meta tag 底 = RGBC(0xEA,0xF1,0xFA)
 FS_TAG_TX        = c565(0x4AF0)   # 全屏 meta tag 字 = RGBC(0x4A,0x5F,0x87)
 # 全屏控制按钮几何 (镜像固件 radio_ui.cpp FS_BTN_*, 2026-10-22)
 FS_BTN_Y      = 200
-FS_BTN_DN_X   = 168
-FS_BTN_MAIN_X = 226
-FS_BTN_UP_X   = 284
+FS_BTN_DN_X   = 182
+FS_BTN_MAIN_X = 240
+FS_BTN_UP_X   = 298
 FS_BTN_R      = 22
 FS_BTN_MAIN_R = 26
 RED              = c565(0xF800)   # (TFT_RED)
@@ -1442,37 +1442,41 @@ def draw_radio_fullscreen(d, cur_cat, playing_idx=-1, favorited=False):
         # 峰值余晖: 点亮条顶部 1.6px 白 (镜像固件)
         py = 256 - 10 - (lit + 1) * 5 + 4 - 1
         d.rectangle([gx + 6, py, gx + 6 + 54 - 1, py + 1], fill=WHITE)
-    # L/R 声道标签 (设计稿 ch-label, canvas 下方)
-    hw_text(d, 10 + 33, 256 - 4, "L", RADIO_DIM, RADIO_CARD, anchor="mm")
-    hw_text(d, 404 + 33, 256 - 4, "R", RADIO_DIM, RADIO_CARD, anchor="mm")
+    # L/R 声道标签 (设计稿 ch-label, canvas 下方 — 2026-10-28: 256-4→256+4 下移 8px 避让音量%)
+    hw_text(d, 10 + 33, 256 + 8, "L", RADIO_DIM, RADIO_CARD, anchor="mm")
+    hw_text(d, 404 + 33, 256 + 8, "R", RADIO_DIM, RADIO_CARD, anchor="mm")
     # 台名 16px (字库原生 font16; font24 已清除, 镜像固件 drawStationFullscreen)
     hw_glyphs(d, 240, 78, st.name, RADIO_TXT, RADIO_CARD, 16, anchor="mm")
-    # 频率 24px + MHz 16px (字库原生字号; 设计稿全屏无 FM 前缀)
+    # 频率 24px + MHz 16px 同行 ("频率+MHz" 整体左右居中, 镜像固件 2026-10-28 三批)
     freq_txt = st.freq if st.freq else "网络电台"
     if freq_txt.startswith("FM"):
         freq_txt = freq_txt[2:].strip()
-    hw_glyphs(d, 240, 125, freq_txt, FS_FREQ_COL, RADIO_CARD, 24, anchor="mm")
+    fw24 = aa_text_width(freq_txt) * 24 // 16
+    mhz_w = aa_text_width("MHz") if st.freq else 0
+    total_w = fw24 + (8 + mhz_w if mhz_w else 0)
+    hw_glyphs(d, 240 - total_w // 2 + fw24 // 2, 125, freq_txt, FS_FREQ_COL, RADIO_CARD, 24, anchor="mm")
     if st.freq:
-        hw_glyphs(d, 240, 136, "MHz", RADIO_ACC, RADIO_CARD, 16, anchor="mm")
-    # meta 行: 地区 tag + 分类 tag
-    my = 158
-    reg = radio_region_name(st)
-    catl = _station_cat(st)
-    labels = [x for x in (reg, catl) if x]
-    mx0 = 240 - (len(labels) * 92) // 2
-    for j, lab in enumerate(labels[:2]):
-        bx = mx0 + j * 92
-        d.rounded_rectangle([bx - 42, my - 2, bx + 42, my + 16], radius=4, fill=FS_TAG_BG)
-        hw_text(d, bx, my + 7, lab[:4], FS_TAG_TX, FS_TAG_BG, anchor="mm")
-    # 控制按钮: 音量− | 播放/暂停 | 音量+ (中心 FS_BTN_Y=200)
-    for bx, r, col in ((168, 22, RADIO_SIDE_BG), (226, 26, RADIO_ACC), (284, 22, RADIO_SIDE_BG)):
+        hw_glyphs(d, 240 - total_w // 2 + fw24 + 8, 125, "MHz", RADIO_ACC, RADIO_CARD, 16, anchor="lm")
+    # meta 行: 地区 tag + 分类 tag (2026-10-28 三批: 双 chip 整体左右居中; 文字左对齐, chip 内边距 8, chip 间距 16, 镜像固件)
+    my = 146
+    labels = [x for x in (radio_region_name(st), _station_cat(st)) if x]
+    gap = 16
+    widths = [len(lab[:4]) * 16 + 16 for lab in labels[:2]]
+    c_total = sum(widths) + (len(widths) - 1) * gap
+    mx = 240 - c_total // 2
+    for lab, w in zip(labels[:2], widths):
+        d.rounded_rectangle([mx, my - 2, mx + w - 1, my + 16], radius=4, fill=FS_TAG_BG)
+        hw_text(d, mx + 8, my + 7, lab[:4], FS_TAG_TX, FS_TAG_BG, anchor="lm")
+        mx += w + gap
+    # 控制按钮: 音量− | 播放/暂停 | 音量+ (中心 FS_BTN_Y=200, 2026-10-28 居中 182/240/298; +号 3px 与 − 一致)
+    for bx, r, col in ((182, 22, RADIO_SIDE_BG), (240, 26, RADIO_ACC), (298, 22, RADIO_SIDE_BG)):
         d.ellipse([bx - r, 200 - r, bx + r, 200 + r], fill=col)
-    d.rectangle([161, 199, 175, 203], fill=RADIO_TXT)                       # − 横
-    d.rectangle([219, 188, 224, 212], fill=RADIO_CARD)                      # ‖ 左
-    d.rectangle([229, 188, 234, 212], fill=RADIO_CARD)                      # ‖ 右
-    d.line([277, 200, 291, 200], fill=RADIO_TXT)                            # + 横
-    d.line([284, 193, 284, 207], fill=RADIO_TXT)                            # + 竖
-    hw_text(d, 240, 234, "100%", RADIO_DIM, RADIO_CARD, anchor="mm")
+    d.rectangle([175, 199, 189, 203], fill=RADIO_TXT)                       # − 横 (14×3)
+    d.rectangle([233, 188, 238, 212], fill=RADIO_CARD)                      # ‖ 左 (5×24)
+    d.rectangle([243, 188, 248, 212], fill=RADIO_CARD)                      # ‖ 右
+    d.rectangle([291, 199, 305, 203], fill=RADIO_TXT)                       # + 横 (14×3, 与 − 一致)
+    d.rectangle([297, 191, 301, 209], fill=RADIO_TXT)                       # + 竖 (3×14)
+    hw_text(d, 240, 244, "100%", RADIO_DIM, RADIO_CARD, anchor="mm")   # 音量% 主按钮下方 (中心 244 = FS_BTN_Y+36+8, 2026-10-28 二批 与主按钮底226拉开10px)
     # 底部提示条 30px
     d.rectangle([0, NAV_Y, 479, NAV_Y + 29], fill=RADIO_CARD)
     d.line([0, NAV_Y, 479, NAV_Y], fill=RADIO_LINE)

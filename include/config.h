@@ -33,10 +33,17 @@
 
 // ============================================================
 // 引脚分配 - I2S0 (音频输出 → PCM5102A DAC)
+// 2026-10-25 二次调整: BCK/LRC 从 43/44 挪到 18/5。
+//   GPIO43/44 = UART0 的 RXD0/TXD0, 硬件直连 CH340X USB 串口;
+//   I2S 一旦占用这两脚, CH340 就再也收不到任何 Serial 日志。
+//   18/5 原为 KEY1/KEY3 按键 (固件中从未读取), 现改作 I2S 时钟,
+//   接线时请拔掉 KEY1/KEY3 的按键排线 (按键会把时钟线拉到 GND)。
+//   DOUT 保持 45 不变 (45 是 strapping 脚, 启动后作普通输出正常)。
+// 历史: 6/7/8 → 43/44/45 (GPIO6=TF卡CS, 7/8=GY-39), 现 43/44 归还 UART0。
 // ============================================================
-#define I2S_BCLK_PIN        6       // I2S位时钟 → PCM5102A BCK
-#define I2S_LRC_PIN         7       // I2S左右声道时钟 → PCM5102A LCK
-#define I2S_DOUT_PIN        8       // I2S数据输出 → PCM5102A DIN
+#define I2S_BCLK_PIN        18      // I2S位时钟 → PCM5102A BCK (原 43)
+#define I2S_LRC_PIN         5       // I2S左右声道时钟 → PCM5102A LCK (原 44)
+#define I2S_DOUT_PIN        45      // I2S数据输出 → PCM5102A DIN
 #define I2S_PORT            I2S_NUM_0
 
 // PCM5102A 其他引脚（可选，根据模块）
@@ -59,6 +66,52 @@
 #define MIC_SAMPLE_RATE     16000   // 采样率 16kHz (语音识别用)
 #define MIC_SAMPLE_BITS     32      // 采样位深 32bit
 #define MIC_BUFFER_SIZE     512     // 缓冲区大小
+
+// ============================================================
+// 引脚分配 - 板载 SPI TF 卡 (2026-10-25 实测更正)
+// 原理图 + 实测: TF 座接在模块相邻脚 pin6~9 ——
+//   IO6=SD_CS / IO7=SD_MOSI / IO15=SD_SCK / IO16=SD_MISO
+// 之前的 11/12/13 是显示屏的 SDI/SCK/SDO (与触摸共用), 接 SD 永远 CMD0 无应答。
+// 显示走 FSPI(SPI2), SD 走独立 HSPI(SPI3), 两套引脚互不干扰。
+// ============================================================
+#define SD_CS_PIN           6
+#define SD_SCK_PIN          15
+#define SD_MOSI_PIN         7
+#define SD_MISO_PIN         16
+#define SD_SPI_FREQ         1000000   // 1MHz (已实测可挂载; 音频流足够)
+#define SD_MOUNT_POINT      "/sdcard"
+#define SD_MAX_FILES        5
+
+// ============================================================
+// 引脚分配 - GY-39 四合一气象传感器 (UART2)
+// 2026-10-25 (最终): CT(模块TX) -> GPIO8 = UART2 RX; DR(模块RX) -> GPIO2 = UART2 TX。
+//   GY-39 出厂不一定自动输出, 需固件发 A5 81 26 / A5 82 27 开启连续输出。
+//   GPIO2 因此归 GY-39 使用, 单色状态灯取消, 状态指示只保留板载 WS2812(GPIO48)。
+//   GPIO7 是 TF 卡 SD_MOSI, 不能接 GY-39。
+// 模块仅可 3.3V 供电。
+// ============================================================
+#define GY39_RX_PIN         8       // 只收: CT(模块TX) -> GPIO8
+#define GY39_TX_PIN         2       // 发命令: DR(模块RX) -> GPIO2 (原单色灯脚, 灯已取消)
+#define GY39_BAUD           9600
+// GY-39 的两条"连续输出"指令互斥: 发 0x81 只出光照帧, 发 0x82 只出温湿压海拔帧,
+// 没有"同时输出"的指令, 所以固件按窗口周期切换。
+// 原先 15s/105s: lux 很新鲜, 但温湿度每 120s 只有 15s 在更新, 时钟页温湿度最长要等
+// ~105s 才有新数据 -> 体感"刷新很慢"。现改为 60s/60s 对称:
+//   温湿度最旧 ~60s (原 ~105s), lux 最旧 ~60s (原 ~15s, 对自动背光/夜间熄屏仍足够),
+//   整周期仍 120s, 命令频率不变。
+#define GY39_TEMP_DWELL_MS  60000   // 0x82 温湿压海拔窗口
+#define GY39_LUX_DWELL_MS   60000   // 0x81 光照窗口 (背光自动亮度/夜间熄屏依赖)
+#define GY39_STALE_MS       150000  // 温湿压失效阈值 (须 > 一个完整周期 120s)
+#define GY39_LUX_STALE_MS   90000   // 光照失效阈值 (须 > 温湿压窗口 60s)
+
+// ============================================================
+// 背光自动亮度 / 夜间熄屏 (GPIO21, LEDC PWM)
+// ============================================================
+#define BL_PWM_FREQ         5000
+#define BL_PWM_BITS         10      // 0..1023
+#define BL_NIGHT_LUX        10.0f   // 低于该光照视为"夜间" (关灯后室内残余光通常 5~15lx)
+#define BL_NIGHT_HOLD_MS    5000    // 持续黑暗多久后熄屏 (5s, 触发更灵敏)
+#define BL_WAKE_MS          20000   // 触摸唤醒后强制点亮时长 (黑暗环境里保证有足够操作时间)
 
 // ============================================================
 // 引脚分配 - SPI 显示屏 ST7796S 480x320
@@ -95,16 +148,17 @@
 
 // ============================================================
 // 引脚分配 - 功能按键
+// 2026-10-25: KEY1(18)/KEY3(5) 已改作 I2S0 BCK/LRC (见上), 按键功能取消;
+// KEY2(4) 早已因与触摸 T_IRQ 冲突移除。现仅剩 BOOT(GPIO0) 物理按键。
 // ============================================================
-#define KEY1_PIN            18      // 按键1 - 音量+/功能
-#define KEY2_PIN            4       // 按键2 - 音量-/功能
-#define KEY3_PIN            5       // 按键3 - 模式切换/播放暂停
+#define KEY_BOOT_PIN        0       // BOOT 按键 (strapping, 仅输入)
 #define KEY_DEBOUNCE_MS     50      // 按键消抖时间
 
 // ============================================================
 // 引脚分配 - 状态指示
 // ============================================================
-#define STATUS_LED_PIN      2       // 状态LED (板载)
+#define STATUS_LED_PIN      -1      // 单色状态LED 已取消: GPIO2 改作 GY-39 UART2-TX (DR)
+#define STATUS_RGB_PIN      48      // 板载 WS2812B-5050RGB (原理图 LED2, DIN←IO48)
 #define LED_BLINK_INTERVAL  1000    // LED闪烁间隔(ms)
 
 // ============================================================
@@ -127,7 +181,8 @@
 // ============================================================
 // 和风天气API (免费: https://dev.qweather.com/)
 #define WEATHER_API_ENABLED     1
-#define WEATHER_API_KEY         "YOUR_QWEATHER_API_KEY"
+#define WEATHER_API_KEY         "49ae5235d64149ebaf6f15a8ece324d9"   // 与 WinCalender 同一 key
+#define WEATHER_API_HOST        "p85khy6vmp.re.qweatherapi.com"        // 和风控制台分配的专属 API Host
 #define WEATHER_CITY_ID         "101010100"  // 默认城市: 北京
 #define WEATHER_UPDATE_INTERVAL 1800000      // 30分钟更新一次
 #define WEATHER_LANG            "zh"         // 语言: 中文
