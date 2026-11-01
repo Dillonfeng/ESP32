@@ -1,17 +1,18 @@
 #include "ui_common.h"
 #include "gy39.h"
+#include "moon_img.h"   // 2026-11-01: 真实月面照片 (WinCalender images/moon.jpg, 64x64 RGB565)
 
-// 2026-10-25: 日期条温湿度来源 —— GY-39 本地传感优先, 其次天气缓存, 最后 mock。
-static void envTempHum(int& t, int& h) {
+// 2026-10-31: 温度改 float (时钟行显示 1 位小数); GY-39 本地传感优先, 其次天气缓存, 最后 mock。
+static void envTempHum(float& t, int& h) {
   const gy39::Data& g = gy39::get();
   if (g.ok) {
-    t = (int)lroundf(g.tempC);
+    t = g.tempC;
     h = (int)lroundf(g.humidity);
     return;
   }
   const WData& w = weather::get();
   if (w.ok) {
-    t = (int)lroundf(w.temp);
+    t = w.temp;
     h = w.humidity;
     return;
   }
@@ -661,51 +662,88 @@ static void drawAnalogClock(int h, int m, int s) {
   drawModeHint(STYLE_ANALOG);
 }
 
-// 月相图标: 暗底圆盘 + �?�? (上弦�?�? / 下弦�?�?), �?暗交界为内缩�?�?黄经�?
-void drawMoonIcon(int cx, int cy, int R, double phase) {
-  double cosP = cos(2.0 * M_PI * phase);
-  tft.fillCircle(cx, cy, R, MOON_DARK);
-  for (int yy = -R; yy <= R; yy++) {
-    double hw = sqrt((double)(R * R - yy * yy));   // 该�?�的圆盘半�??
-    double xl, xr;
-    if (phase <= 0.5) {                             // 上弦: �?部在�?
-      xl = cosP * hw; if (xl < -hw) xl = -hw;
-      xr = hw;
-    } else {                                          // 下弦: �?部在�?
-      xl = -hw;
-      xr = -cosP * hw; if (xr > hw) xr = hw;
-    }
-    if (xr >= xl) {
-      int x0 = (int)(cx + xl + 0.5);
-      int x1 = (int)(cx + xr + 0.5);
-      if (x1 >= x0) tft.drawFastHLine(x0, cy + yy, x1 - x0 + 1, MOON_LIT);
-    }
-  }
-  tft.drawCircle(cx, cy, R, MOON_EDGE);
+// 月相图标: 真实月面照片 + 按农历日的亮面遮罩 (WinCalender moonPhase 同款)。
+// 2026-11-01: 亮面改用 WinCalender images/moon.jpg (64x64 RGB565, 见 moon_img.h), 不再是纯金色。
+// waxing (ldn<15) lit right, waning (ldn>16) lit left, full (15-16) solid, new (1) dashed rim.
+// Only lit pixels drawn; background kept (DATE_STRIP / ALM_PAPER).
+static inline uint16_t moonTex(int px, int py, int R) {
+  int sx = ((px + R) * MOON_IMG_W) / (2 * R);
+  int sy = ((py + R) * MOON_IMG_H) / (2 * R);
+  if (sx < 0) sx = 0; else if (sx >= MOON_IMG_W) sx = MOON_IMG_W - 1;
+  if (sy < 0) sy = 0; else if (sy >= MOON_IMG_H) sy = MOON_IMG_H - 1;
+  return kMoonImg[sy * MOON_IMG_W + sx];
 }
 
-// 日期条第2行右侧: 湿度 + 温度 (右对齐)。
-// 独立成函数, 便于秒级局部刷新(只擦这一小块, 不整条重绘 -> 不闪)。
-// s_envLeft 记录上次温度文本左缘, 旧值更宽时也能擦干净。
-static int s_envLeft = 10000;
-static void drawEnvCells(int x1, int cy2) {
-  int envT = 0, envH = 0;
+void drawMoonIcon(int cx, int cy, int R, int ldn) {
+  const uint16_t MOON_RIM = 0xCD0C;   // #c9a063 (WinCalender new-moon rim)
+  double p = (1.0 - cos(2.0 * M_PI * (ldn - 1) / 29.53)) / 2.0;
+  double L = R / fmax(fabs(1.0 - 2.0 * p), 0.02);
+  if (L > 999.0) L = 999.0;
+  double dd = sqrt(L * L - (double)R * R);
+  // 2026-11-01 修正: 与 WinCalender moonPhaseSvg SVG path 逐点等价 ——
+  // p>0.5 凸月: terminator 圆心在亮侧(盈+dd/亏-dd), 亮面 = 盘 ∩ 圆内;
+  // p<=0.5 月牙: 圆心在暗侧(盈-dd/亏+dd), 亮面 = 盘内圆外 (右/左一弯细牙)。
+  bool waxing = (ldn < 15);
+  double txC = (p > 0.5) ? (waxing ? dd : -dd) : (waxing ? -dd : dd);
+  for (int py = -R; py <= R; py++) {
+    for (int px = -R; px <= R; px++) {
+      double dx = px, dy = py;
+      double rr = dx * dx + dy * dy;
+      if (rr > (double)R * R) continue;                    // outside disc
+      if (ldn == 1) {                                      // new moon: dashed circle (8 x 45deg alternating)
+        double ang = atan2(dy, dx);
+        int seg = (int)floor((ang + M_PI) / (M_PI / 4.0));
+        if (rr >= (R - 1.5) * (R - 1.5) && (seg & 1) == 0) tft.drawPixel(cx + px, cy + py, MOON_RIM);
+      } else if (ldn >= 15 && ldn <= 16) {                 // full moon: solid real moon photo
+        tft.drawPixel(cx + px, cy + py, moonTex(px, py, R));
+      } else {                                             // waxing/waning: gibbous lit=inside circle, crescent lit=outside
+        double tdx = dx - txC, tdy = dy;
+        double d2 = tdx * tdx + tdy * tdy;
+        if (p > 0.5 ? (d2 <= L * L) : (d2 >= L * L)) tft.drawPixel(cx + px, cy + py, moonTex(px, py, R));
+      }
+    }
+  }
+}
+
+
+// 2026-10-31: 日期条第2行右侧区块整刷: 室内湿度 | 室内温度(1位小数) | 月相名 | 月相图标 (WinCalender)。
+// drawDateRow 与秒级温湿度刷新共用; 擦除从 (月相图标左缘, 节气右缘+8) 取较大者起, 避免残影且不碰节气。
+static int s_jqRight = 0;       // drawDateRow 记录的节气文本右缘
+static void drawEnvCells(int x1, int cy2, int ldn) {
+  float envT = 0.0f; int envH = 0;
   envTempHum(envT, envH);                              // GY-39 优先
-  if (envT < -40) envT = -40; if (envT > 99) envT = 99;
+  if (envT < -40.0f) envT = -40.0f; if (envT > 99.0f) envT = 99.0f;
   if (envH < 0) envH = 0;     if (envH > 100) envH = 100;
-  char hms[10], tms[10];
+  // 2026-11-01: 只保留一个"室内"前缀: "室内 23.5°C 45%" (两个"室内"会把右块顶到节气文本上)
+  char hms[14], tms[16];
   snprintf(hms, sizeof(hms), "%d%%", envH);
-  snprintf(tms, sizeof(tms), "%d°C", envT);
-  int hR   = x1 - 12;
+  snprintf(tms, sizeof(tms), "室内 %.1f°C", envT);
+  int hR   = x1 - 6;                            // 2026-11-01: 右缘留 6px (原 12), 腾位给月相名
   int wH   = font16.textWidth(hms), wT = font16.textWidth(tms);
-  int tR   = hR - wH - 8;
+  int tR   = hR - wH - 6;                       // 温湿度间距 6px (原 8)
   int left = tR - wT;
-  int clrL = (s_envLeft < left) ? s_envLeft : left;
-  if (clrL < hR - 120) clrL = hR - 120;   // 限制擦除宽度, 不盖到左侧节气/月相长文本
-  tft.fillRect(clrL - 1, ROW2_TOP + 1, (hR + 2) - (clrL - 1), ROW2_H - 2, DATE_STRIP);
+  // 月相名 + 图标 (右对齐); 放不下时先丢掉名称只留图标, 仍放不下才隐藏 (不压节气)
+  const char* mn = nl_moon_name_short(ldn);   // 2026-11-01: 2字短名, 让名称+图标能装下
+  int mTw = font16.textWidth(mn);
+  int mR2  = left - 6;                          // 与温度间距 6px (原 8)
+  int Rm   = 9;
+  int mcx  = mR2 - mTw - 6 - Rm;                 // 名称+图标 方案
+  bool withName = (mcx >= s_jqRight + Rm + 2);   // 与节气最小间隙 2px (原 4)
+  if (!withName) mcx = left - 6 - Rm;            // 退化为仅图标
+  bool showMoon = (mcx >= s_jqRight + Rm + 2);
+  int eraseL = left;
+  if (showMoon) {
+    if (mcx - 1 < eraseL) eraseL = mcx - 1;      // 月相区也擦 (月相名宽度每天变化)
+  }
+  if (eraseL < s_jqRight + 8) eraseL = s_jqRight + 8;   // 不碰节气
+  if (eraseL > hR + 1) eraseL = hR + 1;                 // 防御: 擦除区非负
+  tft.fillRect(eraseL - 1, ROW2_TOP + 1, (hR + 2) - (eraseL - 1), ROW2_H - 2, DATE_STRIP);
   font16.drawStringFast(hR - wH, cy2 - 8, hms, humidColor(envH), DATE_STRIP);
   font16.drawStringFast(tR - wT, cy2 - 8, tms, tempColor(envT), DATE_STRIP);
-  s_envLeft = left;
+  if (showMoon) {
+    if (withName) font16.drawStringFast(mR2 - mTw, cy2 - 8, mn, 0xDE72, DATE_STRIP);   // 淡金 (与 WinCalender 纸色系)
+    drawMoonIcon(mcx, cy2, Rm, ldn);
+  }
 }
 
 // 日期�? 两�?�布�?
@@ -743,7 +781,6 @@ static void drawDateRow(int year, int mon, int mday, int wday) {
   nl_jq_info(year, mon, mday, &jqCur, &jqCurD, &jqNxt, &jqNxtD);
 
   // 月相
-  double mp = nl_moon_phase(year, mon, mday);
 
   // ---- �?: �?�?+星期 | 农历+干支+节日 ----
   int y1 = ROW1_TOP, h1 = ROW1_H, cy1 = y1 + h1 / 2;
@@ -780,25 +817,22 @@ static void drawDateRow(int year, int mon, int mday, int wday) {
       char rest[24];
       snprintf(rest, sizeof(rest), "%s %d天后", nl_jq_text[jqNxt], jqNxtD);
       font16.drawStringFast(tx, cy2 - 8, rest, SOFT_C, DATE_STRIP);
+      tx += font16.textWidth(rest);
     } else {
       char jqLine[48];
       snprintf(jqLine, sizeof(jqLine), "%s 已过%d天  %s %d天后",
                nl_jq_text[jqCur], jqCurD, nl_jq_text[jqNxt], jqNxtD);
       font16.drawStringFast(tx, cy2 - 8, jqLine, SOFT_C, DATE_STRIP);
+      tx += font16.textWidth(jqLine);
     }
   } else {
     font16.drawStringFast(tx, cy2 - 8, "--", SOFT_C, DATE_STRIP);
+    tx += font16.textWidth("--");
   }
-  // 右侧: 湿度 | 温度 (从右向左) + 月相名 + 月相图标
-  int mi = (int)(mp * 8.0 + 0.5) % 8;
-  drawEnvCells(x1, cy2);
+  // 2026-10-31: right block: indoor humidity | indoor temp(1dp) | moon name | moon icon (WinCalender)
+  s_jqRight = tx;                       // 2026-11-01: 真实文本右缘 (旧版只记起点, 月相机标会压住节气尾巴)
+  drawEnvCells(x1, cy2, ldn);
 
-  int mR = s_envLeft - 8;                            // 月相名右缘 (温度左缘再左移 8px)
-  int mTw = font16.textWidth(nl_moon_text[mi]);
-  font16.drawStringFast(mR - mTw, cy2 - 8, nl_moon_text[mi], 0xDE72, DATE_STRIP);  // 淡金
-  int R = 9;
-  int mcx = mR - mTw - 6 - R;
-  drawMoonIcon(mcx, cy2, R, mp);
 }
 
 // ---- BUILD17: clock render buffers -> heap (lazy alloc on clock entry, free on leave) ----
@@ -982,7 +1016,8 @@ void modeClock() {
     lastEnvMs = millis();
     if (!modeChanged) {
       tft.startWrite();
-      drawEnvCells(DATE_RIGHT, ROW2_TOP + ROW2_H / 2);
+      int ld2[31]; nl_month_days(year, mon, ld2);
+      drawEnvCells(DATE_RIGHT, ROW2_TOP + ROW2_H / 2, ld2[mday - 1] % 100);   // 2026-10-31: 传农历日 (月相 WinCalender)
       tft.endWrite();
     }
   }

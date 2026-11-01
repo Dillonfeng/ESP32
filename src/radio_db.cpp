@@ -76,10 +76,28 @@ void buildRadioCats() {
     RadioCat& c = radioCats[radioCatCount];
     truncCopy(c.label, sizeof(c.label), (const uint8_t*)label, (int)strlen(label));
     truncCopy(c.key, sizeof(c.key), (const uint8_t*)key, (int)strlen(key));
-    c.meta = meta; c.count = n;
-    c.group = grp;
-    c.sids = (n > 0) ? (uint16_t*)ps_malloc((size_t)n * 2) : nullptr;
-    if (c.sids && seq) memcpy(c.sids, seq, (size_t)n * 2);
+    c.meta = meta; c.count = 0; c.group = grp; c.sids = nullptr;
+    if (n > 0 && seq) {
+      // 2026-10-30 去重: stations.bin/backup json 存在重复记录(如 CNR-2经济之声 sid266/277 同 name+url,
+      // 安徽交通广播 sid841/845), radio_meta all[] 同一 sid 出现两次 -> 列表重复行 + 播放时双高亮.
+      // 每分类同一 sid 只保留一次; 不动数据文件/sid 编号, 收藏历史不受影响.
+      uint16_t* tmp = (uint16_t*)ps_malloc((size_t)n * 2);
+      if (tmp) {
+        int m = 0;
+        for (int i = 0; i < n; i++) {
+          bool dup = false;
+          for (int j = 0; j < m; j++) if (tmp[j] == seq[i]) { dup = true; break; }
+          if (!dup) tmp[m++] = seq[i];
+        }
+        c.count = m;
+        if (m > 0) { c.sids = (uint16_t*)ps_malloc((size_t)m * 2); if (c.sids) memcpy(c.sids, tmp, (size_t)m * 2); }
+        heap_caps_free(tmp);
+      } else {
+        c.count = n;
+        c.sids = (uint16_t*)ps_malloc((size_t)n * 2);
+        if (c.sids) memcpy(c.sids, seq, (size_t)n * 2);
+      }
+    }
     radioCatCount++;
   };
   // ---- 组0 频道: 全国 + 中央/国际/海外 ----

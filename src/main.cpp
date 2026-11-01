@@ -104,6 +104,9 @@ bool modeDrawn[MODE_COUNT] = {false, false, false, false};
 // 交错, �?TE 面板�?描撕�? -> 收音�?天气 之间出现"彩色竖条"(长度随机)。故样式切换�?�?
 // modeChanged(重绘页面), 不置 navDirty(不动导航�?�?
 bool navDirty = true;
+// 2026-10-31: 全屏无底部功能切换栏 —— 底部点击唤出导航栏 (peek), 5s 无操作自动收起。
+bool navPeek = false;
+uint32_t navPeekAt = 0;
 
 // ========== 导航栏布�? ==========
 #define NAV_BAR_Y       288
@@ -188,7 +191,7 @@ bool sideScrollDirty = true;    // 侧栏(整列)需局部刷新 (2026-09-27)   
 // ========== 天气状�??==========
 bool weatherInited = false;
 // 温度/湿度 (占位 mock �? 接入天气 API 后替�? 默�?��??make_preview.py �?�?
-int mockTempC = 25;
+float mockTempC = 25.0f;   // 2026-10-31: float, 时钟行显示 1 位小数
 int mockHumidity = 60;
 
 // ========== 翻页时钟 (机�?�翻页�??/ Split-Flap) ==========
@@ -266,13 +269,14 @@ uint16_t eventColor(const char* name) {
 
 // 温度颜色: 随数值变�?(越冷越蓝, 越热越红) �?天气接入后在 drawDateRow 使用
 // 冰点以下用浅�?(0x6CF1) 而非�?�? (0x001F), 避免在深色背�?上不�?�?
-uint16_t tempColor(int c) {
-  if (c <= 0)  return 0x6CF1;       // 冰点以下 - 浅蓝 (高�?�比�?)
-  if (c <= 8)  return TFT_CYAN;     // �?
-  if (c <= 15) return TFT_GREEN;    // �?
-  if (c <= 24) return COLOR_GOLD;   // 舒�??
-  if (c <= 29) return TFT_YELLOW;   // �?
-  return TFT_RED;                   // 炎热 (>30°)
+// 2026-10-31: 参数改 float, 支持 1 位小数温度 (冰点判断含 -0.5 等)
+uint16_t tempColor(float c) {
+  if (c <= 0.0f)  return 0x6CF1;      // 冰点以下 - 浅蓝 (高�?�比�?)
+  if (c <= 8.0f)  return TFT_CYAN;    // �?
+  if (c <= 15.0f) return TFT_GREEN;   // �?
+  if (c <= 24.0f) return COLOR_GOLD;  // 舒�??
+  if (c <= 29.0f) return TFT_YELLOW;  // �?
+  return TFT_RED;                     // 炎热 (>30°)
 }
 
 // 湿度颜色: 随数值变�?(过干偏黄, 舒�?�绿, 过湿偏蓝)
@@ -471,6 +475,16 @@ void netTask(void* arg) {
   }
 }
 
+// 2026-10-31: 全屏无导航栏 —— 底部 NAV_BAR_Y..320 擦为当前页面背景 (与 radio_ui.cpp C_BG 同值)。
+#define RGBC(r,g,b) ((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3))
+const uint16_t RADIO_LIST_BG = RGBC(0xF5,0xF7,0xFA);   // = radio_ui.cpp C_BG
+void eraseNavBar() {
+  uint16_t bg = COLOR_BG;
+  if (currentMode == MODE_CALENDAR) bg = CAL_LIGHT_BG;
+  else if (currentMode == MODE_RADIO) bg = RADIO_LIST_BG;
+  tft.fillRect(0, NAV_BAR_Y, 480, 320 - NAV_BAR_Y, bg);
+}
+
 void drawNavBar() {
   tft.fillRect(0, NAV_BAR_Y, 480, NAV_BAR_HEIGHT, COLOR_NAV_BG);
   for (int i = 0; i < NAV_BTN_COUNT; i++) {
@@ -522,6 +536,9 @@ void handleTouch() {
       } else if (tx >= RADIO_LIST_X && ty >= RADIO_LIST_TOP && ty < RADIO_LIST_BOT) {
         touchScrollZone = 1;
       } else touchScrollZone = 0;
+    } else if (currentMode == MODE_WEATHER && weatherTyphoonModalOpen()) {
+      touchScrollZone = 3;                        // 台风弹窗: 上下拖动查看多个台风
+      touchScrollStartScrollTop = weatherTyphoonScrollTop();
     } else touchScrollZone = 0;
   }
 
@@ -541,7 +558,9 @@ void handleTouch() {
       int totalH = sideTotalH();
       int smax = max(0, totalH - (NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H)));
       int snap = 0;
-      if (regionScrollTop >= smax - 13) snap = smax;
+      // 2026-10-30 问题A 根治: 贴底阈值 13px -> 40px (最后一行 28px 高 + 余量)。
+      // 旧阈值: 拖到 smax-14 松手 -> 不满足贴底 -> 吸附回最后分类行顶 (距 smax 208px) -> 弹回一大段
+      if (regionScrollTop > smax - 40) snap = smax;
       else {
         for (int k = 0; k < radioCatCount; k++) {
           int t = sideRowTop(k);
@@ -555,14 +574,20 @@ void handleTouch() {
     if (touchDidScroll && touchScrollZone == 1 && currentMode == MODE_RADIO) {
       int totalPix = curCount() * RADIO_ROW_H;
       int smax = max(0, totalPix - RADIO_LIST_H);
-      int snap = (listScrollTop + RADIO_ROW_H / 2) / RADIO_ROW_H * RADIO_ROW_H;
+      int snap;
+      // 2026-10-30 右列弹回根治: 最后一行可见(>0px)即贴底 smax, 不再按行对齐弹回。
+      // 旧逻辑: listScrollTop 停在 smax-25 附近(噪声) -> snap 取整回 smax-48 -> 松手弹回一行
+      if (listScrollTop >= smax - RADIO_ROW_H) snap = smax;
+      else snap = (listScrollTop + RADIO_ROW_H / 2) / RADIO_ROW_H * RADIO_ROW_H;
       if (snap > smax) snap = smax;
       if (snap != listScrollTop) { listScrollTop = snap; listScrollDirty = true; }
     }
     if (touchDidScroll) touchScrollZone = 0;   // 拖拽结束 -> 复位分区 (避免下次按下误判)
     if (!touchDidScroll && dur < 800 && abs(dy) < 15 && abs(dx) < 15) {
       Serial.printf("[TOUCH] tap @ (%d,%d) dur=%lu mode=%d\n", touchStartX, touchStartY, (unsigned long)dur, (int)currentMode);  // 临时调试: 确认触摸坐标与屏幕坐标一致
-      if (touchStartY >= NAV_BAR_Y && !weatherCoverActive() && !showingFullscreen) {
+      if (touchStartY >= NAV_BAR_Y && !weatherCoverActive() && !showingFullscreen && currentMode != MODE_WEATHER) {
+        // 2026-10-31: 全屏无导航栏 —— 底部第一次点击 = 唤出导航栏 (peek), 5s 无操作自动收起
+        if (!navPeek) { navPeek = true; navPeekAt = millis(); }
         int btnIdx = touchStartX / NAV_BTN_WIDTH;
         if (btnIdx >= 0 && btnIdx < MODE_COUNT) {
           if (btnIdx != currentMode) {
@@ -608,18 +633,23 @@ void handleTouch() {
     touchDidScroll = false;
   }
 
-  if (isDown && currentMode == MODE_RADIO) {
+  if (isDown && (currentMode == MODE_RADIO || touchScrollZone == 3)) {
     int dy = ty - touchStartY;
     if (abs(dy) > 10 && !touchDidScroll) touchDidScroll = true;
     if (touchDidScroll) {
-      if (touchScrollZone == 2) {
+      if (touchScrollZone == 3) {
+        // 台风弹窗: 像素级 1:1 跟手 (上划看后面的台风), 只重绘内容区
+        int ns = touchScrollStartScrollTop - dy;
+        if (abs(ns - weatherTyphoonScrollTop()) >= 2) weatherTyphoonScrollTo(ns);
+      } else if (touchScrollZone == 2) {
         // 2026-09-27: 侧栏整列(分组标题+分类行)一起滚动, 像素级 1:1 跟手(最灵敏);
         // 局部刷新: 只重绘 150x264 侧栏 (sideScrollDirty), 不整页 (旧版每行整页重绘, SPI 要 ~100ms
         // 阻塞主循环, 拖拽采样跟不上 -> 不灵敏/卡顿)。2026-10-22: 总高用 sideTotalH (含组标题行)
         int totalH = sideTotalH();
         int smax = max(0, totalH - (NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H)));
         int ns = constrain(touchScrollStartRegion - dy, 0, smax);
-        if (ns != regionScrollTop) { regionScrollTop = ns; sideScrollDirty = true; }
+        // 2026-10-30 去抖: 吸收 XPT2046 采样噪声(±1px), 防 listScrollTop 微跳触发全列重绘推屏(闪烁)
+        if (abs(ns - regionScrollTop) >= 2) { regionScrollTop = ns; sideScrollDirty = true; }
       } else if (touchScrollZone == 1) {
         // 自然滚动(上划=看下面更多电台)。2026-10-22 问题③: 与左侧统一为像素级
         // 1:1 跟手 —— listScrollTop 从"行索引"改为"像素偏移" (绘制/命中按像素反算)。
@@ -628,7 +658,8 @@ void handleTouch() {
         int ns = touchScrollStartScrollTop - dy;
         if (ns < 0) ns = 0;
         if (ns > smax) ns = smax;
-        if (ns != listScrollTop) { listScrollTop = ns; listScrollDirty = true; }
+        // 2026-10-30 去抖: 吸收采样噪声(±1px), 防 listScrollTop 微跳触发全列重绘推屏(闪烁)
+        if (abs(ns - listScrollTop) >= 2) { listScrollTop = ns; listScrollDirty = true; }
       }
     }
     touchLastX = tx; touchLastY = ty;
@@ -970,6 +1001,15 @@ void loop() {
         modeChanged = true;                          // 校准后强制重绘，恢复主界面
         navDirty = true;                             // CALIB7: 导航栏由 navDirty 控制，校准期间被黑屏擦掉必须重绘
       }
+      else if (c == 'w' || c == 'W') {               // 强制天气刷新 (fast+full)
+        weather::forceRefresh();
+        Serial.println("[CMD] force weather refresh");
+      }
+      else if (c == 'p' || c == 'P') {               // 诊断: 切到天气页 (复现"播放中在天气页刷新")
+        currentMode = MODE_WEATHER;
+        modeChanged = true; navDirty = true;
+        Serial.println("[CMD] switch to weather page");
+      }
       if (sw) {
         Serial.printf("[DEBUG] serial switch -> %c\n", c);
         radioPlaying = false;   // BUILDV5-NETTASK: 先停 netTask 泵（避免切台与 loop 并发）
@@ -1003,7 +1043,7 @@ void loop() {
       strcmp(radioPinnedKey(), radioPinnedUsed) != 0) {
     buildRadioCats();
     if (currentCat >= radioCatCount) currentCat = 0;   // old index may be out of range after rebuild
-    tft.startWrite(); drawRadioRegionSidebar(); tft.endWrite();   // R1: wrap sidebar partial-refresh
+    drawRadioRegionSidebar();   // 内部自包 startWrite (R1)
     drawRadioList(); drawRadioPlayBar();   // repaint right pane (list + playbar)
   }
 
@@ -1034,7 +1074,15 @@ void loop() {
 
   // �?�?"导航选中项变�?(navDirty)时重绘�?�航�?: 既避免每帧重绘的�?�?, 也避免时钟样�?
   // 切换(不改变�?�中�?时�??重绘导航栏�?�成的彩色撕裂竖条�??
-  if (navDirty) { drawNavBar(); navDirty = false; }
+  // 2026-10-31: 全屏无底部功能切换栏 —— navPeek 时画导航栏, 否则擦底部为页面背景。
+  // 天气页全屏自绘 (齿轮唤出); 收音机全屏不擦 (双击返回提示条区域)。
+  if (navPeek && millis() - navPeekAt >= NAV_PEEK_MS) { navPeek = false; navDirty = true; }
+  if (navDirty) {
+    if (currentMode != MODE_WEATHER && !showingFullscreen) {
+      if (navPeek) drawNavBar(); else eraseNavBar();
+    }
+    navDirty = false;
+  }
   // BUILDV5-HLSFIX: 锁释放移到本行——覆盖 L798 drawNavBar（cap_fix10 实证 navDirty
   // 重绘在锁外与 touchScanTask 并发 → 链A TFT pushSwapBytePixels 崩溃）
   if (g_spiMutex) xSemaphoreGive(g_spiMutex);

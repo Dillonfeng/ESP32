@@ -62,12 +62,16 @@ public:
     // 2026-10-29 BUILDV5-FB: 帧缓冲输出模式 —— radio 列表/侧栏拖动防闪烁。
     // 拖动帧整列在 PSRAM 帧缓冲内合成后单次推屏, 消除 ST7796S 无 TE 同步时
     // "fillRect 擦→画" 中间态被面板扫到的半屏闪烁 (调试铁律 R2 精神的帧级实现)。
-    // s_fbTarget 非空时 AA 文字写入该缓冲 (坐标=缓冲内屏幕坐标, 行宽 s_fbW/高 s_fbH),
-    // 否则推屏幕 (默认, 全项目其他绘制不受影响)。
+    // s_fbTarget 非空时 AA 文字写入该缓冲 (坐标=屏幕绝对坐标 - 缓冲原点 s_fbOX/s_fbOY,
+    // 行宽 s_fbW/高 s_fbH), 否则推屏幕 (默认, 全项目其他绘制不受影响)。
+    // ⚠️ 花屏教训 (2026-10-29): 局部缓冲必须带原点换算 —— 上次无 origin 时
+    //    用屏幕绝对坐标写局部缓冲 -> 越界错乱 -> 条纹花屏。
     static uint16_t* s_fbTarget;   // 帧缓冲目标 (nullptr=屏幕)
     static int       s_fbW;        // 帧缓冲行宽 (像素)
     static int       s_fbH;        // 帧缓冲高度 (像素, 越界保护)
-    static void fbBegin(uint16_t* buf, int w, int h) { s_fbTarget = buf; s_fbW = w; s_fbH = h; }
+    static int       s_fbOX;       // 缓冲在屏幕上的原点 x (左上角屏幕坐标)
+    static int       s_fbOY;       // 缓冲在屏幕上的原点 y (左上角屏幕坐标)
+    static void fbBegin(uint16_t* buf, int w, int h, int ox, int oy) { s_fbTarget = buf; s_fbW = w; s_fbH = h; s_fbOX = ox; s_fbOY = oy; }
     static void fbEnd() { s_fbTarget = nullptr; }
 
 private:

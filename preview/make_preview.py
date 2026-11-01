@@ -157,7 +157,7 @@ EVENT_COLORS = {
     "元宵节": 0xFE4C, "中秋节": 0xFE4C, "重阳节": 0xFE4C, "腊八节": 0xFE4C,
     "小年": 0xFE4C, "龙抬头": 0xFE4C, "端午节": 0xFE4C, "青年节": 0xFE4C,
 }
-_DEFAULT_EVENT_COLOR = SOFT
+_DEFAULT_EVENT_COLOR = 0x94F6   # 原始 565 (SOFT=c565(0x94F6)); 2026-10-31: 直接存 565, 避免 event_color 二次 c565 崩 (未收录节日如万圣节)
 def event_color(name):
     return c565(EVENT_COLORS.get(name, _DEFAULT_EVENT_COLOR))
 
@@ -654,6 +654,44 @@ def moon_phase(y, m, d):
 
 def moon_name(phase):
     return MOON_NAMES[int(phase * 8 + 0.5) % 8]
+
+
+def win_moon_name(ldn):
+    """2026-10-31: 月相名称按农历日 (WinCalender 老黄历.hta moonPhaseName 同款表)"""
+    if ldn == 1:
+        return "新月(朔)"
+    if 15 <= ldn <= 16:
+        return "满月(望)"
+    if ldn <= 6:
+        return "娥眉月"
+    if ldn <= 8:
+        return "上弦月"
+    if ldn < 15:
+        return "盈凸月"
+    if ldn <= 21:
+        return "亏凸月"
+    if ldn <= 23:
+        return "下弦月"
+    return "残月"
+
+
+def win_moon_name_short(ldn):
+    """2026-11-01: 2字短名 (与固件 nl_moon_name_short 一致, 时钟行2 省空间)"""
+    if ldn == 1:
+        return "新月"
+    if 15 <= ldn <= 16:
+        return "满月"
+    if ldn <= 6:
+        return "娥眉"
+    if ldn <= 8:
+        return "上弦"
+    if ldn < 15:
+        return "盈凸"
+    if ldn <= 21:
+        return "亏凸"
+    if ldn <= 23:
+        return "下弦"
+    return "残月"
 
 
 def load_masks():
@@ -1417,6 +1455,7 @@ def draw_radio_fullscreen(d, cur_cat, playing_idx=-1, favorited=False):
     左L频谱竖条 | 台名24px/频率42px+MHz/meta/控制按钮−播放+ | 右R频谱竖条 +
     底部30px 双击提示. 镜像固件 drawStationFullscreen. 频谱用静态模拟竖条."""
     d.rectangle([0, 0, 479, NAV_Y - 1], fill=RADIO_CARD)
+    d.rectangle([0, NAV_Y, 479, 319], fill=RADIO_CARD)   # 2026-10-31: 全屏无导航栏 -> 底部同列表底 (镜像固件 eraseNavBar)
     stations = radio_cat_stations(cur_cat)
     if playing_idx < 0 or playing_idx >= len(stations):
         return
@@ -1496,6 +1535,7 @@ def draw_radio_scene(cur_cat=0, list_scroll_top=0, region_scroll_top=0,
     """收音机页面 (2026-10-22 三分组 + 浅色 + 像素滚动 + 设计稿全屏; 全屏时不画导航栏, 镜像固件)."""
     img = Image.new("RGB", (480, 320), (0, 0, 0))
     d = ImageDraw.Draw(img)
+    d.rectangle([0, NAV_Y, 479, 319], fill=RADIO_CARD)   # 2026-10-31: 全屏无导航栏 -> 底部同列表底 (镜像固件 eraseNavBar)
     draw_radio_header(d, cur_cat)
     draw_radio_sidebar(d, cur_cat, region_scroll_top)
     draw_radio_list(d, cur_cat, list_scroll_top, playing_idx, favorites)
@@ -1506,7 +1546,7 @@ def draw_radio_scene(cur_cat=0, list_scroll_top=0, region_scroll_top=0,
     if fullscreen:
         draw_radio_fullscreen(d, cur_cat, playing_idx, cur_fav)
     else:
-        draw_nav(d, sel=2)   # 导航栏选中"收音机" (全屏页无导航, 镜像固件 modeRadio)
+        pass  # 2026-10-31 全屏无导航栏: draw_nav 已停用 (镜像固件全屏)
     return img
 
 # 预览日期: 默认取"今天"(与设备 NTP 一致, 方便对照),
@@ -1537,25 +1577,83 @@ def date_strings():
     mp = moon_phase(y, m, d)
     return dict(date=date, week=week, lunar=lunar, gz=gz, fest=fest,
                 cur=cur_name, cur_d=cur_d, nxt=nxt_name, nxt_d=nxt_d,
-                mp=mp, moon=moon_name(mp))
+                mp=mp, moon=moon_name(mp), ldn=ldn)   # 2026-10-31: 加农历日 (月相 WinCalender)
 
 
-def draw_moon(d, cx, cy, R, phase):
-    """在 (cx,cy) 画月相图标: 暗底圆盘 + 亮部 (上弦亮右 / 下弦亮左)。"""
-    cosP = math.cos(2 * math.pi * phase)
-    d.ellipse([cx - R, cy - R, cx + R, cy + R], fill=MOON_DARK)
-    for yy in range(-R, R + 1):
-        hw = math.sqrt(max(0.0, R * R - yy * yy))
-        if phase <= 0.5:                       # 上弦: 亮部在右
-            xl, xr = max(cosP * hw, -hw), hw
-        else:                                  # 下弦: 亮部在左
-            xl, xr = -hw, min(-cosP * hw, hw)
-        if xr >= xl:
-            x0 = int(round(cx + xl))
-            x1 = int(round(cx + xr))
-            if x1 >= x0:
-                d.line([x0, cy + yy, x1, cy + yy], fill=MOON_LIT)
-    d.ellipse([cx - R, cy - R, cx + R, cy + R], outline=MOON_EDGE)
+MOON_SRC = r"D:\WinCalender\images\moon.jpg"
+_moon_tex_cache = None   # None=未加载, False=不可用, Image=已加载
+
+def _moon_tex():
+    """2026-11-01: 真实月面照片 (WinCalender images/moon.jpg) -> 64x64, 与固件 moon_img.h 同源。"""
+    global _moon_tex_cache
+    if _moon_tex_cache is None:
+        try:
+            im = Image.open(MOON_SRC).convert("RGB")
+            W, H = im.size
+            cy, cx = H // 2, W // 2
+            p = im.load()
+            lum = lambda c: (c[0] * 299 + c[1] * 587 + c[2] * 114) // 1000
+            def longest_run(vals):
+                best, cur = (0, 0), None
+                for i in vals:
+                    if cur and i == cur[1] + 1:
+                        cur = (cur[0], i)
+                        if cur[1] - cur[0] > best[1] - best[0]:
+                            best = cur
+                    else:
+                        cur = (i, i)
+                return best
+            x0, x1 = longest_run([x for x in range(W) if lum(p[x, cy]) > 25])
+            y0, y1 = longest_run([y for y in range(H) if lum(p[cx, y]) > 25])
+            side = int(min(x1 - x0 + 1, y1 - y0 + 1)) - 4
+            bx = int(round((x0 + x1) / 2.0 - side / 2.0))
+            by = int(round((y0 + y1) / 2.0 - side / 2.0))
+            _moon_tex_cache = im.crop((bx, by, bx + side, by + side)).resize((64, 64), Image.LANCZOS)
+        except Exception:
+            _moon_tex_cache = False
+    return _moon_tex_cache or None
+
+
+def draw_moon(d, cx, cy, R, ldn):
+    """2026-10-31: WinCalender 月牙 (老黄历.hta moonPhaseSvg 同款, 与固件 drawMoonIcon 逐点一致):
+    盈(ldn<15)亮右、亏(ldn>16)亮左、满月(15-16)实心、新月(1)虚线圆; 只画亮点, 背景保留.
+    2026-11-01: 亮面贴 WinCalender images/moon.jpg 真实月面纹理 (固件 moon_img.h 同源)。"""
+    GOLD = (244, 197, 66)   # #f4c542 (无图兜底)
+    RIM = (201, 160, 99)    # #c9a063
+    tex = _moon_tex()
+
+    def lit_color(px, py):
+        if not tex:
+            return GOLD
+        sx = min(63, max(0, int((px + R) * 64 / (2 * R))))
+        sy = min(63, max(0, int((py + R) * 64 / (2 * R))))
+        return tex.getpixel((sx, sy))
+
+    p = (1.0 - math.cos(2 * math.pi * (ldn - 1) / 29.53)) / 2.0
+    L = R / max(abs(1.0 - 2.0 * p), 0.02)
+    L = min(L, 999.0)
+    dd = math.sqrt(max(0.0, L * L - R * R))
+    # 2026-11-01 修正: 与 moonPhaseSvg SVG path 逐点等价 ——
+    # p>0.5 凸月: 圆心在亮侧(盈+dd/亏-dd), 亮=盘∩圆内; p<=0.5 月牙: 圆心在暗侧, 亮=盘内圆外。
+    waxing = ldn < 15
+    txC = (dd if waxing else -dd) if p > 0.5 else (-dd if waxing else dd)
+    for py in range(-R, R + 1):
+        for px in range(-R, R + 1):
+            rr = px * px + py * py
+            if rr > R * R:
+                continue
+            if ldn == 1:
+                ang = math.atan2(py, px)
+                seg = int(math.floor((ang + math.pi) / (math.pi / 4.0)))
+                if rr >= (R - 1.5) ** 2 and (seg & 1) == 0:
+                    d.point((cx + px, cy + py), fill=RIM)
+            elif 15 <= ldn <= 16:
+                d.point((cx + px, cy + py), fill=lit_color(px, py))
+            else:
+                tdx, tdy = px - txC, py
+                d2 = tdx * tdx + tdy * tdy
+                if (d2 <= L * L) if p > 0.5 else (d2 >= L * L):
+                    d.point((cx + px, cy + py), fill=lit_color(px, py))
 
 
 def draw_date(d):
@@ -1596,20 +1694,35 @@ def draw_date(d):
         cur_s = "今日" + info["cur"]
         hw_text(d, xj, cy2, cur_s, event_color(info["cur"]), ROW2_BG, "lm")
         xj += int(aa_text_width(cur_s)) + 10
-        hw_text(d, xj, cy2, "%s %d天后" % (info["nxt"], info["nxt_d"]), SOFT, ROW2_BG, "lm")
+        rest = "%s %d天后" % (info["nxt"], info["nxt_d"])
+        hw_text(d, xj, cy2, rest, SOFT, ROW2_BG, "lm")
+        xj += int(aa_text_width(rest))
     else:
-        hw_text(d, xj, cy2,
-               "%s 已过%d天   %s %d天后" % (info["cur"], info["cur_d"], info["nxt"], info["nxt_d"]),
-               SOFT, ROW2_BG, "lm")
-    # 右侧: 湿度 | 温度 | 月相名 | 月相图标 (自右向左)
-    x = DATE_RIGHT - 12
-    hw_text(d, x, cy2, "%d%%" % MOCK_HUMIDITY, humid_color(MOCK_HUMIDITY), ROW2_BG, "rm")
-    x -= aa_text_width("%d%%" % MOCK_HUMIDITY) + 8
-    hw_text(d, x, cy2, "%d°C" % int(MOCK_TEMP), temp_color(int(MOCK_TEMP)), ROW2_BG, "rm")
-    x -= aa_text_width("%d°C" % int(MOCK_TEMP)) + 8
-    hw_text(d, x, cy2, info["moon"], MOON_TXT, ROW2_BG, "rm")
-    x -= aa_text_width(info["moon"]) + 6
-    draw_moon(d, int(x) - 8, cy2, 9, info["mp"])
+        jq_line = "%s 已过%d天   %s %d天后" % (info["cur"], info["cur_d"], info["nxt"], info["nxt_d"])
+        hw_text(d, xj, cy2, jq_line, SOFT, ROW2_BG, "lm")
+        xj += int(aa_text_width(jq_line))
+    jq_r = xj   # 2026-11-01: 节气文本真实右缘 (固件 s_jqRight 同款)
+    # 右侧: 室内湿度 | 室内温度(1位小数) | 月相名 | 月相图标 (WinCalender 画法, 自右向左, 2026-10-31)
+    # 2026-11-01: 右缘 6px + 间距 6px (固件 drawEnvCells 收紧同款, 腾位给月相名)
+    x = DATE_RIGHT - 6
+    # 2026-11-01: 只保留一个"室内"前缀 (与固件 drawEnvCells 一致): "室内 23.5°C 45%"
+    hms = "%d%%" % MOCK_HUMIDITY
+    hw_text(d, x, cy2, hms, humid_color(MOCK_HUMIDITY), ROW2_BG, "rm")
+    x -= aa_text_width(hms) + 6
+    tms = "室内 %.1f°C" % MOCK_TEMP
+    hw_text(d, x, cy2, tms, temp_color(MOCK_TEMP), ROW2_BG, "rm")
+    x -= aa_text_width(tms) + 6
+    mn = win_moon_name_short(info["ldn"])   # 2026-11-01: 2字短名 (固件 drawEnvCells 同款)
+    mTw = int(aa_text_width(mn))
+    Rm = 9
+    mcx = int(x) - mTw - 6 - Rm              # 名称+图标 (x 已是 left-6)
+    with_name = mcx >= jq_r + Rm + 2         # 与节气最小间隙 2px (固件同款)
+    if not with_name:
+        mcx = int(x) - Rm                    # 退化: 仅图标 (固件同款)
+    if mcx >= jq_r + Rm + 2:
+        if with_name:
+            hw_text(d, x, cy2, mn, MOON_TXT, ROW2_BG, "rm")
+        draw_moon(d, mcx, cy2, Rm, info["ldn"])
 
 # ---- 模拟指针表盘 (白色表盘 + 黑指针/刻度 + 位图数字 + 红秒针, 与 main.cpp drawAnalogClock 完全一致) ----
 AC_FACE  = (255, 255, 255)   # 白色表盘 (无外圈描边)
@@ -1694,7 +1807,7 @@ def draw_analog_scene(h, m, s, ms=0):
     draw_mode_hint(d, 1)
     # 指针样式不显示 "NTP OK" (与 main.cpp 一致), 表盘放大到顶部
     draw_date(d)
-    draw_nav(d)
+    # 2026-10-31 全屏无导航栏: draw_nav 已停用 (镜像固件全屏)
     return img
 
 
@@ -1955,14 +2068,15 @@ def draw_calendar_scene(year, month, today=None, selected=None, picker=False, pi
         today = PREVIEW_DATE
     # ---- 浅色背景 (仅日历页) ----
     d.rectangle([0, 0, 479, NAV_Y - 1], fill=CAL_LIGHT_BG)
+    d.rectangle([0, NAV_Y, 479, 319], fill=CAL_LIGHT_BG)   # 2026-10-31: 全屏无导航栏 -> 底部同日历底 (镜像固件 eraseNavBar)
     if picker:
         _draw_cal_picker(d, pick_ym or (year, month))
-        draw_nav(d, sel=1)
+        # 2026-10-31 全屏无导航栏: draw_nav 已停用 (镜像固件全屏)
         return img
     if almanac:
         sd = selected if selected is not None else (today.year, today.month, today.day)
         draw_almanac_popup(img, d, sd[0], sd[1], sd[2])   # 黄历弹层 (全屏覆盖, 与 main.cpp calAlmOpen 分支一致)
-        draw_nav(d, sel=1)
+        # 2026-10-31 全屏无导航栏: draw_nav 已停用 (镜像固件全屏)
         return img
     # ---- 顶部: 上月 | 月份标题(点击选年月) | 下月 ----
     d.text((24, 24), "<", font=F16, fill=CAL_HDR, anchor="mm")
@@ -2039,7 +2153,7 @@ def draw_calendar_scene(year, month, today=None, selected=None, picker=False, pi
                         fill=CYAN if at_today else CAL_STRIP_L)
     d.text((bt_x + 8, cys), bt_txt, font=F16,
            fill=BLACK if at_today else CAL_TITLE, anchor="lm")
-    draw_nav(d, sel=1)
+    # 2026-10-31 全屏无导航栏: draw_nav 已停用 (镜像固件全屏)
     return img
 
 
@@ -2236,7 +2350,7 @@ def draw_weather_scene(w=None):
         hw_text(d, x0 + hw2 + 4, 274 + 8, lb, W_DIM,  W_BG, "lm")
 
     # 导航栏 (选中 天气=idx 3)
-    draw_nav(d, sel=3)
+    # 2026-10-31 全屏无导航栏: draw_nav 已停用 (镜像固件全屏)
     return img
 
 
@@ -2260,7 +2374,7 @@ def scene(digits, flips=None, gears=True, white=True, gear_scroll=0.0):
         draw_roller(d, GAP1_CX, CARD_TOP, CARD_TOP + CARD_H - 1, gear_scroll)
         draw_roller(d, GAP2_CX, CARD_TOP, CARD_TOP + CARD_H - 1, gear_scroll)
     draw_mode_hint(d, 0)   # 顶右侧样式提示 (与实机一致)
-    draw_nav(d)
+    # 2026-10-31 全屏无导航栏: draw_nav 已停用 (镜像固件全屏)
     return img
 
 def labeled(img, text):

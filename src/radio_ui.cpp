@@ -12,28 +12,105 @@
 int radioFailCnt = 0;        // 起播连接失败计数 (3 次彻底停)
 uint32_t radioWasRunAt = 0;  // watchdog timer base
 
-// ===== 2026-10-29 帧缓冲方案回退 (直绘) =====
-// 花屏 regression: BISECT-1 推常量纯色无条纹 => pushImage 分块链路正常, 但恢复 memcpy 读 g_fb 后花屏。
-// 为最快消除 regression, 直接回退帧缓冲: fb* 原语全部改直绘 tft (调用点不动),
-// xfont compositeGlyph 的 s_fbTarget 恒 null 自动走 pushImage 直推。代价: 拖动闪烁(问题①)回到旧状态。
-static void fbEnsure() { }
-static void fbBegin() { }
-static void fbEnd() { }
+// ===== 滚动区帧缓冲 (2026-10-29 重建, 吸取花屏教训) =====
+// 花屏根因(已定位): 上次局部滚动区缓冲 + compositeGlyph 用"屏幕绝对坐标"写缓冲 (无原点换算)
+//   -> 写入越界错乱 -> 条纹花屏。本次 XFont 帧缓冲分支已加 s_fbOX/s_fbOY 原点换算,
+//   缓冲坐标 = 屏幕坐标 - 缓冲原点, 严格裁剪到缓冲范围。
+// 缓冲放 PSRAM: 侧栏 150x236 + 列表 330x192 (合计 ~193KB, 8MB 够, 不占内部 RAM/clockPool)。
+// 推屏: memcpy 到内部 RAM 中转块(推屏瞬间分配, 用完释放) 分块 pushImage (R3: PSRAM 不能直推)。
+// 教训: ① 分配后立即清零(未初始化=随机条纹) ② fb* 写入裁剪缓冲范围 ③ 分块偏移必须正确 ④ 推屏 startWrite。
+#define FB_SIDE_X   0
+#define FB_SIDE_Y   (RADIO_HEADER_H + SIDEBAR_HEAD_H)     // 52
+#define FB_SIDE_W   RADIO_SIDEBAR_W                        // 150
+#define FB_SIDE_H   (NAV_BAR_Y - FB_SIDE_Y)                // 236
+#define FB_LIST_X   RADIO_LIST_X                           // 150
+#define FB_LIST_Y   RADIO_LIST_TOP                         // 48
+#define FB_LIST_W   RADIO_LIST_W                           // 330
+#define FB_LIST_H   RADIO_LIST_H                           // 192
+
+static uint16_t* g_fbSide = nullptr;    // PSRAM 侧栏滚动区缓冲
+static uint16_t* g_fbList = nullptr;    // PSRAM 列表区缓冲
+static uint16_t* s_fbCur = nullptr;     // 当前绘制目标
+static int s_fbCurOX = 0, s_fbCurOY = 0, s_fbCurW = 0, s_fbCurH = 0;
+
+static void fbEnsure() {
+  if (!g_fbSide) {
+    g_fbSide = (uint16_t*)heap_caps_malloc((size_t)FB_SIDE_W * FB_SIDE_H * 2, MALLOC_CAP_SPIRAM);
+    if (g_fbSide) memset(g_fbSide, 0, (size_t)FB_SIDE_W * FB_SIDE_H * 2);
+  }
+  if (!g_fbList) {
+    g_fbList = (uint16_t*)heap_caps_malloc((size_t)FB_LIST_W * FB_LIST_H * 2, MALLOC_CAP_SPIRAM);
+    if (g_fbList) memset(g_fbList, 0, (size_t)FB_LIST_W * FB_LIST_H * 2);
+  }
+}
+// 指定绘制目标: 帧缓冲 (buf 非空) 或直绘屏幕 (buf=nullptr)
+static void fbTarget(int ox, int oy, int w, int h, uint16_t* buf) {
+  s_fbCur = buf; s_fbCurOX = ox; s_fbCurOY = oy; s_fbCurW = w; s_fbCurH = h;
+  if (buf) XFont::fbBegin(buf, w, h, ox, oy);
+  else XFont::fbEnd();
+}
+static void fbBeginSide() { fbEnsure(); fbTarget(FB_SIDE_X, FB_SIDE_Y, FB_SIDE_W, FB_SIDE_H, g_fbSide); }
+static void fbBeginList() { fbEnsure(); fbTarget(FB_LIST_X, FB_LIST_Y, FB_LIST_W, FB_LIST_H, g_fbList); }
+static void fbEnd() { s_fbCur = nullptr; XFont::fbEnd(); }
+
 static inline void fbFillRect(int x, int y, int w, int h, uint16_t c) {
   if (w <= 0 || h <= 0) return;
-  int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-  int x1 = x + w, y1 = y + h; if (x1 > 480) x1 = 480; if (y1 > NAV_BAR_Y) y1 = NAV_BAR_Y;
+  if (!s_fbCur) {  // 直绘 (非滚动区)
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w, y1 = y + h; if (x1 > 480) x1 = 480; if (y1 > NAV_BAR_Y) y1 = NAV_BAR_Y;
+    if (x1 <= x0 || y1 <= y0) return;
+    tft.fillRect(x0, y0, x1 - x0, y1 - y0, c);
+    return;
+  }
+  int x0 = x < s_fbCurOX ? s_fbCurOX : x;
+  int y0 = y < s_fbCurOY ? s_fbCurOY : y;
+  int x1 = x + w; if (x1 > s_fbCurOX + s_fbCurW) x1 = s_fbCurOX + s_fbCurW;
+  int y1 = y + h; if (y1 > s_fbCurOY + s_fbCurH) y1 = s_fbCurOY + s_fbCurH;
   if (x1 <= x0 || y1 <= y0) return;
-  tft.fillRect(x0, y0, x1 - x0, y1 - y0, c);
+  for (int yy = y0; yy < y1; yy++) {
+    uint16_t* row = s_fbCur + (yy - s_fbCurOY) * s_fbCurW + (x0 - s_fbCurOX);
+    for (int xx = x0; xx < x1; xx++) *row++ = c;
+  }
 }
 static inline void fbHLine(int x, int y, int w, uint16_t c) { fbFillRect(x, y, w, 1, c); }
 static inline void fbVLine(int x, int y, int h, uint16_t c) { fbFillRect(x, y, 1, h, c); }
 static inline void fbPixel(int x, int y, uint16_t c) {
-  if (x < 0 || x >= 480 || y < 0 || y >= NAV_BAR_Y) return; tft.drawPixel(x, y, c);
+  if (!s_fbCur) { if (x >= 0 && x < 480 && y >= 0 && y < NAV_BAR_Y) tft.drawPixel(x, y, c); return; }
+  if (x < s_fbCurOX || x >= s_fbCurOX + s_fbCurW || y < s_fbCurOY || y >= s_fbCurOY + s_fbCurH) return;
+  s_fbCur[(y - s_fbCurOY) * s_fbCurW + (x - s_fbCurOX)] = c;
 }
-static inline void fbCircle(int x, int y, int r, uint16_t c) { tft.fillCircle(x, y, r, c); }
-// 帧缓冲推屏不再需要 (绘制已直推屏幕); 保留空实现避免调用点改动
-static void fbPushRect(int sx, int sy, int w, int h) { (void)sx; (void)sy; (void)w; (void)h; }
+static inline void fbCircle(int x, int y, int r, uint16_t c) {
+  if (!s_fbCur) { tft.fillCircle(x, y, r, c); return; }
+  int x0 = x - r, x1 = x + r, y0 = y - r, y1 = y + r;   // 实心圆: 逐行水平扫描线
+  for (int yy = y0; yy <= y1; yy++) {
+    int dy = yy - y; long dy2 = (long)dy * dy;
+    long rr = (long)r * r - dy2; if (rr < 0) rr = 0;
+    int half = (int)sqrtf((float)rr);
+    fbHLine(x - half, yy, half * 2 + 1, c);
+  }
+}
+// 推屏: 从当前缓冲 memcpy 到内部 RAM 中转, 分块 pushImage (R3: PSRAM 不能直推)
+static void fbPushRect(int sx, int sy, int w, int h) {
+  if (!s_fbCur) return;
+  int x0 = sx < s_fbCurOX ? s_fbCurOX : sx;
+  int y0 = sy < s_fbCurOY ? s_fbCurOY : sy;
+  int x1 = sx + w; if (x1 > s_fbCurOX + s_fbCurW) x1 = s_fbCurOX + s_fbCurW;
+  int y1 = sy + h; if (y1 > s_fbCurOY + s_fbCurH) y1 = s_fbCurOY + s_fbCurH;
+  if (x1 <= x0 || y1 <= y0) return;
+  int sw = x1 - x0, sh = y1 - y0;
+  uint16_t* src0 = s_fbCur + (y0 - s_fbCurOY) * s_fbCurW + (x0 - s_fbCurOX);
+  int rowsPerChunk = (sw > 0) ? (2048 / sw) : 1; if (rowsPerChunk < 1) rowsPerChunk = 1;
+  uint16_t* tmp = (uint16_t*)heap_caps_malloc((size_t)sw * rowsPerChunk * 2, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+  if (!tmp) return;
+  tft.startWrite();
+  for (int yy = 0; yy < sh; yy += rowsPerChunk) {
+    int ch = sh - yy; if (ch > rowsPerChunk) ch = rowsPerChunk;
+    memcpy(tmp, src0 + (size_t)yy * sw, (size_t)sw * ch * 2);
+    tft.pushImage(x0, y0 + yy, sw, ch, tmp);
+  }
+  tft.endWrite();
+  heap_caps_free(tmp);
+}
 
 void updateSpectrum();    // 全屏 VU 表刷新 (后文定义)
 void refreshMiniEq();     // 播放条均衡器动画 (后文定义)
@@ -191,9 +268,8 @@ void modeRadio() {
 
   if (!modeDrawn[MODE_RADIO] || modeChanged) {
     tft.fillRect(0, 0, 480, NAV_BAR_Y, C_BG);
-    tft.startWrite();
-    drawRadioHeader(); drawRadioRegionSidebar(); drawRadioList(); drawRadioPlayBar();
-    tft.endWrite();
+    drawRadioHeader(); drawRadioSidebarStatic(); drawRadioRegionSidebar();
+    drawRadioListStatic(); drawRadioList(); drawRadioPlayBar();
     modeDrawn[MODE_RADIO] = true; listScrollDirty = false; sideScrollDirty = false;
   }
 
@@ -356,7 +432,7 @@ void handleRadioTap(uint16_t tx, uint16_t ty) {
       modeDrawn[MODE_RADIO] = false;
     } else if (tx >= x + RADIO_LIST_W - 108) {        // 音量区 -> 静音切换
       radioToggleMute();
-      tft.startWrite(); drawRadioPlayBar(); tft.endWrite();
+      drawRadioPlayBar();   // 内部自包 startWrite
     } else if (currentPlayingSid >= 0) {              // 台名/均衡器 -> 全屏
       showingFullscreen = true; modeDrawn[MODE_RADIO] = false;
     }
@@ -372,7 +448,7 @@ void handleRadioTap(uint16_t tx, uint16_t ty) {
       bool inFavCat = (currentCat < radioCatCount) && strcmp(radioCats[currentCat].key, RLBL[1]) == 0;
       radioToggleFav(curSidAt(rowIdx));
       if (inFavCat) { listScrollTop = 0; modeDrawn[MODE_RADIO] = false; }
-      else { tft.startWrite(); drawRadioList(); drawRadioPlayBar(); tft.endWrite(); }
+      else { drawRadioList(); drawRadioPlayBar(); }
       lastTapTime = 0;
       return;
     }
@@ -383,7 +459,7 @@ void handleRadioTap(uint16_t tx, uint16_t ty) {
       Serial.printf("[DBG-T] DOUBLETAP row=%d dt=%lu -> fullscreen\n", rowIdx, now - lastTapTime);
     } else {
       playStationAt(curSidAt(rowIdx));
-      tft.startWrite(); drawRadioList(); drawRadioPlayBar(); tft.endWrite();
+      drawRadioList(); drawRadioPlayBar();
     }
     lastTapTime = now; lastTapRow = rowIdx;
   }
@@ -393,6 +469,7 @@ void handleRadioTap(uint16_t tx, uint16_t ty) {
 // 绘制: 状态栏
 // ============================================================
 void drawRadioHeader() {
+  tft.startWrite();   // 自包含事务 (2026-10-29 直绘回退)
   tft.fillRect(0, 0, 480, RADIO_HEADER_H, C_CARD);
   font16.drawString(6, 4, "网络收音机", C_TXT, C_CARD);
   tft.fillRect(6 + font16.textWidth("网络收音机") + 5, 6, 3, 12, C_ACC);   // 设计稿光标点缀
@@ -409,6 +486,7 @@ void drawRadioHeader() {
   x -= (font16.textWidth(wt) + 10);
   font16.drawString(x, 4, wt, wifiConnected ? C_WIFI : C_LIVE, C_CARD);
   tft.drawFastHLine(0, RADIO_HEADER_H, 480, C_LINE);
+  tft.endWrite();
 }
 
 // ============================================================
@@ -450,16 +528,22 @@ static int catIconIndex(const char* key, int grp) {
   return -1;
 }
 
-void drawRadioRegionSidebar() {
-  Serial.printf("[SIDE] catCnt=%d scroll=%d cur=%d special=%d\n", radioCatCount, regionScrollTop, currentCat, RADIO_SPECIAL_CNT);
-  // 固定头 "频道分类" (设计稿 lp-head 28px, 弱化字色) + 下分隔线 —— 不滚动, 直绘屏幕
+// 固定头 "频道分类" —— 不随滚动重绘 (2026-10-29: 从滚动重绘拆出, 防擦后画闪烁。
+// 滚动路径只调 drawRadioRegionSidebar() 画滚动区, 固定头保持上次内容 -> 面板扫到时不闪)
+void drawRadioSidebarStatic() {
+  tft.startWrite();
   tft.fillRect(0, RADIO_HEADER_H, RADIO_SIDEBAR_W, SIDEBAR_HEAD_H, C_SIDE);
   font16.drawString(10, RADIO_HEADER_H + (SIDEBAR_HEAD_H - 16) / 2, "频道分类", C_DIM, C_SIDE);
   tft.drawFastHLine(0, RADIO_HEADER_H + SIDEBAR_HEAD_H - 1, RADIO_SIDEBAR_W - 1, C_LINE);
-  // 2026-10-29 BUILDV5-FB: 滚动区整列帧缓冲合成 -> 单次分块推屏 (拖动防闪烁)
-  fbBegin();
-  fbFillRect(0, RADIO_HEADER_H + SIDEBAR_HEAD_H, RADIO_SIDEBAR_W,
-             NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H), C_SIDE);
+  tft.endWrite();
+}
+
+void drawRadioRegionSidebar() {
+  Serial.printf("[SIDE] catCnt=%d scroll=%d cur=%d special=%d\n", radioCatCount, regionScrollTop, currentCat, RADIO_SPECIAL_CNT);
+  // 2026-10-29 帧缓冲重建: 滚动区整列在 PSRAM 缓冲合成 -> fbPushRect 单次分块推屏
+  // (消除擦后画中间态: 每行只写一次, 面板扫到的是完整帧)
+  fbBeginSide();
+  fbFillRect(0, FB_SIDE_Y, FB_SIDE_W, FB_SIDE_H, C_SIDE);
   int S = regionScrollTop;
   int top = RADIO_HEADER_H + SIDEBAR_HEAD_H - S;
   // 组标题 (频道/省市/我的): 每组首个分类前一行, 弱化字色
@@ -475,7 +559,13 @@ void drawRadioRegionSidebar() {
         fbFillRect(0, gy0, RADIO_SIDEBAR_W - 2, gy1 - gy0 + 1, C_SIDE);
         int g = radioCats[i].group;
         const char* gn = (g >= 0 && g < RADIO_GROUP_CNT) ? GNAMES[g] : "";
-        font16.drawString(10, gy + (RADIO_GROUP_H - 16) / 2, gn, C_GROUP, C_SIDE);
+        // 2026-10-29 残留根治: 组标题文字 y 必须裁剪进滚动区 [gy0, gy1],
+        // 否则滚到底时画到导航栏 (y>288), 导航栏仅 navDirty 时打底 -> 残留不消失
+        int gty = gy + (RADIO_GROUP_H - 16) / 2;
+        if (gty < gy0) gty = gy0;
+        if (gty + 15 > gy1) gty = gy1 - 15;
+        if (gty >= gy0 && gty + 15 <= gy1)
+          font16.drawString(10, gty, gn, C_GROUP, C_SIDE);
       }
     }
     int rh = (i < RADIO_SPECIAL_CNT) ? RADIO_SPECIAL_H : RADIO_ROW_H_SIDE;
@@ -511,9 +601,8 @@ void drawRadioRegionSidebar() {
     fbFillRect(RADIO_SIDEBAR_W - 5, thumbY, 3, thumbH, C_THUMB);
   }
   fbVLine(RADIO_SIDEBAR_W - 1, RADIO_HEADER_H + SIDEBAR_HEAD_H, NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H), C_LINE);
+  fbPushRect(0, FB_SIDE_Y, FB_SIDE_W, FB_SIDE_H);   // 先推屏 (需 s_fbCur 有效)
   fbEnd();
-  fbPushRect(0, RADIO_HEADER_H + SIDEBAR_HEAD_H, RADIO_SIDEBAR_W,
-             NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H));
 }
 
 // ============================================================
@@ -558,17 +647,23 @@ void drawStationRow(int rowY, RadioStation* st, bool playing, bool favorited, in
     fbHLine(x, rowY + RADIO_ROW_H - 1, w, C_LINE);
 }
 
-void drawRadioList() {
-  // 2026-10-29 BUILDV5-FB: 子标题+列表+滚动条整列帧缓冲合成 -> 单次分块推屏 (拖动防闪烁)
-  fbBegin();
+// 右列子标题 (分类名 + N 台) —— 不随滚动重绘 (2026-10-29: 从 drawRadioList 拆出, 防擦后画闪烁)
+void drawRadioListStatic() {
+  tft.startWrite();
   drawRadioSubHeader();
+  tft.endWrite();
+}
+
+void drawRadioList() {
+  // 2026-10-29 帧缓冲重建: 列表区整列在 PSRAM 缓冲合成 -> fbPushRect 单次分块推屏
+  fbBeginList();
   int x = RADIO_LIST_X, y = RADIO_LIST_TOP, w = RADIO_LIST_W, h = RADIO_LIST_H;
   fbFillRect(x, y, w, h, C_CARD);
   int count = curCount();
   if (count == 0) {
     font16.drawStringFast(x + w / 2 - 56, y + h / 2 - 8, "该分类暂无电台", C_DIM, C_CARD);
+    fbPushRect(x, y, w, h);
     fbEnd();
-    fbPushRect(x, RADIO_HEADER_H, w, RADIO_LIST_BOT - RADIO_HEADER_H);
     return;
   }
   // 2026-10-22 问题③: listScrollTop 为"像素偏移" (与左列 regionScrollTop 一致的 1:1 跟手).
@@ -586,8 +681,8 @@ void drawRadioList() {
                    curSidAt(i) == currentPlayingSid && radioPlaying, isFavSid(curSidAt(i)), c0, c1);
   }
   drawRadioScrollbar();
+  fbPushRect(x, y, w, h);
   fbEnd();
-  fbPushRect(x, RADIO_HEADER_H, w, RADIO_LIST_BOT - RADIO_HEADER_H);
 }
 
 void drawRadioScrollbar() {
@@ -638,6 +733,7 @@ static void drawVolumeCtl(int x, int y, int h) {
 }
 void drawRadioPlayBar() {
   int x = RADIO_LIST_X, y = RADIO_LIST_BOT, w = RADIO_LIST_W, h = RADIO_PLAYBAR_H;
+  tft.startWrite();   // 自包含事务 (2026-10-29 直绘回退: 消除多事务间隙闪烁)
   tft.fillRect(x, y, w, h, C_CARD);
   tft.drawFastHLine(x, y, w, C_LINE);
   drawMiniEqBars(x + 8, y + h - 8, radioPlaying);
@@ -661,6 +757,7 @@ void drawRadioPlayBar() {
   } else {
     tft.fillTriangle(cx - 4, cy - 7, cx + 7, cy, cx - 4, cy + 7, TFT_WHITE);
   }
+  tft.endWrite();
 }
 
 // ============================================================

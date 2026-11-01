@@ -432,6 +432,30 @@ const char* nl_moon_text[8] = {
     "新月", "娥眉月", "上弦月", "盈凸月", "满月", "亏凸月", "下弦月", "残月"
 };
 
+// 2026-10-31: 月相名称按农历日 (WinCalender 老黄历.hta moonPhaseName 同款表)
+const char* nl_moon_name(int ldn) {
+    if (ldn == 1) return "新月(朔)";
+    if (ldn >= 15 && ldn <= 16) return "满月(望)";
+    if (ldn <= 6) return "娥眉月";
+    if (ldn <= 8) return "上弦月";
+    if (ldn < 15) return "盈凸月";
+    if (ldn <= 21) return "亏凸月";
+    if (ldn <= 23) return "下弦月";
+    return "残月";
+}
+
+// 2026-11-01: 2字短名 (时钟行2 省空间): 去掉"月"后缀与"(朔)/(望)"括号注
+const char* nl_moon_name_short(int ldn) {
+    if (ldn == 1) return "新月";
+    if (ldn >= 15 && ldn <= 16) return "满月";
+    if (ldn <= 6) return "娥眉";
+    if (ldn <= 8) return "上弦";
+    if (ldn < 15) return "盈凸";
+    if (ldn <= 21) return "亏凸";
+    if (ldn <= 23) return "下弦";
+    return "残月";
+}
+
 /**
  * 月相计算, 返回 0..1 (0=新月, 0.5=满月)。
  * 基于儒略日(JD)与朔望月周期 29.530588853 天, 以 2000-01-06 18:14 UTC 新月为参考。

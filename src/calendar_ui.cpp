@@ -618,12 +618,10 @@ static void drawAlmPopup(int y, int m, int d) {
 
   }
 
-  // moon (legend-right): icon + name
+  // moon (legend-right): icon + name  (2026-10-31: WinCalender 画法, 按农历日)
   {
-    double mp = nl_moon_phase(y, m, d);
-    int mi = (int)(mp * 8.0 + 0.5) % 8;
-    drawMoonIcon(415, 250, 9, mp);
-    font16.drawStringFast(415 - font16.textWidth(nl_moon_text[mi]) / 2, 264, nl_moon_text[mi], 0xDE72, ALM_PAPER);
+    drawMoonIcon(415, 250, 9, ldn);
+    font16.drawStringFast(415 - font16.textWidth(nl_moon_name(ldn)) / 2, 264, nl_moon_name(ldn), 0xDE72, ALM_PAPER);
   }
 }
 

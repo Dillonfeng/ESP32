@@ -35,6 +35,8 @@ extern const char* nl_tg_text[10]; // 天干
 extern const char* nl_dz_text[12]; // 地支
 extern const char* nl_sx_text[12]; // 生肖
 extern const char* nl_moon_text[8]; // 月相
+const char* nl_moon_name(int ldn);  // 2026-10-31: 月相名称按农历日 (WinCalender 同款表)
+const char* nl_moon_name_short(int ldn);  // 2026-11-01: 2字短名 (时钟行2 省空间, 去掉"月"/括号注)
 
 void nl_month_days(int year, int month, int* result);
 void nl_year_jq(int year, int* jqList);

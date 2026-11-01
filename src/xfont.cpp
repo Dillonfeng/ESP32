@@ -14,6 +14,8 @@
 uint16_t* XFont::s_fbTarget = nullptr;
 int       XFont::s_fbW = 0;
 int       XFont::s_fbH = 0;
+int       XFont::s_fbOX = 0;
+int       XFont::s_fbOY = 0;
 
 XFont::XFont(TFT_eSPI* tft)
     : _tft(tft)
@@ -737,8 +739,9 @@ int XFont::findAA(uint16_t code) const
     int lo = 0, hi = _totalFontCount - 1;
     while (lo <= hi) {
         int mid = (lo + hi) >> 1;
-        if (_aaUni[mid] == code) return mid;
-        else if (_aaUni[mid] < code) lo = mid + 1;
+        uint16_t u = _aaUni[mid];
+        if (u == code) return mid;
+        else if (u < code) lo = mid + 1;
         else hi = mid - 1;
     }
     return -1;
@@ -803,15 +806,15 @@ void XFont::compositeGlyph(int x, int y, int idx, uint16_t fg, uint16_t bg) cons
                                   ((bb * (255 - m) + fb * m) / 255);
         }
     }
-    // 2026-10-29 BUILDV5-FB: 帧缓冲输出模式 (radio 列表拖动防闪烁)。
-    // s_fbTarget 非空时字形像素写入帧缓冲 (坐标=缓冲内屏幕坐标, 裁剪到行宽),
-    // 否则推屏幕 (默认, 全项目其他绘制路径不变)。
+    // 2026-10-29 BUILDV5-FB: 帧缓冲输出模式 (radio 列表/侧栏拖动防闪烁)。
+    // s_fbTarget 非空时字形像素写入帧缓冲: 缓冲坐标 = 屏幕绝对坐标 - 缓冲原点 (s_fbOX/s_fbOY),
+    // 裁剪到缓冲宽高。⚠️ 花屏教训: 局部缓冲必须原点换算, 否则越界错乱。
     if (XFont::s_fbTarget) {
         for (int oy = 0; oy < 16; oy++) {
-            int yy = y + oy;
+            int yy = y + oy - XFont::s_fbOY;
             if (yy < 0 || yy >= XFont::s_fbH) continue;   // 越界保护 (帧缓冲高度)
             for (int ox = 0; ox < 16; ox++) {
-                int xx = x + ox;
+                int xx = x + ox - XFont::s_fbOX;
                 if (xx < 0 || xx >= XFont::s_fbW) continue;
                 XFont::s_fbTarget[yy * XFont::s_fbW + xx] = _buf[oy * 16 + ox];
             }

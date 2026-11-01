@@ -7,11 +7,16 @@
 - 功能：机械翻页(split-flap)时钟 + 万年历(农历/干支/节气/节日) + 网络收音机(HLS) + 天气
 
 ## 构建 (PlatformIO 已装)
-- `pio` = `C:\Users\fhaiy\AppData\Roaming\Python\Python311\Scripts\pio.exe`
-- 编译：`pio run`（当前编译通过，RAM ~21% / Flash ~24%）
-- 烧固件：`pio run -t upload`
-- 烧 LittleFS：`pio run -t uploadfs`（推送 `data/festival.json` 等）
-- 串口：`pio run -t monitor`，115200，关注 `[Fest] festival.json loaded`
+- **必须用项目自带核心**：`D:\ESP32-S3\.platformio\penv\Scripts\pio.exe` (Core 6.2.0)
+  ```powershell
+  & 'D:\ESP32-S3\.platformio\penv\Scripts\pio.exe' run -e s3v5
+  ```
+- **禁止用 PATH 里的 `pio` (6.1.19 旧核心)**：它会把 `framework-arduinoespressif32` 换成 Arduino 2.0.16，导致 s3v5 报 `Missing Arduino framework directory 'None'`，下次正确构建又要全量重装 3.3.9 + 整个 ESP-IDF 全量重编（数分钟）。日志出现 `Obsolete PIO Core` / `Tool Manager: Installing` 就是踩了这个坑。
+- 烧固件：`& 'D:\ESP32-S3\.platformio\penv\Scripts\pio.exe' run -e s3v5 -t upload`
+- 烧 LittleFS：`& 'D:\ESP32-S3\.platformio\penv\Scripts\pio.exe' run -e s3v5 -t uploadfs`（推送 `data/festival.json` 等）
+- **绝不裸 `pio run`**（会连带旧 env `esp32-s3-devkitc-1` 全量编译，并覆盖共享 `framework-arduinoespressif32`）；`platformio.ini` 已加 `default_envs = s3v5` 作双保险。
+- 串口：`& 'D:\ESP32-S3\.platformio\penv\Scripts\pio.exe' run -e s3v5 -t monitor`，115200，关注 `[Fest] festival.json loaded`
+- 烧录端口以 `Get-PnpDevice -Class Ports` 里的 **CH340** 为准（当前 **COM4**；COM5/COM6 是蓝牙串口，不能用）。
 - **脱离终端烧录（终端集成抽风时的可靠法，2026-09-25 验证）**：前台 `pio run -t upload` 会被 shell 集成反复掐掉，且之前失败的 `_bootlog.py`/`pio` 子进程会**独占 COM5** → 后续 esptool 卡在 `Connecting...`（**端口抢占死锁**）。解法 = `scripts/flash2.py` + `scripts/_kill_port.ps1`：
   ```powershell
   # ① 先杀掉一切占用 COM5 的进程（esptool/pio/遗留 python）

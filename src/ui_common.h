@@ -149,6 +149,11 @@ extern bool modeChanged;
 extern bool modeDrawn[MODE_COUNT];
 extern bool navDirty;
 
+// 2026-10-31: 全屏无底部功能切换栏 —— 底部点击唤出导航栏 (peek), 5s 无操作自动收起。
+extern bool navPeek;
+extern uint32_t navPeekAt;
+#define NAV_PEEK_MS 5000
+
 #define NAV_BAR_Y       288
 #define NAV_BAR_HEIGHT  32
 #define NAV_BTN_WIDTH   120
@@ -273,7 +278,7 @@ extern bool listScrollDirty;
 extern bool sideScrollDirty;
 
 extern bool weatherInited;
-extern int mockTempC;
+extern float mockTempC;
 extern int mockHumidity;
 
 extern const char* lunarMonths[];
@@ -282,8 +287,8 @@ extern const char* weekDaysFull[];
 
 int almBigText(int x, int y, const String& s, int dst, uint16_t fg, uint16_t bg, bool center);
 int almScaledText(int x, int ytop, const String& s, int size, uint16_t fg, uint16_t bg, bool center);
-void drawMoonIcon(int cx, int cy, int R, double phase);
-uint16_t tempColor(int c);
+void drawMoonIcon(int cx, int cy, int R, int ldn);   // 2026-10-31: 参数改农历日 (WinCalender 画法)
+uint16_t tempColor(float c);                          // 2026-10-31: 温度支持 1 位小数
 uint16_t humidColor(int h);
 uint16_t eventColor(const char* name);
 
@@ -304,11 +309,17 @@ void modeWeather();
 void drawWeatherScreen();
 void handleWeatherTap(uint16_t tx, uint16_t ty);   // 天气页触摸 (刷新/7天预报入口/返回)
 bool weatherCoverActive();                          // 7天预报二级页全屏覆盖中 (导航栏触摸让路)
+// 台风弹窗滚动 (触摸拖动上下滚; 内容超过窗口时出滚动条)
+bool weatherTyphoonModalOpen();
+int  weatherTyphoonScrollTop();
+void weatherTyphoonScrollTo(int v);
 void modeRadio();
 void pumpRadio();
 void handleRadioTap(uint16_t tx, uint16_t ty);
 void drawRadioHeader();
+void drawRadioSidebarStatic();     // 固定头"频道分类" (2026-10-29: 不随滚动重绘, 防擦后画闪烁)
 void drawRadioRegionSidebar();
+void drawRadioListStatic();        // 右列子标题 (2026-10-29: 不随滚动重绘)
 void drawStationRow(int rowY, RadioStation* st, bool playing, bool favorited);
 void drawRadioList();
 void drawRadioPlayBar();
