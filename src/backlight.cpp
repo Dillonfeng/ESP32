@@ -19,6 +19,7 @@ uint32_t s_lastEval = 0;
 uint32_t s_lastStep = 0;
 uint32_t s_darkSince = 0;
 uint32_t s_forceUntil = 0;
+bool     s_keepOn = false;     // 2026-11-03: 轮播等场景持续点亮, 抑制夜间熄屏
 
 // lux -> 亮度 曲线 (对数区间线性插值)
 struct Pt { float lux; uint8_t pct; };
@@ -82,6 +83,15 @@ void wake() {
   apply(s_duty);
 }
 
+// 2026-11-03: 轮播等需要持续可见的场景: 抑制夜间熄屏, 暗环境给低亮(25%), 亮环境按曲线。
+void setKeepOn(bool on) {
+  s_keepOn = on;
+  if (on) {
+    s_off = false;
+    s_darkSince = 0;
+  }
+}
+
 void tick() {
   if (!s_ready) return;
   const uint32_t now = millis();
@@ -91,7 +101,12 @@ void tick() {
   if (now - s_lastEval >= 250) {
     s_lastEval = now;
     if (g.luxOk) {
-      if (g.lux < BL_NIGHT_LUX) {
+      if (s_keepOn) {
+        // 轮播持续亮: 暗环境给 25% (可見且不刺眼), 亮环境走曲线
+        s_off = false;
+        s_darkSince = 0;
+        s_target = (g.lux < BL_NIGHT_LUX) ? 25 : mapLux(g.lux);
+      } else if (g.lux < BL_NIGHT_LUX) {
         if (s_darkSince == 0) {
           s_darkSince = now;
         } else if (!s_off && now - s_darkSince >= BL_NIGHT_HOLD_MS && now > s_forceUntil) {

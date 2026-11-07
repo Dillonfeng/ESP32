@@ -16,5 +16,6 @@ void setPercent(uint8_t pct); // 0..100 直接设定 (调试/手动)
 uint8_t percent();
 bool isOff();                // 已熄屏 (背光=0)
 void wake();                 // 触摸唤醒: 强制点亮一段时间
+void setKeepOn(bool on);      // 2026-11-03: 轮播等场景持续点亮 (不熄屏, 暗环境给低亮)
 
 } // namespace backlight

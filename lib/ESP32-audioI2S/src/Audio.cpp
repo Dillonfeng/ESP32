@@ -1205,6 +1205,10 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
     return res;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+// 2026-11-06 断流取证: HTTP 请求复用基线 (供 DIAG 计算复用率)
+uint32_t g_tcpReqTotal = 0;
+uint32_t g_tcpReqReused = 0;
+
 bool Audio::httpPrint(const char* host) {
 
     ps_ptr<char> c_host = host; // copy of host
@@ -1276,6 +1280,29 @@ bool Audio::httpPrint(const char* host) {
 
     info(*this, evt_info, "next URL: \"{}\"", c_host.get());
 
+    // 2026-11-06 根因修复 (证据见 logs/pc_keepalive.log):
+    //   服务端 keep-alive 连接在 100 个请求后会被关闭, 且第 100 个响应头里就带
+    //   "Connection: close" (PC 侧同一条 TCP 连接实测: n=100 响应 srv_conn=close,
+    //   该响应 body 完整, 紧随其后的第 101 个请求被 connection reset)。
+    //   库原来只把该响应头写进 m_f_connectionClose, 从不消费 -> 下一个请求仍发往
+    //   服务端已关闭的 socket, 现场表现为 [TCPD] r=0 ... re=true dt=0
+    //   (收到响应头 + Content-Length 后 body 0 字节, 连接已死)。
+    //   正确做法即按 HTTP/1.1 持久连接语义消费该标志: 该响应读完就关 socket, 下次重连。
+    bool wasConnected = m_client->connected();
+    if (wasConnected && m_f_connectionClose) {
+        info(*this, evt_info, "[TCPD] srv-close -> drop socket (n={})", (unsigned)g_tcpReqTotal);
+        m_client->stop();
+        wasConnected = false;
+        f_equal = false;
+    }
+    m_f_connectionClose = false;   // 本次响应头重新判定
+    m_f_tcpReused = wasConnected;
+    // 2026-11-06 取证关键: 每个请求开始清零 content-length。否则断流时 cl=77080 可能是
+    // 上一段 .ts 的旧值, 无法区分「没收到任何响应头(旧 socket 已死)」与「收到头后被掐断」。
+    m_audioFileSize = 0;
+    // 2026-11-06 基线统计: 若复用率本来就接近 100%, 断流时 re=true 就不具备判别力。
+    g_tcpReqTotal++;
+    if (m_f_tcpReused) g_tcpReqReused++;
     if (f_equal == false) {
         if (m_client->connected()) m_client->stop();
     }
@@ -1288,7 +1315,24 @@ bool Audio::httpPrint(const char* host) {
         }
         if (f_equal) info(*this, evt_info, "The host has disconnected, reconnecting");
 
-        if (!m_client->connect(hwoe.get(), port, 5000)) { // S2-2 延续 (2026-10-15): httpPrint 重试路径同样带 5s 超时（原两参无超时——CRI SYN 无响应时无限卡死）
+        // 2026-11-06: 服务端每 100 个请求关闭一次 keep-alive 连接 (响应头已声明 Connection: close),
+        // 此时必须重建 TCP。直接按域名 connect 每次都做 DNS (实测 500~945ms 阻塞 audio task,
+        // 会让 I2S 断音), 故缓存 host->IP, 后续直接连 IP。
+        static char      s_ipHost[96] = {0};
+        static IPAddress s_ip;
+        bool ok = false;
+        if (s_ipHost[0] && strncmp(s_ipHost, hwoe.get(), 95) == 0 && (uint32_t)s_ip != 0) {
+            ok = m_client->connect(s_ip, port, 5000);
+        }
+        if (!ok) {
+            ok = m_client->connect(hwoe.get(), port, 5000); // S2-2 延续 (2026-10-15): 带 5s 超时
+            if (ok) {
+                s_ip = m_client->remoteIP();
+                strncpy(s_ipHost, hwoe.get(), 95);
+                s_ipHost[95] = 0;
+            }
+        }
+        if (!ok) {
             AUDIO_LOG_ERROR("connection lost {}", c_host.c_get());
             stopSong();
             return false;
@@ -1296,6 +1340,7 @@ bool Audio::httpPrint(const char* host) {
     }
     m_currentHost = c_host;
     m_diagSegT0 = millis(); // DIAG [NET] segDone: GET 发起时刻
+    m_tcpReqStartMs = millis();
     m_client->print(rqh.get());
 
     if (extension.ends_with_icase(".mp3"))
@@ -1398,6 +1443,8 @@ bool Audio::httpRange(uint32_t seek, uint32_t length) {
     rqh.append("Sec-GPC: 1\r\n");
     rqh.append("User-Agent: VLC/3.0.21 LibVLC/3.0.21 AppleWebKit/537.36 (KHTML, like Gecko)\r\n\r\n");
 
+    // 2026-11-04: 每个请求发出前重置, 由本次响应头重新判定 (避免上一次 Connection:close 残留)
+    m_f_connectionClose = false;
     if (m_client->connected()) { m_client->stop(); }
     if (m_f_ssl) {
         m_client = static_cast<NetworkClientSecure*>(&clientsecure);
@@ -3673,6 +3720,12 @@ uint32_t Audio::stopSong() {
     m_f_lockInBuffer = true; // wait for the decoding to finish
     uint8_t  maxWait = 0;
     uint32_t currTime = getAudioCurrentTime();
+    // 2026-11-07 定位用: 重试后 stopSong 被无日志分支调用, 用这行区分调用点
+    // (mode=HTTP_RESPONSE_HEADER 且 dt≈0 -> httpPrint 连接失败; mode=AUDIO_NONE -> 解析头失败;
+    //  ch=1 cs=-100 -> chunkSize 错误分支)
+    info(*this, evt_info, "[STOP] m={} ch={} cs={} dt={}",
+         (int)m_dataMode, (int)m_f_chunked, (int)m_pwsHLS.chunkSize,
+         (unsigned)((millis() - m_tcpReqStartMs) / 1000));
 
     bool pdTrue = xSemaphoreTake(mutex_audioTaskIsDecoding, 1 * configTICK_RATE_HZ); // wait for audioTask is ready
     {
@@ -3982,6 +4035,14 @@ void Audio::loop() {
         switch (m_dataMode) {
             case HTTP_RESPONSE_HEADER:
                 if (!parseHttpResponseHeader()) {
+                    if (m_f_segResume) { // 续传的响应头没拿到 -> 放弃续传, 回播放列表, 不停播
+                        info(*this, evt_info, "[TCPD] resume hdr fail -> playlist");
+                        m_f_segResume = false;
+                        m_segResumeSkip = 0;
+                        m_segResumeSkipRead = 0;
+                        m_dataMode = AUDIO_PLAYLISTDATA;
+                        break;
+                    }
                     AUDIO_LOG_ERROR("S2DBG m3u8 hdr fail retry={}", m_lVar.count);
                     if (m_lVar.count < 3) {
                         m_lVar.count++;
@@ -3992,6 +4053,16 @@ void Audio::loop() {
                     }
                 } else {
                     m_lVar.count = 0;
+                    if (m_f_segResume) {
+                        if (m_segResumeSize && m_audioFileSize == m_segResumeSize) {
+                            m_segResumeSkip = m_segResumeGot;
+                            info(*this, evt_info, "[TCPD] resume hdr ok cl={} skip={}", m_audioFileSize, m_segResumeSkip);
+                        } else { // 长度不一致: 不是同一分片, 放弃续传, 按新分片从 0 开始
+                            info(*this, evt_info, "[TCPD] resume aborted cl={} exp={}", m_audioFileSize, m_segResumeSize);
+                            m_f_segResume = false;
+                            m_segResumeSkip = 0;
+                        }
+                    }
                     m_f_firstCall = true; // read ID3 header in processWebStreamHLS/TS()
                 }
                 break;
@@ -4032,7 +4103,14 @@ void Audio::loop() {
                     processWebStreamHLS(); // aac, mp3 or aacp normal stream
                 }
                 if (m_f_continue) { // at this point m_f_continue is true, means processWebStream() needs more data
-                    m_dataMode = AUDIO_PLAYLISTDATA;
+                    if (m_f_segResume && m_segResumeHost.valid()) {
+                        // 分片被截断: 重下同一 URL, 响应头里再校验 content-length 后按断点续传
+                        info(*this, evt_info, "[TCPD] resume GET got={}/{}", m_segResumeGot, m_segResumeSize);
+                        httpPrint(m_segResumeHost.get());
+                        m_dataMode = HTTP_RESPONSE_HEADER;
+                    } else {
+                        m_dataMode = AUDIO_PLAYLISTDATA;
+                    }
                     m_f_continue = false;
                 }
                 break;
@@ -5004,10 +5082,21 @@ void Audio::processWebStreamTS() {
         m_f_firstCall = false;
         m_f_m3u8data = true;
         m_audioFilePosition = 0;
-        m_pwsst.f_firstPacket = true;
         m_pwsst.f_chunkFinished = false;
         m_pwsst.f_nextRound = false;
-        m_pwsst.byteCounter = 0;
+        if (m_f_segResume && m_segResumeSkip) {
+            // 续传: 本分片前 m_segResumeSkip 字节已进过 TS 流水线, 从断点继续;
+            // 不重读 ID3 (响应体是同一分片的后半段)
+            m_pwsst.byteCounter = m_segResumeSkip;
+            m_pwsst.f_firstPacket = false;
+            m_segResumeSkipRead = m_segResumeSkip;
+            info(*this, evt_info, "[TCPD] seg resume cont at {}/{}", m_segResumeSkip, m_segResumeSize);
+            m_segResumeSkip = 0;
+        } else {
+            m_pwsst.byteCounter = 0;
+            m_pwsst.f_firstPacket = true;
+        }
+        m_f_segResume = false;
         m_t0 = millis();
         if (!m_pwsst.ts_packet.valid()) m_pwsst.ts_packet.alloc_array(m_pwsst.ts_packetsize, "m_pwsst.ts_packet"); // first init
         if (!m_decoder) {                                                                                          // first init
@@ -5025,6 +5114,27 @@ nextRound:
     uint32_t availableBytes = m_client->available(); // available bytes in stream
 
     if (availableBytes) {
+        // 2026-11-07 续传: 重下同一分片时先丢弃已收到的前缀字节, 从断点逐字节对齐续传
+        if (m_segResumeSkipRead) {
+            if (!m_segResumeBuf) m_segResumeBuf = (uint8_t*)heap_caps_malloc(1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!m_segResumeBuf) { // 内存不足: 放弃续传, 按新分片处理
+                m_segResumeSkipRead = 0;
+                m_pwsst.byteCounter = 0;
+            } else {
+                uint32_t n = m_segResumeSkipRead;
+                if (n > 1024) n = 1024;
+                if (n > availableBytes) n = availableBytes;
+                int res = audioFileRead(m_segResumeBuf, n);
+                if (res <= 0) return;
+                m_segResumeSkipRead -= res;
+                if (m_segResumeSkipRead == 0) {
+                    heap_caps_free(m_segResumeBuf);
+                    m_segResumeBuf = nullptr;
+                    info(*this, evt_info, "[TCPD] seg resume tail begins");
+                }
+                return;
+            }
+        }
         /* If the m3u8 stream uses 'chunked data transfer' no content length is supplied. Then the chunk size determines the audio data to be processed.
            However, the chunk size in some streams is limited to 32768 bytes, although the chunk can be larger. Then the chunk size is
            calculated again. The data used to calculate (here readedBytes) the chunk size is not part of it.
@@ -5507,7 +5617,11 @@ Audio::HeaderResult Audio::parseHeaderLine(ps_ptr<char> name, ps_ptr<char> value
     }
 
     else if (name.equals_icase("connection")) {
-        if (value.contains_with_icase("close")) { m_f_connectionClose = true; }
+        // 取证: 服务端每 100 个请求在一条响应头里声明 close, 只记这一条, 避免刷爆 96 条 ringLog
+        if (value.contains_with_icase("close")) {
+            m_f_connectionClose = true;
+            info(*this, evt_info, "[TCPD] resp conn=close n={}", (unsigned)g_tcpReqTotal);
+        }
         return HeaderResult::Continue;
     }
 
@@ -5583,6 +5697,10 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
     ps_ptr<char> redirectUrl;
 
     auto header = readHeader();
+    // 2026-11-07 定案用: 打印本次响应头的行数与首行(状态行)。重试后 dt=0 即 stopSong, 说明
+    // 服务端立刻回了头但 ct_seen=false; 首行能直接看出是 200 还是 4xx/5xx/被截断的残头。
+    if (header.size()) info(*this, evt_info, "[HDR] n={} l0={}", (int)header.size(), header[0].get());
+    else info(*this, evt_info, "[HDR] empty c={} av={}", (int)m_client->connected(), m_client->available());
     AUDIO_LOG_ERROR("S2DBG parseHeader enter: running={} connected={} timeout={}ms hdrLen={}", m_f_running, m_client->connected(), m_timeout_ms, header.size());
     if (header.empty()) goto exit;
 
@@ -8109,7 +8227,53 @@ fail:
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————-
 boolean Audio::streamDetection(uint32_t bytesAvail) {
 
+    // 2026-11-07 根因定案 (证据: logs/live_raw.log n=99/n=199, logs/stall_auto_20261107-094257.txt):
+    //   服务端 radio.pull.hebtv.com 在 keep-alive 连接的第 100 个请求上返回带 "Connection: close"
+    //   的响应头 (Content-Length 已知), 但 body 0 字节:
+    //     n=99  socket 报 Disconnected (RES:0, ERR:128);
+    //     n=199 socket 仍报 connected (半关闭对本层不可见) -> 走慢路径空等 (log: [TCPD] s1 dt=20),
+    //           期间 netTask 被 processWebStreamTS 的 nextRound 自旋卡住 (NET-BLK 20364ms),
+    //           主程序 8s 看门狗先停播 -> 永久无声。
+    //   「同一 URL 换 TCP 重发」实测不可靠: n=99 retry result=1 后响应头解析失败 -> [STOP] m=1 dt=0。
+    //   标准 HLS 恢复: 丢弃该分片, 回播放列表取下一(更新)分片。不 stopSong / connecttohost,
+    //   解码器与缓冲保持, 所以不会出现无声音的断档。
+    //   触发条件: 分片响应头已到 (content-length>0) 但 body 未收满 (实测既有 0 字节也有被截断的),
+    //   socket 已断则立即判, socket 仍 connected 则要求 2.5s 0 字节(半关闭不可见)。
+    //   正常完成的分片 byteCounter == content-length, 不会命中。
+    if (m_audioFileSize && !m_f_continue && !m_pwsHLS.f_chunkFinished) {
+        uint32_t segBytes = m_f_ts ? m_pwsst.byteCounter : m_pwsHLS.byteCounter;
+        uint32_t age      = millis() - m_tcpReqStartMs;
+        // socket 已断: 只要 body 未收满 (0 字节 或 被截断) 就是本片取流失败;
+        // socket 仍连: 只有 0 字节且 2.5s 无进展才算 (半关闭不可见), 避免误伤慢速下载。
+        bool cut = !m_client->connected() ? (segBytes < m_audioFileSize)
+                                          : (segBytes == 0 && age >= 2500);
+        if (cut) {
+            info(*this, evt_info, "[TCPD] cut seg -> resume same seg (n={} dt={} got={}/{} re={} c={})",
+                 (unsigned)g_tcpReqTotal, (unsigned)(age / 1000), segBytes, m_audioFileSize,
+                 (int)m_f_tcpReused, (int)m_f_connectionClose);
+            // 不丢弃这片: 记住已收到的字节, 关掉死连接, 重下同一 URL 并跳过这段前缀,
+            // 从断点逐字节续传。这样 InBuff 里不会留下半截 AAC 帧 (那会把解码器永久带偏,
+            // 实测表现为 "Invalid number of channels" 刷屏 + 绿灯无声)。
+            m_segResumeHost = m_lastHost;
+            m_segResumeGot = segBytes;
+            m_segResumeSize = m_audioFileSize;
+            m_f_segResume = true;
+            m_client->stop();
+            m_pwsst.f_nextRound = false; // 打断 processWebStreamTS 的 nextRound 自旋, 让它正常返回
+            m_f_continue = true;         // loop(): AUDIO_DATA -> 见 m_f_segResume -> 重下同一分片
+            m_sdet.cnt_slow = 0;
+            m_sdet.cnt_lost = 0;
+            return true;
+        }
+    }
+
     if (!m_client->connected()) {
+        if (m_pwsHLS.f_chunkFinished || m_f_continue) return false;
+        info(*this, evt_info, "[TCPD] r={} cl={} f={} c={} m={} re={} dt={} rssi={} hp={}",
+             m_pwsHLS.byteCounter, m_audioFileSize,
+             m_pwsHLS.f_chunkFinished, m_f_continue, (int)m_dataMode,
+             m_f_tcpReused, (unsigned)((millis() - m_tcpReqStartMs) / 1000),
+             WiFi.RSSI(), ESP.getFreeHeap());
         info(*this, evt_info, "Stream lost");
         connecttohost(m_lastHost.get());
         return false;
@@ -8138,6 +8302,14 @@ boolean Audio::streamDetection(uint32_t bytesAvail) {
 
     // if no audio data is received within 10 seconds, a new connection attempt is started.
     if (m_sdet.cnt_lost == 5) {
+        // 2026-11-06 取证: 这一支是「TCP 仍 connected, 但 10s 零字节到达」(socket 半开/挂死)。
+        // 上一版 [TCPD] 只在 !connected() 分支打印, 本次断流走的正是这里 -> 缺 re=/dt=。
+        // s=1 区分于断连分支 (s=0)。整行仍需 <88B 才能进 ringLog。
+        info(*this, evt_info, "[TCPD] s1 r={} cl={} f={} c={} m={} re={} dt={} rssi={} hp={}",
+             m_pwsHLS.byteCounter, m_audioFileSize,
+             m_pwsHLS.f_chunkFinished, m_f_continue, (int)m_dataMode,
+             m_f_tcpReused, (unsigned)((millis() - m_tcpReqStartMs) / 1000),
+             WiFi.RSSI(), ESP.getFreeHeap());
         info(*this, evt_info, "Stream lost");
         connecttohost(m_lastHost.get());
         m_sdet.cnt_slow = 0;

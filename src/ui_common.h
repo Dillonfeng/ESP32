@@ -149,16 +149,35 @@ extern bool modeChanged;
 extern bool modeDrawn[MODE_COUNT];
 extern bool navDirty;
 
-// 2026-10-31: 全屏无底部功能切换栏 —— 底部点击唤出导航栏 (peek), 5s 无操作自动收起。
-extern bool navPeek;
-extern uint32_t navPeekAt;
-#define NAV_PEEK_MS 5000
+// 2026-11-02: 全屏页面 + 用户主动唤出导航栏 (取代 10-31 的 peek 5s 自动收起)。
+// 内容按 480x320 全屏布局 (PAGE_BOTTOM), 导航栏是覆盖在 288..320 上的浮层:
+// 唤出 = 底部中央指示条 (小横条 cue) 点按/上滑, 或天气页顶栏齿轮; 收起 = 点内容区/下划/再点cue。
+extern bool navPeek;              // 导航栏唤出中 (用户手动控制, 无超时)
+#define PAGE_BOTTOM     320       // 页面内容底 (真全屏; NAV_BAR_Y 仅表示导航浮层位置)
+// 2026-11-02 电阻屏: 指示条 56x4 太细难点, 放大到 96x8; 热区左右各 80px, 命中率优先
+#define NAV_CUE_X0      192       // 唤起指示条: 96x8 圆角小横条, 屏幕底中央
+#define NAV_CUE_Y       310
+#define NAV_CUE_W       96
+#define NAV_CUE_H       8
+#define NAV_CUE_HOT_X0  160       // 触发热区 (比可视条宽很多, 电阻屏容错)
+#define NAV_CUE_HOT_X1  320
+#define NAV_CUE_HOT_Y   306       // y>=306 且 x 在热区内: 点按/上滑唤出 (避开天气预报按钮 306 下沿)
 
 #define NAV_BAR_Y       288
 #define NAV_BAR_HEIGHT  32
 #define NAV_BTN_WIDTH   120
 #define NAV_BTN_COUNT   4
 extern const char* navLabels[];
+void navSummon();                 // 唤出导航栏 (立即绘制)
+void navDismiss();                // 收起导航栏 (立即恢复底部内容)
+void navSwitchTo(int idx);        // 导航按钮切页 (收起导航 + 整页重绘)
+void drawNavCue();                // 画底部唤起指示条 (按当前页面配色)
+bool weatherNavCueEnabled();      // 天气主页才允许唤出 (二级页/弹窗有自己的返回)
+bool calendarNavCueEnabled();     // 日历弹层(年月选择/黄历)打开时禁止唤出
+void weatherRestoreBottom();      // 天气页底部条恢复 (restoreBottom 的外露包装)
+void clockRestoreBottom();        // 时钟页底部恢复 (导航栏收起后重画日期条+底边)
+void clockRedrawFace();           // 时钟页只重绘主体区 (切换翻页/指针, 不碰日期条 -> 不闪)
+void calendarRestoreBottom();     // 日历页底部恢复 (导航栏收起后重画信息条+底边)
 
 #define COLOR_BG       TFT_BLACK
 #define COLOR_TEXT     TFT_WHITE
@@ -193,11 +212,11 @@ void saveClockStyle(uint8_t v);
 #define RADIO_LIST_W       (480 - RADIO_SIDEBAR_W)
 #define RADIO_SCROLLBAR_W  5
 #define RADIO_LIST_TOP     (RADIO_HEADER_H + RADIO_SUBHDR_H)
-#define RADIO_LIST_BOT     (NAV_BAR_Y - RADIO_PLAYBAR_H)
+#define RADIO_LIST_BOT     (PAGE_BOTTOM - RADIO_PLAYBAR_H)   // 272: 全屏布局, 播放条贴屏幕底
 #define RADIO_LIST_H       (RADIO_LIST_BOT - RADIO_LIST_TOP)
 #define RADIO_SPECIAL_CNT  4
-#define RADIO_SPECIAL_H    28
-#define RADIO_ROW_H_SIDE   26
+#define RADIO_SPECIAL_H    32     // 2026-11-02: 28->32 电阻屏行高加大, 首 4 个固定分类更好点
+#define RADIO_ROW_H_SIDE   30     // 2026-11-02: 26->30 侧栏分类行高加大 (最后一项"历史"更好点)
 #define RADIO_REGION_TOP   (RADIO_HEADER_H + RADIO_SPECIAL_CNT * RADIO_SPECIAL_H)
 // 2026-10-22: 左列分组标题 (设计稿 频道/省市/我的 三分组)。组标题行占 GROUP_H,
 // 行偏移由 sideRowY() 统一计算 (radio_ui.cpp), 绘制/命中/滚动共用。
@@ -224,8 +243,8 @@ struct RadioStation {
   char cat[12];
   uint8_t r, g, b;
   bool is_user;
-  bool in_bin;
-  uint32_t url_offset;
+  bool in_bin;            // true: URL 在 stations.bin, url_offset=记录偏移
+  uint32_t url_offset;    // in_bin: stations.bin 记录偏移; !in_bin: radio_meta.bin 里 URL 字段偏移 (0=无 URL)
 };
 extern RadioStation* radioStn;
 extern int radioStnTotal;
@@ -248,8 +267,6 @@ extern uint16_t favSids[RMAX_FAV]; extern int favCount;
 extern uint16_t histSids[RMAX_HIST]; extern int histCount;
 extern int radioBinTotal;
 extern int extraCount;
-#define RMAX_EXTRA 24
-extern char extraUrl[RMAX_EXTRA][260]; extern int extraUrlCount;
 static const char* RADIO_CATNAMES[] = { "交通","综合","经济","新闻","文艺","音乐","体育","农村","影视","教育","生活" };
 static const uint16_t RADIO_CATCOLS[] = { 0x34DB, 0x324B, 0xF4E2, 0xE267, 0xE3E4, 0x9AD6, 0x2E6E, 0x256C, 0xD2A0, 0x2C17, 0x1DF3 };
 #define RADIO_CATN (sizeof(RADIO_CATNAMES) / sizeof(RADIO_CATNAMES[0]))
@@ -276,6 +293,7 @@ extern int pendingPlaySid;
 extern unsigned long pendingPlayAt;
 extern bool listScrollDirty;
 extern bool sideScrollDirty;
+extern bool playBarDirty;      // 2026-11-02: 播放条内容变化才重绘, 滚动时不再跟着刷 (滚动帧少了 330x48 擦写)
 
 extern bool weatherInited;
 extern float mockTempC;
@@ -309,12 +327,17 @@ void modeWeather();
 void drawWeatherScreen();
 void handleWeatherTap(uint16_t tx, uint16_t ty);   // 天气页触摸 (刷新/7天预报入口/返回)
 bool weatherCoverActive();                          // 7天预报二级页全屏覆盖中 (导航栏触摸让路)
+// 2026-11-03: 闲置自动轮播用 —— 编程式切天气主页/7天预报二级页 (不触发数据刷新)
+void weatherSetSub(uint8_t sub);
+// 2026-11-03: 闲置自动轮播用 —— 编程式打开/关闭黄历弹层 (以今天为选中日)
+void calendarSetAlmanacOpen(bool on);
 // 台风弹窗滚动 (触摸拖动上下滚; 内容超过窗口时出滚动条)
 bool weatherTyphoonModalOpen();
 int  weatherTyphoonScrollTop();
 void weatherTyphoonScrollTo(int v);
 void modeRadio();
 void pumpRadio();
+void radioPendingPlayTick();   // 2026-11-04: pendingPlay 连接泵 (主循环每帧调用, 任意页面可起播)
 void handleRadioTap(uint16_t tx, uint16_t ty);
 void drawRadioHeader();
 void drawRadioSidebarStatic();     // 固定头"频道分类" (2026-10-29: 不随滚动重绘, 防擦后画闪烁)
@@ -367,9 +390,9 @@ void loadFestivalConfig();
 #define DIGIT_SCALE   2
 #define DATE_LEFT     31
 #define DATE_RIGHT    449
-#define ROW1_TOP      186
+#define ROW1_TOP      192   // 2026-11-02: 全屏重排 (原 186/240, 底部留 44px 像导航预留)
 #define ROW1_H        46
-#define ROW2_TOP      240
+#define ROW2_TOP      256
 #define ROW2_H        36
 #define CARD_X0       31
 #define CARD_X1       (CARD_X0 + CARD_W + CARD_GAP)
@@ -419,7 +442,7 @@ void loadFestivalConfig();
 #define CAL_WORK_L    0x01F4
 #define CAL_X0        16
 #define CAL_CELL_W    64
-#define CAL_CELL_H    30
+#define CAL_CELL_H    34   // 2026-11-02: 全屏重排 30->34, 网格 54..258, 底条 266..300
 #define CAL_X1        (CAL_X0 + 7 * CAL_CELL_W)
 #define CAL_GRID_TOP  54
 #define CAL_WKND      0xF800

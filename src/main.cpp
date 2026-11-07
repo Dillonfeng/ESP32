@@ -1,20 +1,20 @@
-﻿/*
- * ESP32-S3 网络收音�?- 主程�?v2
+/*
+ * ESP32-S3 网络收音??- 主程??v2
  * ===============================
- * �?�?: ESP32-S3-N16R8 + ST7796S 480x320 + XPT2046 + PCM5102A + INMP441
+ * ????: ESP32-S3-N16R8 + ST7796S 480x320 + XPT2046 + PCM5102A + INMP441
  * 
- * 参�?��?��?? yoradio (widget布局), tftziku (�?文字�?), ESP32-audioI2S
+ * 参????????? yoradio (widget布局), tftziku (??文字??), ESP32-audioI2S
  * 
  * 功能模块:
- * 1. 翻页时钟 (数码管�?�格数�??+ �?文日�?)
- * 2. 万年�?(农历/干支/生肖/节气/定制节日)
- * 3. 网络收音�?(HLS+HTTPS, 电台列表, 触摸控制)
+ * 1. 翻页时钟 (数码管???格数???+ ??文日??)
+ * 2. 万年??(农历/干支/生肖/节气/定制节日)
+ * 3. 网络收音??(HLS+HTTPS, 电台列表, 触摸控制)
  * 4. 天气显示
  * 
- * 切换方式: 底部触摸导航�?�?按�??
+ * 切换方式: 底部触摸导航????按???
  *
- * ⚠️ 注意: �?文件已手动改写�??机�?�翻�?(Split-Flap)时钟 + �?部刷�?�?
- *    请勿再运�?scripts/rebuild_main.py —�??它会覆盖这些手动改动�?
+ * ?? 注意: ??文件已手动改写???机???翻??(Split-Flap)时钟 + ??部刷????
+ *    请勿再运??scripts/rebuild_main.py —???它会覆盖这些手动改动??
  */
 
 #include <Arduino.h>
@@ -28,7 +28,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <nvs.h>
-#include <TFT_eSPI.h>   // 已包�?Fonts/GFXFF/* (FreeSansBold24pt7b �?
+#include <TFT_eSPI.h>   // 已包??Fonts/GFXFF/* (FreeSansBold24pt7b ??
 #include <Audio.h>
 #include <ArduinoJson.h>
 #include "xfont.h"
@@ -53,8 +53,8 @@ using weather::WData;  // WData 在 weather 命名空间内, 天气页绘制代�
 #define M_PI 3.14159265358979323846
 #endif
 
-// 调试提示�?�? 1=调试期显�?点屏幕切�?等提�? 正式产品�?0 全部隐藏
-// (�?preview/make_preview.py �?DEBUG_UI 保持�?�?�?
+// 调试提示???? 1=调试期显??点屏幕切??等提?? 正式产品??0 全部隐藏
+// (??preview/make_preview.py ??DEBUG_UI 保持??????
 #define DEBUG_UI 0
 
 // ========== 引脚定义 ==========
@@ -69,14 +69,14 @@ using weather::WData;  // WData 在 weather 命名空间内, 天气页绘制代�
 
 // ========== 全局对象 ==========
 TFT_eSPI tft = TFT_eSPI();
-// 指针表盘: 每帧�?(静�?�表�?白圆+刻度+12数字) + (3 根指�? 全部合成到这块内�?RAM 缓冲
-// (146x146 = 42.6KB), 再�?�单次�?�pushImage 整帧。关�?整帧�?次推�?原子�? �?TE 同�?��??
-// 面板持续�?�?, �?推表�?擦掉�? -> 再分几笔画针"会有�?间露针空�? -> 3 针闪�?+ 秒针
-// 像不动�?�合成到同一缓冲�?次推, 与已验证干净的翻页时钟同�?(�?pushImage, 无中间状�?�?
-// 静�?�表盘缓�?(白圆+刻度+12数字), �?次�?�构建后每帧 memcpy 复用�?
-// 原实现每帧调 buildAnalogFace 重建全表 (~50-100ms on ESP32-S3), 实际 FPS 远低�?
-// ANALOG_FRAME_MS �?�? (30 FPS), 秒针每帧仅推�?<0.1px �?视�?��??冻结"�?
-// 缓存后每帧只 memcpy 42.6KB (~1ms) + �?3 �? 实际 FPS 回到 ~30, 秒针平滑�?秒�??
+// 指针表盘: 每帧??(静???表??白圆+刻度+12数字) + (3 根指?? 全部合成到这块内??RAM 缓冲
+// (146x146 = 42.6KB), 再???单次???pushImage 整帧。关??整帧??次推??原子?? ??TE 同??????
+// 面板持续????, ??推表??擦掉?? -> 再分几笔画针"会有??间露针空?? -> 3 针闪??+ 秒针
+// 像不动???合成到同一缓冲??次推, 与已验证干净的翻页时钟同??(??pushImage, 无中间状????
+// 静???表盘缓??(白圆+刻度+12数字), ??次???构建后每帧 memcpy 复用??
+// 原实现每帧调 buildAnalogFace 重建全表 (~50-100ms on ESP32-S3), 实际 FPS 远低??
+// ANALOG_FRAME_MS ???? (30 FPS), 秒针每帧仅推??<0.1px ??视??????冻结"??
+// 缓存后每帧只 memcpy 42.6KB (~1ms) + ??3 ?? 实际 FPS 回到 ~30, 秒针平滑??秒???
 XFont font16(&tft);
 XFont font32(&tft);   // 64px AA 字库 (黄历大字; ver3, ~1.0MB PSRAM; Flash 直读)
 // Legacy audioI2S (3.0.12e + HLS BUILD42/46/48 patches): default ctor,
@@ -97,18 +97,19 @@ uint16_t touchCalib[] = {194, 3767, 174, 3844, 0x01};
 // ========== UI 页面定义 ==========
 UIMode currentMode = MODE_CLOCK;
 bool modeChanged = true;
-// 每个模式�?立�??已绘�?标志，切换时全部重置�?false
+// 每个模式??立???已绘??标志，切换时全部重置??false
 bool modeDrawn[MODE_COUNT] = {false, false, false, false};
-// 导航栏重绘标�? 仅在"选中的�?�航项变�?"时重绘�?�时钟样式切�?翻页<->指针)不改变�?��??
-// 选中�? 若�?�时也重绘�?�航�? �?fillRect+4 �?AA �?4 条分隔线 多笔 SPI 会与整页重绘
-// 交错, �?TE 面板�?描撕�? -> 收音�?天气 之间出现"彩色竖条"(长度随机)。故样式切换�?�?
-// modeChanged(重绘页面), 不置 navDirty(不动导航�?�?
+// 导航栏重绘标?? 仅在"选中的???航项变??"时重绘???时钟样式切??翻页<->指针)不改变??????
+// 选中?? 若???时也重绘???航?? ??fillRect+4 ??AA ??4 条分隔线 多笔 SPI 会与整页重绘
+// 交错, ??TE 面板??描撕?? -> 收音??天气 之间出现"彩色竖条"(长度随机)。故样式切换????
+// modeChanged(重绘页面), 不置 navDirty(不动导航????
 bool navDirty = true;
-// 2026-10-31: 全屏无底部功能切换栏 —— 底部点击唤出导航栏 (peek), 5s 无操作自动收起。
+// 2026-11-02: 全屏页面 + 用户主动唤出导航栏 —— 底部中央指示条点按/上滑唤出,
+// 点内容区/下划/再点指示条收起, 无自动超时 (取代 10-31 的 peek 5s 自动收起)。
 bool navPeek = false;
-uint32_t navPeekAt = 0;
+static bool navOnScreen = false;   // 导航栏当前确实在屏上 (整页重绘会擦掉它)
 
-// ========== 导航栏布�? ==========
+// ========== 导航栏布?? ==========
 #define NAV_BAR_Y       288
 #define NAV_BAR_HEIGHT  32
 #define NAV_BTN_WIDTH   120
@@ -121,10 +122,10 @@ const char* navLabels[] = {"时钟", "日历", "收音机", "天气"};
 #define COLOR_ACCENT   TFT_CYAN
 #define COLOR_NAV_BG   0x2104
 #define COLOR_NAV_SEL  0x4A69
-#define COLOR_DIGIT    0x07FF  // 青色数码�?
+#define COLOR_DIGIT    0x07FF  // 青色数码??
 #define COLOR_DIM      0x7BEF  // 暗灰
 
-// ========== WiFi/NTP 状�??==========
+// ========== WiFi/NTP 状???==========
 bool wifiConnected = false;
 bool ntpSynced = false;
 bool wifiConnecting = false;
@@ -133,17 +134,17 @@ const char* ntpServer = "ntp.aliyun.com";
 const int gmtOffsetSec = 8 * 3600;
 
 // ========== 时间来源 ==========
-// 通过 WiFi + NTP 同�?�时�? (�?联网)�?
+// 通过 WiFi + NTP 同???时?? (??联网)??
 
-// ========== 时钟状�??==========
+// ========== 时钟状???==========
 int prevH = -1, prevM = -1, prevS = -1;
 bool colonBlink = true;
 
-// 时钟样式 (0=机�?�翻�? 1=模拟指针) �?前向声明, 实现见下�?
+// 时钟样式 (0=机???翻?? 1=模拟指针) ??前向声明, 实现见下??
 uint8_t clockStyle = STYLE_FLAP;
 
-// ========== 收音机状�?==========
-// 二进�?stations.bin 格式 (v2):
+// ========== 收音机状??==========
+// 二进??stations.bin 格式 (v2):
 //   Header(24) + RegionIdx(28*N) + StationRecords(变长)
 // 2026-10-22: 布局宏统一由 ui_common.h 提供 (150/24/48/48/28/26), 删掉本文件的重复定义
 //   (旧值 70/28/80/45/22/24 是 2026-10-20 重构前布局; 重复定义曾导致 radio_ui.cpp
@@ -164,8 +165,8 @@ uint16_t favSids[RMAX_FAV];     int favCount = 0;
 uint16_t histSids[RMAX_HIST];   int histCount = 0;
 int radioBinTotal = 0;
 int extraCount = 0;            // radio_meta 里额外(用户)电台数, buildRadioCats 用
-#define RMAX_EXTRA 24
-char extraUrl[RMAX_EXTRA][260]; int extraUrlCount = 0;
+// 2026-11-01 MEM: 原 char extraUrl[24][260] (6.2KB 内部 RAM) 已删除 —— 用户台 URL 不再常驻,
+// 起播时按 url_offset 直接 seek /radio_meta.bin 读 (见 radio_db.cpp readURLForSid)。
 char radioPinnedUsed[18] = "";  // 最近一次 buildRadioCats 用的置顶省名, loop 用它判断定位是否变化需重建
 int currentCat = 0;
 int currentPlayingSid = -1;   // 播放中的全局 sid (-1=无)
@@ -181,66 +182,66 @@ unsigned long lastTapTime = 0;
 int lastTapRow = -1;
 int pendingPlaySid = -1;          // 延迟起播 sid: 双击窗口(RADIO_DBL_MS)关闭后才真正连流
 unsigned long pendingPlayAt = 0;  // 起播请求的时间戳
-          // �?�?�?�?见的电台下标 (行号)
+          // ????????见的电台下标 (行号)
 bool listScrollDirty = true;
-bool sideScrollDirty = true;    // 侧栏(整列)需局部刷新 (2026-09-27)    // �?要重绘列�?
+bool sideScrollDirty = true;    // 侧栏(整列)需局部刷新 (2026-09-27)    // ??要重绘列??
+bool playBarDirty = false;      // 2026-11-02: 播放条只在内容变化时重绘 (不再随列表滚动每帧擦写)
 
-// 触摸状�??
-// touchLastX/Y 已在 handleTouch 前的 static 变量�?定�??
+// 触摸状???
+// touchLastX/Y 已在 handleTouch 前的 static 变量??定???
 
-// ========== 天气状�??==========
+// ========== 天气状???==========
 bool weatherInited = false;
-// 温度/湿度 (占位 mock �? 接入天气 API 后替�? 默�?��??make_preview.py �?�?
+// 温度/湿度 (占位 mock ?? 接入天气 API 后替?? 默??????make_preview.py ????
 float mockTempC = 25.0f;   // 2026-10-31: float, 时钟行显示 1 位小数
 int mockHumidity = 60;
 
-// ========== 翻页时钟 (机�?�翻页�??/ Split-Flap) ==========
-// 屏幕 480x480 (rot 1)。布�?: 6 张白色翻页牌(HH:MM:SS) + �?�?铰链�?
-// + 下方日期条�?�只重绘发生变化的数字牌(�?部刷�? 不整屏刷�?�?
-// 数字: FreeSansBold24pt7b 缩放2 �?'0' �?48x70 px�?
-#define CARD_W        56    // 单张数字牌�?? (容纳 48px 数字 + 边距)
-#define COLON_W       12    // 冒号�?
+// ========== 翻页时钟 (机???翻页???/ Split-Flap) ==========
+// 屏幕 480x480 (rot 1)。布??: 6 张白色翻页牌(HH:MM:SS) + ????铰链??
+// + 下方日期条???只重绘发生变化的数字牌(??部刷?? 不整屏刷????
+// 数字: FreeSansBold24pt7b 缩放2 ??'0' ??48x70 px??
+#define CARD_W        56    // 单张数字牌??? (容纳 48px 数字 + 边距)
+#define COLON_W       12    // 冒号??
 #define CARD_GAP      6     // 同组两数字牌间距
 #define COLON_GAP     10    // 冒号两侧间距
-#define CARD_TOP      48    // 翻页牌顶�?
+#define CARD_TOP      48    // 翻页牌顶??
 #define CARD_H        120   // 翻页牌高 (数字 70px 居中 + 上下留白)
-#define CARD_RADIUS   10    // 圆�?�半�?
-#define DIGIT_SCALE   2     // FreeSansBold24 缩放 (24px -> 48px �?
-#define DATE_LEFT     31    // 日期条左�?(�?CARD_X0 对齐)
-#define DATE_RIGHT    449   // 日期条右�?(与末张牌右缘对齐)
-#define ROW1_TOP      186   // 主日期�?�顶�? (�?�?/星期 | 农历/干支)
-#define ROW1_H        46    // 主日期�?��??
-#define ROW2_TOP      240   // 详情行顶�?(节气 | 月相)
+#define CARD_RADIUS   10    // 圆???半??
+#define DIGIT_SCALE   2     // FreeSansBold24 缩放 (24px -> 48px ??
+#define DATE_LEFT     31    // 日期条左??(??CARD_X0 对齐)
+#define DATE_RIGHT    449   // 日期条右??(与末张牌右缘对齐)
+// ROW1_TOP / ROW2_TOP 由 ui_common.h 统一提供 (2026-11-02 全屏重排: 192 / 256)
+#define ROW1_H        46    // 主日期??????
 #define ROW2_H        36    // 详情行高
 
-// 翻页牌配�?
-#define CARD_FACE     0xFFFF  // 白底牌面 (�?preview CARD_FACE_W=0xFFFF �?�? 黑字)
-#define CARD_SEAM     0x3A48  // 铰链: �?�? 1px 细缝 (冷灰, 白底上近乎隐�?
-#define HINGE_HI      0x9514  // 铰链: 两�??�?轴帽受光高�??(�?�?)
-#define HINGE_MID     0x4ACB  // 铰链: �?轴帽�?�?(�?�?)
-#define HINGE_LO      0x1945  // 铰链: �?轴帽底�??(暗沟)
+// 翻页牌配??
+#define CARD_FACE     0xFFFF  // 白底牌面 (??preview CARD_FACE_W=0xFFFF ???? 黑字)
+#define CARD_SEAM     0x3A48  // 铰链: ???? 1px 细缝 (冷灰, 白底上近乎隐??
+#define HINGE_HI      0x9514  // 铰链: 两?????轴帽受光高???(????)
+#define HINGE_MID     0x4ACB  // 铰链: ??轴帽????(????)
+#define HINGE_LO      0x1945  // 铰链: ??轴帽底???(暗沟)
 #define CARD_SHADE    0x1084  // 翻页时上半暗阴影
 #define CARD_EDGE     0x39C6  // 卡片下缘投影
 #define CARD_NUM      0x0000  // 数字黑色
-#define DATE_STRIP    0x18E3  // 详情行底�?(近黑, 与�?�航栏一�?
-#define ROW1_BG       0x2146  // 主日期�?�底�? (深灰�? 稍亮突出)
+#define DATE_STRIP    0x18E3  // 详情行底??(近黑, 与???航栏一??
+#define ROW1_BG       0x2146  // 主日期???底?? (深灰?? 稍亮突出)
 #define DATE_SEP      0x0821  // 日期分隔竖线
 #define COLOR_GOLD    0xFE4C  // 干支金色
-#define SOFT_C        0x94F6  // 灰蓝 (�?通节气文�?
-// 节假日同步高�?(�?preview make_preview.py HOL_* �?�?
-#define CAL_OFF       0xF800  // 放假(�? - �?(与周�?同�?? 表示休息)
-#define CAL_WORK      0x6CF1  // 补班(�? - 浅蓝 (黑底高可�? �?tempColor 冰点�?
-// 日历浅色主�?? (仅日历页; 其余页面仍深�? �?�?make_preview.py CAL_* 同�??
+#define SOFT_C        0x94F6  // 灰蓝 (??通节气文??
+// 节假日同步高??(??preview make_preview.py HOL_* ????
+#define CAL_OFF       0xF800  // 放假(?? - ??(与周??同??? 表示休息)
+#define CAL_WORK      0x6CF1  // 补班(?? - 浅蓝 (黑底高可?? ??tempColor 冰点??
+// 日历浅色主??? (仅日历页; 其余页面仍深?? ????make_preview.py CAL_* 同???
 #define CAL_LIGHT_BG  0xFFFF  // 页面白底
-#define CAL_GRID      0xC65A  // table 网格�?(浅灰�?
-#define CAL_HDR       0x5ACB  // 星期表头 / �?�? (深灰)
-#define CAL_TITLE     0x12D9  // 月份标�?? / "今日" (�?
-#define CAL_NORM      0x31A6  // �?通日期数�?(深灰)
-#define CAL_STRIP_L   0xEF9F  // 底部信息条底�?(浅蓝�?
-#define CAL_GOLD_L    0xCC21  // 干支 (深金, 白底�?�?)
-#define CAL_WORK_L    0x01F4  // 补班 (深蓝, 白底�?�?)
+#define CAL_GRID      0xC65A  // table 网格??(浅灰??
+#define CAL_HDR       0x5ACB  // 星期表头 / ???? (深灰)
+#define CAL_TITLE     0x12D9  // 月份标??? / "今日" (??
+#define CAL_NORM      0x31A6  // ??通日期数??(深灰)
+#define CAL_STRIP_L   0xEF9F  // 底部信息条底??(浅蓝??
+#define CAL_GOLD_L    0xCC21  // 干支 (深金, 白底????)
+#define CAL_WORK_L    0x01F4  // 补班 (深蓝, 白底????)
 
-// 节日/节气 当天显示颜色 ("今日XX" �? �?知事�? -> 灰蓝)
+// 节日/节气 当天显示颜色 ("今日XX" ?? ??知事?? -> 灰蓝)
 uint16_t eventColor(const char* name) {
   if (!name || !name[0]) return SOFT_C;
   // 24 节气
@@ -255,7 +256,7 @@ uint16_t eventColor(const char* name) {
   if (!strcmp(name,"小暑")||!strcmp(name,"大暑")||!strcmp(name,"立秋")||
       !strcmp(name,"处暑")||!strcmp(name,"小满")||!strcmp(name,"芒种"))
                                       return TFT_YELLOW;
-  // 24 节气之�?? (春分/秋分) 用金�?
+  // 24 节气之??? (春分/秋分) 用金??
   if (!strcmp(name,"春分")||!strcmp(name,"秋分")) return COLOR_GOLD;
   // 节日
   if (!strcmp(name,"春节")||!strcmp(name,"元旦")||!strcmp(name,"国庆节")||
@@ -267,31 +268,31 @@ uint16_t eventColor(const char* name) {
   return SOFT_C;
 }
 
-// 温度颜色: 随数值变�?(越冷越蓝, 越热越红) �?天气接入后在 drawDateRow 使用
-// 冰点以下用浅�?(0x6CF1) 而非�?�? (0x001F), 避免在深色背�?上不�?�?
+// 温度颜色: 随数值变??(越冷越蓝, 越热越红) ??天气接入后在 drawDateRow 使用
+// 冰点以下用浅??(0x6CF1) 而非???? (0x001F), 避免在深色背??上不????
 // 2026-10-31: 参数改 float, 支持 1 位小数温度 (冰点判断含 -0.5 等)
 uint16_t tempColor(float c) {
-  if (c <= 0.0f)  return 0x6CF1;      // 冰点以下 - 浅蓝 (高�?�比�?)
-  if (c <= 8.0f)  return TFT_CYAN;    // �?
-  if (c <= 15.0f) return TFT_GREEN;   // �?
-  if (c <= 24.0f) return COLOR_GOLD;  // 舒�??
-  if (c <= 29.0f) return TFT_YELLOW;  // �?
+  if (c <= 0.0f)  return 0x6CF1;      // 冰点以下 - 浅蓝 (高???比??)
+  if (c <= 8.0f)  return TFT_CYAN;    // ??
+  if (c <= 15.0f) return TFT_GREEN;   // ??
+  if (c <= 24.0f) return COLOR_GOLD;  // 舒???
+  if (c <= 29.0f) return TFT_YELLOW;  // ??
   return TFT_RED;                     // 炎热 (>30°)
 }
 
-// 湿度颜色: 随数值变�?(过干偏黄, 舒�?�绿, 过湿偏蓝)
+// 湿度颜色: 随数值变??(过干偏黄, 舒???绿, 过湿偏蓝)
 uint16_t humidColor(int h) {
   if (h <= 30) return TFT_YELLOW;   // 过干
   if (h <= 45) return COLOR_GOLD;   // 偏干
-  if (h <= 65) return TFT_GREEN;    // 舒�??
+  if (h <= 65) return TFT_GREEN;    // 舒???
   if (h <= 80) return TFT_CYAN;     // 偏湿
-  return 0x6CF1;                    // 过湿 - 浅蓝 (高�?�比�?)
+  return 0x6CF1;                    // 过湿 - 浅蓝 (高???比??)
 }
-#define MOON_LIT      0xFF97  // 月相�?�?
+#define MOON_LIT      0xFF97  // 月相????
 #define MOON_DARK     0x2146  // 月相暗部
-#define MOON_EDGE     0x424B  // 月相�?�?
+#define MOON_EDGE     0x424B  // 月相????
 
-// 数字�?x 坐标 (居中布局: 6 张牌 + 2 �?冒�?? 总�?? 418, 左右�?31px 边距)
+// 数字??x 坐标 (居中布局: 6 张牌 + 2 ??冒??? 总??? 418, 左右??31px 边距)
 #define CARD_X0       31
 #define CARD_X1       (CARD_X0 + CARD_W + CARD_GAP)              // 93
 #define COLON_X       (CARD_X1 + CARD_W + COLON_GAP)             // 159
@@ -301,27 +302,27 @@ uint16_t humidColor(int h) {
 #define CARD_X4       (COLON_X2 + COLON_W + COLON_GAP)           // 331
 #define CARD_X5       (CARD_X4 + CARD_W + CARD_GAP)              // 393
 
-// 两相 split-flap 翻页时序 & 滚动齿轮 (�?preview live_preview / make_preview �?�?
-// 再放慢版 (�?260/220): 让翻�?齿轮滚动更清晰可�?
+// 两相 split-flap 翻页时序 & 滚动齿轮 (??preview live_preview / make_preview ????
+// 再放慢版 (??260/220): 让翻??齿轮滚动更清晰可??
 #define FLIP_TOP_MS   400
 #define FLIP_BOT_MS   340
-// 翻页刷新帧间�?(ms) = preview live_preview �?TICK_MS=40 (~25 FPS)�?
-// loop() 无节�? tickFlapClock 若每�?都�??(~1000+ FPS) 会把 SPI 打满,
-// 每帧 ~13KB 牌面重绘丢帧 -> 翻页�?抖�?�按 40ms 门控调用, 与�?��?�同帧率�?
-// 状�?�机�?�?�?millis() 计时, �?�?"调用频率"不改变动画时序�??
+// 翻页刷新帧间??(ms) = preview live_preview ??TICK_MS=40 (~25 FPS)??
+// loop() 无节?? tickFlapClock 若每??都???(~1000+ FPS) 会把 SPI 打满,
+// 每帧 ~13KB 牌面重绘丢帧 -> 翻页??抖???按 40ms 门控调用, 与??????同帧率??
+// 状???机??????millis() 计时, ????"调用频率"不改变动画时序???
 #define FLAP_FRAME_MS 40
-// 指针样式刷新帧间�?(ms) �?30 FPS。�?�针�?平滑�?�?, 每帧都会重绘整张表盘
+// 指针样式刷新帧间??(ms) ??30 FPS。???针??平滑????, 每帧都会重绘整张表盘
 // (~40KB: fillCircle 白底 + 60 刻度 + 12 数字 + 指针)。loop() 无节流时 (~1000+ FPS)
-// 会把 20MHz SPI 打满 -> 整面�?�?/撕�?��?�限�?~30 FPS, 秒针 6°/s => 0.2°/�?
-// 依然平滑, 与翻页的 FLAP_FRAME_MS 节流同理�? 2026-10-22: ANALOG_FRAME_MS 由 ui_common.h 统一 (50), 删本行
+// 会把 20MHz SPI 打满 -> 整面????/撕??????限??~30 FPS, 秒针 6°/s => 0.2°/??
+// 依然平滑, 与翻页的 FLAP_FRAME_MS 节流同理?? 2026-10-22: ANALOG_FRAME_MS 由 ui_common.h 统一 (50), 删本行
 #define ROLLER_W      16
 #define ROLLER_PITCH  14
 #define GAP1_CX       (COLON_X  + COLON_W / 2)   // 165 (= preview GAP1_CX)
 #define GAP2_CX       (COLON_X2 + COLON_W / 2)   // 315 (= preview GAP2_CX)
 
-// 两相 split-flap 翻页 (非阻塞状态机), �?preview live_preview.Sim �?�?
+// 两相 split-flap 翻页 (非阻塞状态机), ??preview live_preview.Sim ????
 
-// 农历/星期 名称�?
+// 农历/星期 名称??
 const char* lunarMonths[] = {"正","二","三","四","五","六","七","八","九","十","冬","腊"};
 const char* lunarDays[] = {
   "初一","初二","初三","初四","初五","初六","初七","初八","初九","初十",
@@ -332,10 +333,11 @@ const char* weekDaysFull[] = {"星期日","星期一","星期二","星期三","�
 
 
 // ============================================================
-// 触摸状�?�变�?(边沿�?�?
+// 触摸状???变??(边沿????
 // ============================================================
 static bool touchWasDown = false;
 static int touchStartX = 0, touchStartY = 0;
+static bool touchNavGesture = false;   // 本次按压已触发导航唤出/收起手势 (释放时吞掉 tap)
 static int touchLastX = 0, touchLastY = 0;
 static unsigned long touchStartTime = 0;
 static bool touchDidScroll = false;
@@ -349,11 +351,11 @@ static int touchScrollStartRegion = 0;  // 侧栏拖拽起始 regionScrollTop
 void initTFT() {
   tft.init();
   tft.setRotation(3);   // 180° 旋转 (原为 1)
-  // ⚠️ ST7796 �?BGR 顺序 (User_Setup.h TFT_BGR), 必须 swap 字节�?
-  // ESP32 小�?? uint16_t 0x07FE 在内存是 0xFE 0x07; pushImage �?swap 就推
-  // 0xFE 0x07, ST7796 读成 0xFE07 (B=31,G=57,R=7) = 蓝色, �?应是青�??
-  // 之前 drawCard/blitDialNum 用黑字白�?(0x0000/0xFFFF swap 后仍�?�?/�?
-  // 看不出错, 但日期条彩色�?彩色背景就暴露字节序错乱 (字体颜色�?彩色背景).
+  // ?? ST7796 ??BGR 顺序 (User_Setup.h TFT_BGR), 必须 swap 字节??
+  // ESP32 小??? uint16_t 0x07FE 在内存是 0xFE 0x07; pushImage ??swap 就推
+  // 0xFE 0x07, ST7796 读成 0xFE07 (B=31,G=57,R=7) = 蓝色, ??应是青???
+  // 之前 drawCard/blitDialNum 用黑字白??(0x0000/0xFFFF swap 后仍????/??
+  // 看不出错, 但日期条彩色??彩色背景就暴露字节序错乱 (字体颜色??彩色背景).
   tft.setSwapBytes(true);
   tft.fillScreen(TFT_BLACK);
   tft.setTextFont(1);
@@ -391,37 +393,66 @@ volatile uint32_t g_lastNetLoopDt = 0;  // netTask 写: 上次 audio.loop 耗时
 // [DIAG] 每 2s 一条 → 约 3.2 分钟窗口), 异常停流 (库内 Stream lost / stream dead /
 // dead-flow) 自动 dumpRing 到串口 + saveStallDump 写 /stall.txt; 串口 'D' 命令随时
 // dump; boot 自动输出上次 /stall.txt —— 断流后任意时刻可取回证据, 不靠抓包时机。
-static char s_ring[96][88];
+// 2026-11-01 MEM: 环形日志改 PSRAM (96×88≈8.4KB 内部 RAM). 仅 CPU 读写, 不进 DMA/SPI.
+// 首次由 setup() 预分配, 避免 audio/net/main 多任务首次并发分配; 分配失败则丢弃环日志。
+static char* s_ring = nullptr;
+static char* ringBuf() {
+  if (!s_ring) {
+    s_ring = (char*)heap_caps_malloc(96 * 88, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_ring) memset(s_ring, 0, 96 * 88);
+  }
+  return s_ring;
+}
+static inline char* ringRow(int i) { return s_ring + i * 88; }
 static volatile int s_ringW = 0;
 static volatile int s_ringN = 0;
 
 void ringLog(const char* fmt, ...) {
+  if (!ringBuf()) return;
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(s_ring[s_ringW], 88, fmt, ap);
+  vsnprintf(ringRow(s_ringW), 88, fmt, ap);
   va_end(ap);
   s_ringW = (s_ringW + 1) % 96;
   if (s_ringN < 96) s_ringN++;
 }
 void dumpRing() {
+  if (!ringBuf()) return;
   if (g_printMutex) xSemaphoreTake(g_printMutex, portMAX_DELAY);
   Serial.printf("[RING] ---- %d entries (oldest->newest) ----\n", s_ringN);
   int n = s_ringN < 96 ? s_ringN : 96;
   int start = (s_ringW - n + 96 * 2) % 96;
-  for (int i = 0; i < n; i++) Serial.printf("%s\n", s_ring[(start + i) % 96]);
+  for (int i = 0; i < n; i++) Serial.printf("%s\n", ringRow((start + i) % 96));
   Serial.printf("[RING] ---- end ----\n");
   if (g_printMutex) xSemaphoreGive(g_printMutex);
 }
 void saveStallDump(const char* why) {
-  File f = LittleFS.open("/stall.txt", "w");
+  if (!ringBuf()) return;
+  // 2026-11-05: 断流无人值守取证。改为追加写 + 32KB 封顶 + 5s 限频, 不再每次覆盖 —
+  // 用户不在旁时多次断流/软重连都能留证; boot 时 dumpStallFile 自动输出, 随时接串口取回。
+  static uint32_t s_lastSave = 0;
+  if (millis() - s_lastSave < 5000) return;   // 限频防 flash 抖动 (恢复链路本身 >=2s)
+  s_lastSave = millis();
+  size_t prev = LittleFS.exists("/stall.txt") ? LittleFS.open("/stall.txt", "r").size() : 0;
+  bool append = prev > 0 && prev < 32768;      // 超 32KB 丢弃旧记录重写, 保留最近证据
+  File f = LittleFS.open("/stall.txt", append ? "a" : "w");
   if (f) {
-    f.printf("== STALL t=%lu ms: %s ==\n", (unsigned long)millis(), why);
+    // 墙钟时间 (NTP 已同步时), 便于和用户感知对照; 未同步退化为 millis
+    time_t now = time(nullptr);
+    struct tm tmv;
+    bool hasWall = localtime_r(&now, &tmv) && tmv.tm_year >= 124;
+    if (hasWall)
+      f.printf("== STALL %04d-%02d-%02d %02d:%02d:%02d (t=%lu ms): %s ==\n",
+               tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+               tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (unsigned long)millis(), why);
+    else
+      f.printf("== STALL t=%lu ms: %s ==\n", (unsigned long)millis(), why);
     int n = s_ringN < 96 ? s_ringN : 96;
     int start = (s_ringW - n + 96 * 2) % 96;
-    for (int i = 0; i < n; i++) f.printf("%s\n", s_ring[(start + i) % 96]);
+    for (int i = 0; i < n; i++) f.printf("%s\n", ringRow((start + i) % 96));
     f.close();
     if (g_printMutex) xSemaphoreTake(g_printMutex, portMAX_DELAY);
-    Serial.printf("[STALL] saved /stall.txt (%s, %d entries)\n", why, n);
+    Serial.printf("[STALL] saved /stall.txt (%s, %d entries, %s)\n", why, n, append ? "append" : "rewrite");
     if (g_printMutex) xSemaphoreGive(g_printMutex);
   }
 }
@@ -475,14 +506,50 @@ void netTask(void* arg) {
   }
 }
 
-// 2026-10-31: 全屏无导航栏 —— 底部 NAV_BAR_Y..320 擦为当前页面背景 (与 radio_ui.cpp C_BG 同值)。
+// 2026-11-02: 全屏页面 —— 底部 NAV_BAR_Y..320 属于页面内容; 导航栏收起后按页恢复该条。
 #define RGBC(r,g,b) ((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3))
 const uint16_t RADIO_LIST_BG = RGBC(0xF5,0xF7,0xFA);   // = radio_ui.cpp C_BG
-void eraseNavBar() {
-  uint16_t bg = COLOR_BG;
-  if (currentMode == MODE_CALENDAR) bg = CAL_LIGHT_BG;
-  else if (currentMode == MODE_RADIO) bg = RADIO_LIST_BG;
-  tft.fillRect(0, NAV_BAR_Y, 480, 320 - NAV_BAR_Y, bg);
+// 底部中央唤起指示条 (home indicator): 导航栏收起时常驻, 点按/上滑唤出
+void drawNavCue() {
+  // 浅底页(日历/收音机)用深灰, 深底页(时钟/天气)用浅灰 —— 保证白底与黑底上都清晰可见
+  uint16_t col = (currentMode == MODE_CALENDAR || currentMode == MODE_RADIO) ? 0x8410 : 0x9CF3;
+  tft.fillRoundRect(NAV_CUE_X0, NAV_CUE_Y, NAV_CUE_W, NAV_CUE_H, 2, col);
+}
+void restoreNavStrip() {
+  switch (currentMode) {
+    case MODE_WEATHER: weatherRestoreBottom(); break;   // 天气自绘底部 (含指示条)
+    case MODE_RADIO:   // 播放条 (272..320, 内含指示条) + 侧栏底部被覆盖区
+      drawRadioPlayBar(); sideScrollDirty = true; break;
+    case MODE_CALENDAR: calendarRestoreBottom(); break;          // 信息条(266..300) 重新绘制
+    default:            clockRestoreBottom();    break;          // 日期条(192..292) 重新绘制
+  }
+}
+void navSummon() {                 // 唤出导航栏 (立即绘制)
+  if (navPeek) return;
+  navPeek = true; navOnScreen = true;
+  drawNavBar();
+}
+void navDismiss() {                // 收起导航栏 (立即恢复底部内容)
+  if (!navPeek) return;
+  navPeek = false;
+  if (navOnScreen) { navOnScreen = false; restoreNavStrip(); }
+}
+void navSwitchTo(int idx) {        // 导航按钮切页: 收起导航, 新页整页重绘覆盖底部
+  if (idx < 0 || idx >= MODE_COUNT || idx == (int)currentMode) return;
+  currentMode = (UIMode)idx;
+  modeChanged = true;
+  navPeek = false; navOnScreen = false;
+  for (int i = 0; i < MODE_COUNT; i++) modeDrawn[i] = false;
+  prevH = prevM = prevS = -1;
+}
+// 当前页面是否允许唤出导航 (二级页/弹窗有自己的返回, 不唤出)
+static bool navCueAllowed() {
+  if (showingFullscreen) return false;                     // 收音机全屏播放器: 返回chip/底部双击
+  if (currentMode == MODE_RADIO) return false;             // 收音机: 顶栏 ≡
+  if (currentMode == MODE_CLOCK) return false;             // 2026-11-03: 时钟右上角 ≡, 底部条取消
+  if (currentMode == MODE_CALENDAR) return false;          // 2026-11-03: 日历顶栏 ≡
+  if (currentMode == MODE_WEATHER) return false;           // 2026-11-03: 天气顶栏齿轮, 底部条取消
+  return true;
 }
 
 void drawNavBar() {
@@ -501,6 +568,122 @@ void drawNavBar() {
 }
 
 // ============================================================
+// 2026-11-03: 闲置自动轮播
+// 状态机: 开机默认播放(全屏) -> 无输入计时 1min -> 6 页轮播(每页 2min)
+//                 ^                                     |
+//                 +---- 任意一次真实触摸/按键 <---------+ 立即退出并重新计时
+// 轮播顺序: 0 翻页时钟 / 1 指针时钟 / 2 日历 / 3 黄历 / 4 天气 / 5 7天预报
+// 只在 handleTouch 的真实输入边沿刷新 carouselLastInput, 页面重绘/网络回调不参与。
+// 2026-11-07: 中断后保留 carouselPage —— 下次轮播从中断页继续, 不回到翻页时钟。
+// ============================================================
+static const uint32_t CAROUSEL_IDLE_MS  = 1UL * 60UL * 1000UL;    // 无操作进入轮播
+static const uint32_t CAROUSEL_PAGE_MS  = 2UL * 60UL * 1000UL;    // 轮播每页停留
+static const uint8_t  CAROUSEL_PAGES    = 6;
+static bool     carouselActive = false;
+static uint8_t  carouselPage = 0;
+static uint32_t carouselPageAt = 0;
+static uint32_t carouselLastInput = 0;     // setup 末尾初始化
+static bool     carouselSwallowTap = false; // 退出轮播的那一次触摸只退出, 不落页面功能
+
+// 轮播切页: 同 mode 只强制重绘本页(保留 wSub 等页内状态); 跨 mode 走完整切页流程
+static void carouselEnterMode(UIMode m) {
+  bool modeChange = (currentMode != m);
+  // 离开收音机全屏态时清掉全屏标记, 避免轮播结束后该状态残留到其它页面
+  // (showingFullscreen 为 true 时 navDirty 兜底不会补画导航栏)
+  if (modeChange && currentMode == MODE_RADIO) showingFullscreen = false;
+  currentMode = m;
+  if (modeChange) {
+    modeChanged = true;
+    for (int i = 0; i < MODE_COUNT; i++) modeDrawn[i] = false;
+    prevH = prevM = prevS = -1;      // 时钟跨页回来必须整屏重画
+  } else {
+    modeDrawn[m] = false;            // 翻页<->指针 / 天气主页<->7天: 同 mode 强制重绘
+  }
+  navPeek = false;                   // 轮播页不保留导航浮层
+  navOnScreen = false;
+}
+
+static void carouselApplyPage(uint8_t p) {
+  switch (p) {
+    case 0:   // 翻页时钟
+      weatherSetSub(0);
+      calendarSetAlmanacOpen(false);
+      clockStyle = STYLE_FLAP;       // 只切显示, 不写 NVS(不覆盖用户保存的样式)
+      carouselEnterMode(MODE_CLOCK);
+      break;
+    case 1:   // 指针时钟
+      weatherSetSub(0);
+      calendarSetAlmanacOpen(false);
+      clockStyle = STYLE_ANALOG;     // 只切显示, 不写 NVS
+      carouselEnterMode(MODE_CLOCK);
+      break;
+    case 2:   // 日历(月视图)
+      weatherSetSub(0);
+      calendarSetAlmanacOpen(false);
+      carouselEnterMode(MODE_CALENDAR);
+      break;
+    case 3:   // 黄历(以今天为选中日)
+      weatherSetSub(0);
+      calendarSetAlmanacOpen(true);
+      carouselEnterMode(MODE_CALENDAR);
+      break;
+    case 4:   // 天气主页
+      calendarSetAlmanacOpen(false);
+      weatherSetSub(0);
+      carouselEnterMode(MODE_WEATHER);
+      break;
+    case 5:   // 7天预报二级页(同 mode, 不重置 wSub)
+      calendarSetAlmanacOpen(false);
+      weatherSetSub(1);
+      carouselEnterMode(MODE_WEATHER);
+      break;
+  }
+  carouselPageAt = millis();
+}
+
+static void carouselStart() {
+  carouselActive = true;
+  // 2026-11-07: 不清 carouselPage —— 上次中断在哪页, 这轮就从哪页继续 (开机首轮仍为 0)
+  carouselApplyPage(carouselPage);
+  Serial.printf("[CAROUSEL] start: idle %lums -> page%u\n",
+                (unsigned long)CAROUSEL_IDLE_MS, (unsigned)carouselPage);
+}
+
+static void carouselStop() {
+  if (!carouselActive) return;
+  carouselActive = false;
+  // 保留 carouselPage: 中断时的页面即下次轮播的起始页
+  Serial.println("[CAROUSEL] stop by user input");
+}
+
+// handleTouch 的真实输入入口: 按下即重新计时; 轮播中按下则退出
+static void carouselOnInput() {
+  carouselLastInput = millis();
+  if (carouselActive) {
+    carouselStop();
+    carouselSwallowTap = true;
+  }
+}
+
+static void bootRetryTick();   // 前向声明 (定义在 bootAutoplayCnr1 之后)
+
+static void carouselTick() {
+  // 2026-11-03: 轮播期间背光持续点亮 (暗环境 25% 低亮), 退出轮播恢复夜间自动熄屏
+  backlight::setKeepOn(carouselActive);
+  // 开机连流失败自动重试 (仅在无用户输入时)
+  bootRetryTick();
+
+  uint32_t now = millis();
+  if (!carouselActive) {
+    if ((uint32_t)(now - carouselLastInput) >= CAROUSEL_IDLE_MS) carouselStart();
+  } else if ((uint32_t)(now - carouselPageAt) >= CAROUSEL_PAGE_MS) {
+    carouselPage = (uint8_t)((carouselPage + 1) % CAROUSEL_PAGES);
+    carouselApplyPage(carouselPage);
+    Serial.printf("[CAROUSEL] page -> %u\n", (unsigned)carouselPage);
+  }
+}
+
+// ============================================================
 // handleTouch (边沿检测版) —— BUILDV5-TOUCHDRV: 触摸独立任务
 // ============================================================
 // 触摸扫描在 touchScanTask（touch_driver.cpp，自写 XPT2046 驱动）独立运行，
@@ -511,6 +694,9 @@ void handleTouch() {
   // 触摸不再被 audio.loop 阻塞 → 点击/拖动灵敏）
   bool isDown = s_touchDown;
   uint16_t tx = s_touchX, ty = s_touchY;
+  // 2026-11-03: 闲置计时只认真实按下/按住/抬手 (页面局部重绘、网络回调都不会走到这里)
+  if (isDown) carouselOnInput();
+  else if (touchWasDown) carouselLastInput = millis();   // 抬手也是一次输入, 从松手起算
   // 2026-10-25: 夜间熄屏时, 第一次按下只负责唤醒背光 (吞掉本次点击, 避免误触导航)。
   if (backlight::isOff()) {
     if (isDown && !touchWasDown) {
@@ -521,6 +707,13 @@ void handleTouch() {
     if (!isDown) touchWasDown = false;
     return;
   }
+  // 2026-11-03: 轮播被这次按下打断 -> 本次手势只用于退出轮播, 不落页面功能
+  if (isDown && !touchWasDown && carouselSwallowTap) {
+    touchWasDown = true;
+    touchScrollZone = 0;
+    touchDidScroll = false;
+    return;
+  }
   // 触摸坐标 = 屏幕坐标 (getTouch 已按 rotation(3) 校准), 与 live preview 1:1 一致, 无需翻转.
   // 之前此处曾多翻 180 度 -> 点底部导航栏被映射到顶部, 点日历变成切换时钟样式 (已移除).
   if (isDown && !touchWasDown) {
@@ -528,10 +721,11 @@ void handleTouch() {
     touchStartY = touchLastY = ty;
     touchStartTime = millis();
     touchDidScroll = false;
+    touchNavGesture = false;
     touchScrollStartScrollTop = listScrollTop;
     // 拖拽分区 (镜像 live_preview _on_press): 左侧地区侧栏 / 右侧电台列表 都可上下拖动
     if (currentMode == MODE_RADIO) {
-      if (tx < RADIO_SIDEBAR_W && ty >= RADIO_HEADER_H + SIDEBAR_HEAD_H && ty < NAV_BAR_Y) {
+      if (tx < RADIO_SIDEBAR_W && ty >= RADIO_HEADER_H + SIDEBAR_HEAD_H && ty < PAGE_BOTTOM) {   // 2026-11-03: 侧栏整列到屏幕底 (播放条只占右区)
         touchScrollZone = 2; touchScrollStartRegion = regionScrollTop;
       } else if (tx >= RADIO_LIST_X && ty >= RADIO_LIST_TOP && ty < RADIO_LIST_BOT) {
         touchScrollZone = 1;
@@ -548,6 +742,13 @@ void handleTouch() {
     int dx = touchLastX - touchStartX;
     touchWasDown = false;
     touchStartTime = 0;
+    // 2026-11-03: 退出轮播的那一次手势在此收尾, 不进入任何点击/滚动逻辑
+    if (carouselSwallowTap) {
+      carouselSwallowTap = false;
+      touchDidScroll = false;
+      touchScrollZone = 0;
+      return;
+    }
 
     // 2026-09-27: 侧栏拖拽结束吸附 -> 视口顶所在行的行顶对齐视口顶, 避免停在半行
     // 2026-10-22: 行偏移含分组标题行, 统一用 sideRowTop/sideTotalH
@@ -556,7 +757,9 @@ void handleTouch() {
     // 拖到底会被回弹到上一个行顶 -> "我的"组最后分类(历史)拖不上来/总退回。
     if (touchDidScroll && touchScrollZone == 2 && currentMode == MODE_RADIO) {
       int totalH = sideTotalH();
-      int smax = max(0, totalH - (NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H)));
+      // 2026-11-03: 侧栏视口底 = 屏幕底 (320)。播放条只占右区 x>=150, 左列不再有覆盖区,
+      // "我的/历史"最后一项可以滚到并停留在屏幕最底行 (52..320 全列可见可点)。
+      int smax = max(0, totalH - (PAGE_BOTTOM - (RADIO_HEADER_H + SIDEBAR_HEAD_H)));
       int snap = 0;
       // 2026-10-30 问题A 根治: 贴底阈值 13px -> 40px (最后一行 28px 高 + 余量)。
       // 旧阈值: 拖到 smax-14 松手 -> 不满足贴底 -> 吸附回最后分类行顶 (距 smax 208px) -> 弹回一大段
@@ -585,27 +788,24 @@ void handleTouch() {
     if (touchDidScroll) touchScrollZone = 0;   // 拖拽结束 -> 复位分区 (避免下次按下误判)
     if (!touchDidScroll && dur < 800 && abs(dy) < 15 && abs(dx) < 15) {
       Serial.printf("[TOUCH] tap @ (%d,%d) dur=%lu mode=%d\n", touchStartX, touchStartY, (unsigned long)dur, (int)currentMode);  // 临时调试: 确认触摸坐标与屏幕坐标一致
-      if (touchStartY >= NAV_BAR_Y && !weatherCoverActive() && !showingFullscreen && currentMode != MODE_WEATHER) {
-        // 2026-10-31: 全屏无导航栏 —— 底部第一次点击 = 唤出导航栏 (peek), 5s 无操作自动收起
-        if (!navPeek) { navPeek = true; navPeekAt = millis(); }
-        int btnIdx = touchStartX / NAV_BTN_WIDTH;
-        if (btnIdx >= 0 && btnIdx < MODE_COUNT) {
-          if (btnIdx != currentMode) {
-            currentMode = (UIMode)btnIdx;
-            modeChanged = true;
-            navDirty = true;   // 选中项变�?-> 导航栏高�?�?重绘 (样式切换不走这里)
-            for (int i = 0; i < MODE_COUNT; i++) modeDrawn[i] = false;
-            prevH = prevM = prevS = -1;
-          }
-          drawNavBar();
-        }
+      if (touchNavGesture) {
+        // 2026-11-02: 导航手势收尾 —— 吞掉本次 tap, 不落页面功能
+      } else if (navPeek) {
+        // 导航栏唤出中: 点其它页按钮=切页; 点当前页/空白或内容区=收起 (吞掉)
+        if (touchStartY >= NAV_BAR_Y && touchStartX / NAV_BTN_WIDTH != (int)currentMode)
+          navSwitchTo(touchStartX / NAV_BTN_WIDTH);
+        else
+          navDismiss();
+      } else if (navCueAllowed() && touchStartY >= NAV_CUE_HOT_Y &&
+                 touchStartX >= NAV_CUE_HOT_X0 && touchStartX < NAV_CUE_HOT_X1) {
+        navSummon();   // 2026-11-02: 点底部中央指示条 = 唤出导航栏 (所有页统一, 含天气)
       } else if (currentMode == MODE_WEATHER) {
-        // 天气页: 刷新按钮 / 7天预报入口 / 二级页返回 (二级页全屏时导航栏触摸也让路到这里)
+        // 天气页: 刷新/7天预报/弹窗/齿轮 归其内部 (navPeek 唤出收起已在上方统一处理)
         handleWeatherTap(touchStartX, touchStartY);
       } else if (currentMode == MODE_RADIO) {
         handleRadioTap(touchStartX, touchStartY);
-      } else if (currentMode == MODE_CALENDAR && touchStartY < NAV_BAR_Y) {
-        // 点日历页: �?1/3 = 上一�? �?1/3 = 下一�?(�?preview �?�?/ �?�?�?
+      } else if (currentMode == MODE_CALENDAR && touchStartY < PAGE_BOTTOM) {
+        // 点日历页: ??1/3 = 上一?? ??1/3 = 下一??(??preview ????/ ??????
         handleCalendarTap(touchStartX, touchStartY);
       } else if (currentMode == MODE_CLOCK && touchStartY < 30 && touchStartX < 100) {
         font16.drawString(100, 100, "WiFi配网模式", TFT_YELLOW, COLOR_BG);
@@ -617,12 +817,14 @@ void handleTouch() {
         wm.startConfigPortal("ESP32-Radio", "12345678");
         if (WiFi.status() == WL_CONNECTED) { wifiConnected = true; configTime(gmtOffsetSec, 0, ntpServer); }
         modeChanged = true; prevH = prevM = prevS = -1;
-      } else if (currentMode == MODE_CLOCK && touchStartY < NAV_BAR_Y) {
-        // 点击时钟�?(左上�?30x100 为配网热�? 切换 翻页/指针 样式
+      } else if (currentMode == MODE_CLOCK && touchStartY < 32 && touchStartX >= 436) {
+        navSummon();   // 2026-11-02: 右上角 ≡ = 唤出导航栏 (时钟页固定入口)
+      } else if (currentMode == MODE_CLOCK && touchStartY < ROW1_TOP) {
+        // 2026-11-02: 只有点"时钟主体区"(0..192) 才切换样式。旧版 y<PAGE_BOTTOM 把底部
+        // 日期条和底部指示条区域也算进来 -> 每次点底部都变成切翻页/指针。
         clockStyle = (clockStyle == STYLE_FLAP) ? STYLE_ANALOG : STYLE_FLAP;
         saveClockStyle(clockStyle);
-        modeChanged = true;
-        prevH = prevM = prevS = -1;
+        clockRedrawFace();   // 只重绘主体区, 日期两行不动 (消除切换时文字闪烁)
         Serial.printf("clock style -> %s\n", clockStyle == STYLE_FLAP ? "flap" : "analog");
       }
       // fix(2026-09-27): 旧版此处 delay(150) 在每次 tap 释放后阻塞主循环 150ms。
@@ -631,6 +833,18 @@ void handleTouch() {
       // 的 50ms _pressTime 保持), 无需这层 150ms 阻塞去防抖。删掉后主循环能立即采样第二下。
     }
     touchDidScroll = false;
+  }
+
+  // 2026-11-02: 统一手势 —— 底部中央指示条热区上滑 = 唤出导航栏; 导航栏上下划 = 收起。
+  // 先于滚动判定, 触发后清滚动分区, 与列表/侧栏/弹窗拖动互斥。
+  if (isDown && !touchNavGesture && navCueAllowed()) {
+    int dyg = (int)ty - (int)touchStartY;
+    if (!navPeek && touchStartY >= NAV_CUE_HOT_Y && touchStartX >= NAV_CUE_HOT_X0 &&
+        touchStartX < NAV_CUE_HOT_X1 && dyg <= -20) {
+      navSummon(); touchNavGesture = true; touchScrollZone = 0;
+    } else if (navPeek && touchStartY >= NAV_BAR_Y && dyg >= 20) {
+      navDismiss(); touchNavGesture = true; touchScrollZone = 0;
+    }
   }
 
   if (isDown && (currentMode == MODE_RADIO || touchScrollZone == 3)) {
@@ -646,7 +860,7 @@ void handleTouch() {
         // 局部刷新: 只重绘 150x264 侧栏 (sideScrollDirty), 不整页 (旧版每行整页重绘, SPI 要 ~100ms
         // 阻塞主循环, 拖拽采样跟不上 -> 不灵敏/卡顿)。2026-10-22: 总高用 sideTotalH (含组标题行)
         int totalH = sideTotalH();
-        int smax = max(0, totalH - (NAV_BAR_Y - (RADIO_HEADER_H + SIDEBAR_HEAD_H)));
+        int smax = max(0, totalH - (PAGE_BOTTOM - (RADIO_HEADER_H + SIDEBAR_HEAD_H)));   // 2026-11-03: 视口到屏幕底
         int ns = constrain(touchScrollStartRegion - dy, 0, smax);
         // 2026-10-30 去抖: 吸收 XPT2046 采样噪声(±1px), 防 listScrollTop 微跳触发全列重绘推屏(闪烁)
         if (abs(ns - regionScrollTop) >= 2) { regionScrollTop = ns; sideScrollDirty = true; }
@@ -665,18 +879,100 @@ void handleTouch() {
     touchLastX = tx; touchLastY = ty;
   }
 
-  // 边沿�?�? 必须在所有�??查完�?touchWasDown 之后再更�?
-  // 否则释放�?(!isDown && touchWasDown) 永远�?false �?触摸无反应�??
+  // 边沿???? 必须在所有???查完??touchWasDown 之后再更??
+  // 否则释放??(!isDown && touchWasDown) 永远??false ??触摸无反应???
   touchWasDown = isDown;
 }
 
 // 2026-10-20: autoPlayOnceTask (boot 自动播放环球资讯 + 10s 兜底重连) 已删除。
 // 它是 V81 代理调试期的验证任务, 与新播放条"暂停"按钮直接冲突
-// (用户暂停后 10s 内被强制重新连流, 暂停形同虚设)。现恢复手动控制, 播放条 ▶ 起播。
+// (用户暂停后 10s 内被强制重新连流, 暂停形同虚设)。现恢复手动控制, 播放条 ? 起播。
+
+// 2026-11-03: 开机默认台 —— stations.bin 里 "中国之声" 有多个镜像 (中央台 6 条),
+// 优先选官方 ngcdn HLS 的 HTTP 源 (项目禁用 HTTPS, 防 TLS 握手 OOM); 无则用首个可用 HTTP 源。
+// 2026-11-06 调试期覆盖: 固定开机播放 "河北新闻广播" (sid=898, hebxw HLS), 用于复现断流。
+// 置 -1 即恢复原 "中国之声" 逻辑。
+static const int BOOT_DEBUG_SID = 898;
+
+static int findBootCnr1Sid() {
+  if (BOOT_DEBUG_SID >= 0 && BOOT_DEBUG_SID < radioStnTotal) {
+    RadioStation* d = stn(BOOT_DEBUG_SID);
+    if (d && strstr(d->name, "河北新闻")) return BOOT_DEBUG_SID;
+  }
+  int fallback = -1;
+  for (int i = 0; i < radioStnTotal; i++) {
+    RadioStation* s = stn(i);
+    if (!s || strcmp(s->region, "中央") != 0) continue;
+    if (!strstr(s->name, "中国之声")) continue;
+    String u = readURLForSid(i);
+    if (!u.length()) continue;
+    if (u.startsWith("http://ngcdn00")) return i;
+    if (fallback < 0) fallback = i;
+  }
+  return fallback;
+}
+
+// 2026-11-03: 开机连流失败时的轻量自动重试 (最多 3 次, 间隔 20s)。
+// 仅在用户还未产生任何输入时重试 —— 一旦用户触摸/暂停, 立即停止重试, 不与手动控制冲突。
+static const uint8_t  BOOT_RETRY_MAX   = 3;
+static const uint32_t BOOT_RETRY_INTV  = 20000UL;
+static int      g_bootSid = -1;
+static uint8_t  g_bootRetries = 0;
+static uint32_t g_bootRetryAt = 0;
+static uint32_t g_bootInputBaseline = 0;   // 开机时的 idle 基线, 用户输入后即变化
+
+// 开机默认播放"中国之声"并直接进全屏播放器。
+// 不自己连流: 只登记延迟起播请求 (与用户双击电台同一条路径), 由 modeRadio 统一 flush,
+// 保证音量/历史/状态灯/全屏绘制与手动起播完全一致, 不产生额外启停。
+static void bootAutoplayCnr1() {
+  if (!radioInited) { Serial.println("[BOOT] radio DB not ready, skip autoplay"); return; }
+  if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
+  int sid = findBootCnr1Sid();
+  if (g_spiMutex) xSemaphoreGive(g_spiMutex);
+  if (sid < 0) { Serial.println("[BOOT] 中国之声 not found -> stay clock"); return; }
+
+  // 2026-11-04: 开机音量回落到 75% (48/64)。原 47% 实测偏小 (尤其小喇叭/夜间环境),
+  // 仍低于满档, 避免开机被吓到; 用户可随时按音量±调整。
+  const uint8_t BOOT_VOLUME = (uint8_t)(RADIO_VOL_MAX * 48 / 64);   // ≈48 档 / 75%
+  radioVolume = BOOT_VOLUME;
+  audio.setVolume(BOOT_VOLUME);
+
+  currentPlayingSid = sid;                             // 占位: 全屏首帧即可画出站名/频点
+  pendingPlaySid = sid;
+  pendingPlayAt = millis() - RADIO_PLAY_FLUSH_MS;      // 首个 modeRadio 帧立即连流
+  showingFullscreen = true;
+  currentMode = MODE_RADIO;
+  modeChanged = true;
+  navPeek = false; navOnScreen = false;
+  for (int i = 0; i < MODE_COUNT; i++) modeDrawn[i] = false;
+
+  // 开机重试状态
+  g_bootSid = sid;
+  g_bootRetries = 0;
+  g_bootRetryAt = millis() + BOOT_RETRY_INTV;
+  g_bootInputBaseline = carouselLastInput;             // 用户一旦触摸, 此值失效
+  RadioStation* s = stn(sid);
+  Serial.printf("[BOOT] autoplay %s (%s) sid=%d vol=%d -> fullscreen\n",
+                s ? s->name : "?", s ? s->freq : "", sid, BOOT_VOLUME);
+}
+
+// 开机连流失败自动重试 (在 carouselTick 中调度, 只读状态不绘图)
+static void bootRetryTick() {
+  if (g_bootSid < 0 || g_bootRetries >= BOOT_RETRY_MAX) return;
+  if (radioPlaying) { g_bootSid = -1; return; }             // 已成功, 不再重试
+  if (currentPlayingSid != g_bootSid) { g_bootSid = -1; return; }  // 用户切了台/暂停了别的
+  if (carouselLastInput != g_bootInputBaseline) { g_bootSid = -1; return; }  // 用户有操作
+  if ((int32_t)(millis() - g_bootRetryAt) < 0) return;
+  g_bootRetries++;
+  g_bootRetryAt = millis() + BOOT_RETRY_INTV;
+  Serial.printf("[BOOT] retry connect #%u/%u\n", g_bootRetries, BOOT_RETRY_MAX);
+  playStationAt(g_bootSid);
+}
 
 void setup() {
   Serial.begin(115200);
   delay(500);
+  ringBuf();   // 2026-11-01 MEM: 日志环 PSRAM 预分配 (避免多任务首次并发分配)
   // BUILDUI8-CRASH-DIAG: 临时全开 esp_log（含 WDT "Print CPU" / esp_timer / lwip），定位 boot 后 ~7s 卡死持锁者
   // esp_log_level_set("*", ESP_LOG_NONE); // 关所有 esp_log 打印（Audio 库 S2DBG 刷屏），我们自己的 Serial.printf 不受影响
   // 2026-10-25: 旧的 sdProbe() (挂载后立即 SD.end() 的诊断) 已移除,
@@ -699,9 +995,9 @@ void setup() {
     Serial.printf("RESET_REASON=%d\n", (int)rr);
   }
 
-  // ================== 上电�?�? (BOOT SELF-TEST) ==================
-  // �?TFT_eSPI 内置字体(不依�?LittleFS / �?定�??XFont)在屏幕上逐�?�显�?,
-  // 这样在没有串口监视器时也能直接看出黑屏停在哪�?步�??
+  // ================== 上电???? (BOOT SELF-TEST) ==================
+  // ??TFT_eSPI 内置字体(不依??LittleFS / ??定???XFont)在屏幕上逐???显??,
+  // 这样在没有串口监视器时也能直接看出黑屏停在哪??步???
   initTFT();
 
   // 2026-10-25: 全局锁提前到 initTouch()/任何跨任务 SPI 访问之前创建
@@ -733,13 +1029,13 @@ void setup() {
   pinMode(TOUCH_IRQ, INPUT_PULLUP);
   Serial.printf("[PENIRQ] boot initial GPIO4=%d\n", digitalRead(TOUCH_IRQ));
 
-  tft.setTextFont(2);                 // 内置 16px 字体 (User_Setup.h �?LOAD_FONT2)
+  tft.setTextFont(2);                 // 内置 16px 字体 (User_Setup.h ??LOAD_FONT2)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(0, 0);
   tft.println("ESP32-S3 Radio");
   tft.println("Boot self-test...");
 
-  // 1) 文件系统 (黑屏�?常�?�原�?: �?烧录文件系�??uploadfs)
+  // 1) 文件系统 (黑屏??常???原??: ??烧录文件系???uploadfs)
   bool fsOk = LittleFS.begin();
   Serial.printf("LittleFS: %s\n", fsOk ? "OK" : "FAIL");
   tft.print("FS: ");
@@ -757,14 +1053,17 @@ void setup() {
   // 1b) 节日/节气 音乐配置 (缺失/损坏则不播)
   if (fsOk || sdOk) loadFestivalConfig();
 
-  // 1c) 时钟样式 (NVS 持久�? 翻页 / 指针, 点击时钟页可切换)
+  // 1c) 时钟样式 (NVS 持久?? 翻页 / 指针, 点击时钟页可切换)
   clockStyle = getClockStyle();
   Serial.printf("clock style: %s\n", clockStyle == STYLE_FLAP ? "flap" : "analog");
 
   // 2) 触摸
   initTouch();
 
-  // 3) �?文字�? (加载失败 -> 后续�?有中文都�?空�?? 看起来像黑屏)
+  // 3) ??文字?? (加载失败 -> 后续??有中文都??空??? 看起来像黑屏)
+  // 2026-11-01 MEM: font16 也改 Flash 直读 (原来整包 1.73MB 常驻 PSRAM)。
+  // 与 font32 同一套机制: 只保留 unicode/advance 索引, 字形绘制时按需 seek+read (~0.1-0.2ms/字)。
+  font16.setFlashMode(true);
   bool f16 = font16.reInit("/font_simhei_16.font");
   font32.setFlashMode(true);   // BUILDV5-FONTF: 64px 黄历字库 Flash 直读 → 释放 1.48MB PSRAM 给音频深缓冲 (2026-10-17 恢复; 加诊断验证字形数据)
   bool f32 = font32.reInit("/font_simhei_64.font");
@@ -793,7 +1092,7 @@ void setup() {
     tft.println("FAIL");
   }
 
-  // 4b) 节假�?放假/补班) 同�??: 加载缓存; 联网后由 loop 里的 tick() 定时同�??
+  // 4b) 节假??放假/补班) 同???: 加载缓存; 联网后由 loop 里的 tick() 定时同???
   // 2026-10-25: 三者都会读 SD 上的缓存文件, 与触摸采样共享 FSPI -> 持锁串行
   if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
   holiday::init();
@@ -801,7 +1100,7 @@ void setup() {
   weather::init();   // weather: open-meteo 实时天气 (读缓存; tick() 联网后拉取 + 30min 刷新)
   if (g_spiMutex) xSemaphoreGive(g_spiMutex);
 
-  // 5) 电台数据�?(bad format / 内存不足�?new[] 会崩�?
+  // 5) 电台数据??(bad format / 内存不足??new[] 会崩??
   Serial.println("Loading radio DB...");
   if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);   // stations.bin 可能来自 SD
   bool dbOk = loadRadioDB();
@@ -827,6 +1126,9 @@ void setup() {
       dumpRing();
       saveStallDump("Stream lost");
     }
+    // 2026-11-07: 根因已定并修复 (服务端 keep-alive 第 100 请求 close + 分片 body 截断,
+    // 由 streamDetection 的 cut seg 路径自恢复)。库内软重连每个 ~100 请求会发生一次,
+    // 再落盘就是纯碎片写入 -> 已删除此写盘, 避免闪存磨损。
   };
   // HLS buffer tuning (CNR/CRI m3u8, 10s segments / separate HTTP GET each):
   // 400KB PSRAM buffer ~= 25s @128kbps. Old 64KB setting gave only ~3.5s
@@ -873,6 +1175,10 @@ void setup() {
   // 不再触碰 newlib tz 锁, 此预热窗口已消除; 保留空预热注释占位 (无锁函数无需预热)。
   Serial.printf("[NET] spiMutex=%d printMutex=%d\n", g_spiMutex != nullptr, g_printMutex != nullptr);
   modeChanged = true;
+  // 2026-11-03: 开机默认播放中国之声 + 全屏播放器; 闲置计时从 UI 就绪这一刻开始
+  bootAutoplayCnr1();
+  carouselLastInput = millis();
+  Serial.printf("[CAROUSEL] idle baseline at %lums\n", (unsigned long)carouselLastInput);
 }
 
 // ========== 板载 RGB 状态灯 (WS2812B-5050RGB, 原理图 LED2, DIN←GPIO48) ==========
@@ -930,16 +1236,25 @@ void loop() {
   // 缓冲满&时间戳停 = 解码问题。
   if (millis() - s_diagLast >= 2000) {
     s_diagLast = millis();
+    extern volatile uint32_t g_i2sCbCount;   // radio_ui.cpp: 故障 B 探针
+    extern volatile int32_t g_pcmRawMax;
+    extern volatile uint32_t g_vuLastSigMs;
+    extern uint32_t g_tcpReqTotal;   // Audio.cpp: HTTP 请求复用基线
+    extern uint32_t g_tcpReqReused;
     ringLog("[DIAG] in=%d/%d/%lums buff=%u/%u out=%d/%lus",
             radioPlaying, musicPlaying, (unsigned long)g_lastNetLoopDt,
             (unsigned)audio.inBufferFilled(), (unsigned)audio.inBufferFree(),
             audio.isRunning(), (unsigned long)audio.getAudioCurrentTime());
     if (g_printMutex) xSemaphoreTake(g_printMutex, portMAX_DELAY);
-    Serial.printf("[DIAG] in=%d/%d/%lums buff=%u/%u out=%d/%lus\n",
+    Serial.printf("[DIAG] in=%d/%d/%lums buff=%u/%u out=%d/%lus pcm=%ld cb=%lu vuAge=%lu req=%lu/%lu\n",
                   radioPlaying, musicPlaying, (unsigned long)g_lastNetLoopDt,
                   (unsigned)audio.inBufferFilled(), (unsigned)audio.inBufferFree(),
-                  audio.isRunning(), (unsigned long)audio.getAudioCurrentTime());
+                  audio.isRunning(), (unsigned long)audio.getAudioCurrentTime(),
+                  (long)g_pcmRawMax, (unsigned long)g_i2sCbCount,
+                  (unsigned long)(millis() - g_vuLastSigMs),
+                  (unsigned long)g_tcpReqReused, (unsigned long)g_tcpReqTotal);
     if (g_printMutex) xSemaphoreGive(g_printMutex);
+    g_pcmRawMax = 0;   // 每 2s 窗口重新统计峰值
   }
   if (millis() - s_lowLast >= 2000) {
     s_lowLast = millis();
@@ -1032,8 +1347,16 @@ void loop() {
   // touch 竞争——touch 在 g_spiMutex 外等待）。
   if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
   handleTouch();
+  carouselTick();   // 2026-11-03: 闲置轮播计时/翻页 (只读 millis, 不依赖页面刷新)
+  // 2026-11-04: 收音机断流健康检查 + pendingPlay 连接泵 —— 每帧执行且与当前页面无关,
+  // 使断流自动重连在轮播/时钟/天气页也能生效 (pumpRadio 只在 radioPlaying 时才有动作)。
+  if (radioPlaying) pumpRadio();
+  // 2026-11-07: 首帧未画前不连流 —— flush 里的 connecttohost 是阻塞网络操作(秒级),
+  // 抢在首帧前执行会出现"开机 READY 后声音都出来了 UI 还没画"。等当前页至少画过
+  // 一帧再 flush 延迟起播; 正常交互时页面早已画过, 不增加任何起播延迟。
+  if (modeDrawn[currentMode]) radioPendingPlayTick();
   uint32_t t1 = micros();
-  holiday::tick();   // 节假�? 联网后�?��?�同�?+ �?24h + 浏�?�补同�??
+  holiday::tick();   // 节假?? 联网后??????同??+ ??24h + 浏???补同???
   geo::tick();   // geo: locate province after wifi; refresh every 24h (non-blocking fetch)
   weather::tick();   // weather: fetch open-meteo after wifi; refresh every 30min (non-blocking)
   uint32_t t2 = micros();
@@ -1072,14 +1395,14 @@ void loop() {
     }
   }
 
-  // �?�?"导航选中项变�?(navDirty)时重绘�?�航�?: 既避免每帧重绘的�?�?, 也避免时钟样�?
-  // 切换(不改变�?�中�?时�??重绘导航栏�?�成的彩色撕裂竖条�??
-  // 2026-10-31: 全屏无底部功能切换栏 —— navPeek 时画导航栏, 否则擦底部为页面背景。
-  // 天气页全屏自绘 (齿轮唤出); 收音机全屏不擦 (双击返回提示条区域)。
-  if (navPeek && millis() - navPeekAt >= NAV_PEEK_MS) { navPeek = false; navDirty = true; }
+  // ????"导航选中项变??(navDirty)时重绘???航??: 既避免每帧重绘的????, 也避免时钟样??
+  // 切换(不改变???中??时???重绘导航栏???成的彩色撕裂竖条???
+  // 2026-11-02: 导航栏 = 用户唤出式覆盖层 (无自动收起)。唤出/收起由 navSummon/navDismiss
+  // 立即绘制; 此处只兜底: 页面整页重绘可能擦掉导航栏 -> 补画 (天气页在 modeWeather 内自补)。
   if (navDirty) {
-    if (currentMode != MODE_WEATHER && !showingFullscreen) {
-      if (navPeek) drawNavBar(); else eraseNavBar();
+    if (!showingFullscreen) {
+      if (navPeek && !navOnScreen) { drawNavBar(); navOnScreen = true; }
+      else if (!navPeek && navOnScreen) { restoreNavStrip(); navOnScreen = false; }
     }
     navDirty = false;
   }

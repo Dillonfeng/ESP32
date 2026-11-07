@@ -8,6 +8,7 @@
 #include "audiolib_structs.hpp"
 #include "esp_arduino_version.h"
 #include "esp_dsp.h"
+#include <esp_heap_caps.h>
 #include "psram_unique_ptr.hpp"
 #include <Arduino.h>
 #include <FFat.h>
@@ -687,6 +688,18 @@ class Audio {
     bool       m_f_acceptRanges = false;          //
     bool       m_f_reset_m3u8Codec = true;        // reset codec for m3u8 stream
     bool       m_f_connectionClose = false;       // set in parseHttpResponseHeader
+    // 2026-11-06 取证: 本次请求是复用了已有 TCP(keep-alive) 还是新建连接
+    bool       m_f_tcpReused = false;
+    uint32_t   m_tcpReqStartMs = 0;
+    // 2026-11-07: 分片 body 被服务端在 Connection: close 处截断时, 重下同一分片并从
+    // 已收到字节处续传 (丢失的尾部字节补回来, 不产生半截 AAC 帧, 不会把解码器带偏)
+    bool       m_f_segResume = false;
+    uint32_t   m_segResumeGot = 0;      // 已成功喂给 TS 流水线的字节数
+    uint32_t   m_segResumeSize = 0;     // 原响应 content-length (校验重下的是同一分片)
+    uint32_t   m_segResumeSkip = 0;     // 续传时要丢弃的 body 前缀字节数
+    uint32_t   m_segResumeSkipRead = 0; // 尚需从新响应中丢弃的前缀字节数
+    uint8_t*   m_segResumeBuf = nullptr; // 丢弃前缀时用的读缓冲 (PSRAM)
+    ps_ptr<char> m_segResumeHost;       // 要重下的分片 URL
     bool       m_f_i2s_channel_enabled = false;   // true if enabled
     bool       m_f_mute = false;
     uint32_t   m_audioCurrentTime = 0;  // seconds

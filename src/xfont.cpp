@@ -17,6 +17,19 @@ int       XFont::s_fbH = 0;
 int       XFont::s_fbOX = 0;
 int       XFont::s_fbOY = 0;
 
+// 2026-11-01 MEM: AA 字形灰度中转缓冲 (64x64 上限) —— 纯 CPU 读写, 不是 DMA 源,
+// 因此可放 PSRAM 并三处共享一块, 释放原先 compositeGlyph/drawScaledChar/drawBigChar
+// 各自 4KB 的内部 RAM (共 12KB)。合成后的 sbuf/bigBuf 才是 pushImage 的 DMA 源, 仍留内部 RAM
+// (八线 PSRAM DMA 突发读取错乱 = "秒个位彩虹花屏" 历史根因, 见 clock_ui.cpp 注释)。
+static uint8_t* s_alphaScratch = nullptr;
+static uint8_t* alphaScratch() {
+    if (!s_alphaScratch) {
+        s_alphaScratch = (uint8_t*)heap_caps_malloc(64 * 64, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_alphaScratch) Serial.println(F("[XFont] PSRAM alpha scratch alloc FAIL"));
+    }
+    return s_alphaScratch;
+}
+
 XFont::XFont(TFT_eSPI* tft)
     : _tft(tft)
     , _isInit(false)
@@ -54,6 +67,8 @@ void XFont::clear()
     _aaPixels = nullptr;
     if (_aaFile) { _aaFile.close(); }      // BUILDV5-FONTF: 关闭 Flash 直读句柄
     _aaFlashMode = false;
+    if (_aaCacheData) { heap_caps_free(_aaCacheData); _aaCacheData = nullptr; }   // 2026-11-02 字形缓存
+    for (int i = 0; i < kGlyphCacheSlots; i++) _aaCacheTag[i] = -1;
 }
 
 // ============================================================
@@ -753,6 +768,27 @@ bool XFont::_readGlyph(int idx, uint8_t* buf) const
 {
     if (!_aaFile) return false;
     const uint32_t perGlyph = 3 + (uint32_t)_aaSize * _aaSize;
+    // 2026-11-02 SCROLLFIX: 16x16 字形走 256 槽直接映射缓存 (PSRAM)。
+    // 电台列表滚动一帧 ~130 个字形, 每个 seek+read 约 0.1-0.2ms -> 20ms+ 卡顿;
+    // 命中后只剩 PSRAM memcpy (256B), 未命中才读盘并回填。
+    if (_aaSize == 16) {
+        if (!_aaCacheData) {
+            _aaCacheData = (uint8_t*)heap_caps_malloc((size_t)kGlyphCacheSlots * 256, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (_aaCacheData) for (int i = 0; i < kGlyphCacheSlots; i++) _aaCacheTag[i] = -1;
+            else Serial.println(F("[XFont] glyph cache alloc FAIL"));
+        }
+        if (_aaCacheData) {
+            int slot = idx & (kGlyphCacheSlots - 1);
+            uint8_t* dst = _aaCacheData + (size_t)slot * 256;
+            if (_aaCacheTag[slot] != idx) {
+                if (!_aaFile.seek(8 + (uint32_t)idx * perGlyph + 3)) return false;
+                if (_aaFile.read(dst, 256) != 256) return false;
+                _aaCacheTag[slot] = (int16_t)idx;
+            }
+            memcpy(buf, dst, 256);
+            return true;
+        }
+    }
     if (!_aaFile.seek(8 + (uint32_t)idx * perGlyph + 3)) return false;   // 跳过 unicode(2)+adv(1)
     return _aaFile.read(buf, (size_t)_aaSize * _aaSize) == (size_t)_aaSize * _aaSize;
 }
@@ -783,9 +819,10 @@ int XFont::textWidthAA(const String& str) const
 void XFont::compositeGlyph(int x, int y, int idx, uint16_t fg, uint16_t bg) const
 {
     const int S = _aaSize;                          // 原生单元格边长 (ver4=24 超采样 / ver1=16 / ver3=64)
-    // ⚠️ 内部 RAM 中转: SxS 原生灰度面积平均降采样到 16x16 再逐通道 565 合成.
-    // 避免 ESP32-S3 八线 PSRAM DMA 突发读取错乱 (历史 bug 2026-09-22). 与 drawScaledChar 同款.
-    static uint8_t alphaBuf[64 * 64];               // S<=64 -> 4096B 内部 RAM
+    // ⚠️ 中转灰度: SxS 原生灰度面积平均降采样到 16x16 再逐通道 565 合成.
+    // 2026-11-01 MEM: 中转缓冲改 PSRAM 共享 (原 4KB 内部 RAM/函数).
+    uint8_t* alphaBuf = alphaScratch();
+    if (!alphaBuf) return;
     // BUILDV5-FONTF: Flash 直读模式下字形从文件读入 (PSRAM 模式保持 memcpy)
     if (_aaFlashMode) { if (!_readGlyph(idx, alphaBuf)) return; }
     else              { memcpy(alphaBuf, _aaPixels + idx * (3 + S * S) + 3, (size_t)S * S); }
@@ -835,8 +872,10 @@ void XFont::drawScaledChar(int x, int y, uint16_t ch, int dst, uint16_t fg, uint
     int idx = findAA(ch);
     if (idx < 0) return;
     const int S = _aaSize;                          // 原生单元格边长 (ver4=24 超采样)
-    // ⚠️ 内部 RAM 中转: SxS 原生灰度面积平均缩放到 dst x dst 再逐通道 565 合成 (与 compositeGlyph 同款)
-    static uint8_t alphaBuf[64 * 64];
+    // ⚠️ 中转灰度: SxS 原生灰度面积平均缩放到 dst x dst 再逐通道 565 合成 (与 compositeGlyph 同款)
+    // 2026-11-01 MEM: 中转缓冲改 PSRAM 共享 (原 4KB 内部 RAM)
+    uint8_t* alphaBuf = alphaScratch();
+    if (!alphaBuf) return;
     // BUILDV5-FONTF: Flash 直读模式下字形从文件读入 (PSRAM 模式保持 memcpy)
     if (_aaFlashMode) { if (!_readGlyph(idx, alphaBuf)) return; }
     else              { memcpy(alphaBuf, _aaPixels + idx * (3 + S * S) + 3, (size_t)S * S); }
@@ -874,8 +913,9 @@ void XFont::drawBigChar(int x, int y, uint16_t ch, int dst, uint16_t fg, uint16_
     if (idx < 0) return;
     int S = _aaSize;                       // 字库原生字形边长 (16 或 32)
     const uint32_t perGlyph = (uint32_t)(3 + S * S);
-    // ⚠️ 内部 RAM 中转 alpha (与 compositeGlyph 同款, 避免 PSRAM DMA 错乱)
-    static uint8_t alphaBuf[64 * 64];   // ver3=64x64=4096B (内部 RAM)
+    // ⚠️ 中转灰度 (与 compositeGlyph 同款); 2026-11-01 MEM: 改 PSRAM 共享 (原 4KB 内部 RAM)
+    uint8_t* alphaBuf = alphaScratch();   // ver3=64x64 上限
+    if (!alphaBuf) return;
     // BUILDV5-FONTF: Flash 直读模式下字形从文件读入 (PSRAM 模式保持 memcpy)
     if (_aaFlashMode) { if (!_readGlyph(idx, alphaBuf)) return; }
     else              { memcpy(alphaBuf, _aaPixels + (uint32_t)idx * perGlyph + 3, (size_t)S * S); }

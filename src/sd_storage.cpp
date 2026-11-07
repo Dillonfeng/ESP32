@@ -48,10 +48,15 @@ bool init() {
   digitalWrite(SD_CS_PIN, HIGH);
   delay(10);
 
-  // 1MHz 已实测可挂载; 初始化成功后 SD 库沿用该时钟 (音频流约 16~32KB/s, 够用)。
-  Serial.println("[SD] init try 1000000 Hz...");
-  s_mounted = SD.begin(SD_CS_PIN, sdSpi, 1000000, SD_MOUNT_POINT, SD_MAX_FILES, false);
-  Serial.printf("[SD]   -> %s\n", s_mounted ? "OK" : "fail");
+  // 2026-11-01 MEM: 提速 —— 之前固定 1MHz (≈50KB/s 实际), 数据文件读写都很慢。
+  // SD 库内部先用 400kHz 完成 CMD0/ACMD41 初始化, 之后才按 frequency 走数据,
+  // 所以直接给高速是安全的; 逐级回退: 20MHz -> 10MHz -> 1MHz, 任一级挂载成功即停。
+  static const uint32_t kFreqs[] = { (uint32_t)SD_SPI_FAST_FREQ, 10000000u, (uint32_t)SD_SPI_FREQ };
+  for (unsigned i = 0; i < sizeof(kFreqs) / sizeof(kFreqs[0]) && !s_mounted; i++) {
+    Serial.printf("[SD] init try %u Hz...\n", (unsigned)kFreqs[i]);
+    s_mounted = SD.begin(SD_CS_PIN, sdSpi, kFreqs[i], SD_MOUNT_POINT, SD_MAX_FILES, false);
+    Serial.printf("[SD]   -> %s\n", s_mounted ? "OK" : "fail");
+  }
 
   if (!s_mounted) {
     Serial.println("[SD] mount FAIL (no card / not FAT?) -> fallback LittleFS");

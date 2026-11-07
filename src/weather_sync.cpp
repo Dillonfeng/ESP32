@@ -718,6 +718,9 @@ static FetchResult fetchAndCache(bool full) {
         snprintf(d.date, sizeof(d.date), "%02d-%02d %s", dm, dd2, WK[weekdayFromYmd(dy, dm, dd2)]);
     }
     r.fullOk = true;   // 7 天成功 -> full 链路主体有效
+    // 日期已重建 -> 清空逐日 AQI, 让下方 和风/sojson 按新日期重新填充。
+    // 否则 d=g 带入的旧值使 sojson 的 ==0 补缺失效: AQI 与日期错位且永不更新。
+    for (int i = 0; i < 7; i++) d.dayAqi[i] = 0;
     // 紫外线: V1 daily 顶层 uvIndexMax 即日值 (省去单独 /v7/indices/1d 调用)
     // 和风日值作为兜底; Open-Meteo 实时 UV 在末尾覆盖 (fast 链路也跑)。
     float uvMax = da[0]["uvIndexMax"] | -1.0f;
@@ -798,6 +801,7 @@ static FetchResult fetchAndCache(bool full) {
   // ---- 5) 气象预警 /weatheralert/v1/current/{lat}/{lng} (常跑; fast 链路) ----
   // 台风(eventType 1001)单独进 typhoon 字段; 其余取第一条非台风预警入药丸。
   // 非台风预警字段每次重拉必须清零 (否则旧预警残留); 台风字段保留 (full 链路 storm-list 补实况)。
+  bool tyAlert = false;   // 本轮预警是否含台风 (预警解除后为 false -> 用于清除残留台风标记)
   d.alertCount = 0;
   d.alertTitle[0] = 0; d.alertColor[0] = 0; d.alertDesc[0] = 0;
   d.alertTime[0] = 0; d.alertSender[0] = 0; d.alertSeverity[0] = 0;
@@ -813,6 +817,7 @@ static FetchResult fetchAndCache(bool full) {
         const char* hl     = a["headline"] | "";
         bool isTy = !strcmp(etCode, "1001") || strstr(etName, "台风");
         if (isTy) {
+          tyAlert = true;
           d.typhoon = true;
           // 台风名: 对齐 WinCalender —— headline 截取 "台风/热带风暴/..." 起的片段
           static const char* TY_KW[] = {"超强台风","强台风","强热带风暴","热带风暴","热带低压","台风"};
@@ -845,11 +850,27 @@ static FetchResult fetchAndCache(bool full) {
     }
   }
 
+  // 本轮已无台风预警: 若手上也没有台风实况 (上轮 full 未抓到或已停编), 清掉残留的台风标记,
+  // 否则台风消散后顶栏台风按钮/弹窗仍显示旧信息 (d=g 每轮拷贝旧状态, 之前只置位从不清除)。
+  // fast 链路沿用 g 的 tyCount; full 链路在步骤 6 开头还会再重推一次。
+  if (!tyAlert && d.tyCount <= 0) {
+    d.typhoon = false;
+    d.typhoonName[0] = 0;
+    d.typhoonDesc[0] = 0;
+  }
+
   // ---- 6) 活跃台风: 中国气象局台风网 (免费源, 仅 full 链路) ----
   // 列表里 status=="start" 的台风全部拉取实况 (最多 TY_MAX 个), 弹窗一次列出、超出可滚动。
   // 预警里点名的台风排最前 -> 弹窗首屏/顶部按钮显示的是本地预警的那个。
   if (full) {
   {
+    // full 链路重推台风状态: 上轮 storm-list 写入的台风标记/名称/描述全部作废,
+    // 仅保留步骤 5 本轮预警刚点名的台风; 随后按 NMC 活跃列表重建 (无活跃台风则保持清除)。
+    if (!tyAlert) {
+      d.typhoon = false;
+      d.typhoonName[0] = 0;
+      d.typhoonDesc[0] = 0;
+    }
     int  ids[WData::TY_MAX];
     char names[WData::TY_MAX][24];
     int  n = nmcListStorms(ids, names, WData::TY_MAX);

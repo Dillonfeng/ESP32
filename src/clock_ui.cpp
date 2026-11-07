@@ -902,6 +902,58 @@ void allocClockBufsResident() {
                 clockBufsReady ? 1 : 0);
 }
 
+// 2026-11-02: 导航栏收起后恢复时钟底部 (日期条 192..292 + 底边 + 指示条)。
+// 全屏重排后日期条压到 292, 导航栏(288..320)会盖住其最后 4px, 收起时必须重画而不是填背景。
+void clockRestoreBottom() {
+  time_t now = time(nullptr);
+  struct tm t;
+  epochToLocalNoLock(now, t);
+  drawDateRow(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_wday);
+  tft.fillRect(0, ROW2_TOP + ROW2_H, 480, PAGE_BOTTOM - (ROW2_TOP + ROW2_H), COLOR_BG);
+  // 2026-11-03: 时钟页有右上角 ≡, 底部指示条已取消
+}
+
+// 2026-11-02: 时钟页右上角导航按钮 —— 时钟页没有顶栏, 且"点屏幕=切换样式"会
+// 抢走底部指示条的点击, 因此给一个固定、明确的唤出入口。
+// 2026-11-07: 图标 ≡ -> 齿轮, 与天气/日历/收音机唤出键完全一致。
+static void drawNavCornerBtn() {
+  tft.fillRoundRect(436, 4, 38, 24, 7, 0x2104);
+  const int cx = 455, cy = 16;
+  tft.drawCircle(cx, cy, 6, 0x9CF3);
+  tft.fillCircle(cx, cy, 2, 0x9CF3);
+  for (int i = 0; i < 8; i++) {
+    float a = i * 3.14159265f / 4.0f;
+    tft.drawLine(cx + (int)(cosf(a) * 7), cy + (int)(sinf(a) * 7),
+                 cx + (int)(cosf(a) * 9), cy + (int)(sinf(a) * 9), 0x9CF3);
+  }
+}
+
+// 2026-11-02: 切换翻页/指针样式只重绘时钟主体区 (0..ROW1_TOP), 日期两行完全不动,
+// 消除"切换样式时下面两行文字闪一下"。
+void clockRedrawFace() {
+  time_t now = time(nullptr);
+  struct tm t;
+  epochToLocalNoLock(now, t);
+  int h = t.tm_hour, m = t.tm_min, s = t.tm_sec;
+  allocClockBufs();
+  tft.fillRect(0, 0, 480, ROW1_TOP, COLOR_BG);
+  if (clockStyle == STYLE_FLAP) {
+    char cur[7];
+    snprintf(cur, sizeof(cur), "%02d%02d%02d", h, m, s);
+    flapInit();
+    for (int i = 0; i < 6; i++) {
+      if (!(flapReady && bandSram && (i == 2 || i == 3))) drawCard(i, cur[i], false);
+      fstate[i].flipping = false;
+      fstate[i].shown = cur[i]; fstate[i].newD = cur[i];
+      fstate[i].clicks = 0; fstate[i].redrawn = true; fstate[i].startMs = 0;
+    }
+    rollLast = 0.0f;
+    if (flapReady) drawRollerBand(0.0f);
+  }
+  drawNavCornerBtn();
+  prevH = h; prevM = m; prevS = s;
+}
+
 void modeClock() {
   time_t now = time(nullptr);
   struct tm tm_info;
@@ -915,7 +967,7 @@ void modeClock() {
   // 首�?�进�?: 清场 + 按当前样式绘�?(翻页 6 张牌 / 指针表盘) + 日期�?
   if (!modeDrawn[MODE_CLOCK] || modeChanged) {
     allocClockBufs();   // BUILD17: alloc the active style's clock buffers on clock-page entry (freed in loop() when leaving)
-    tft.fillRect(0, 0, 480, NAV_BAR_Y, COLOR_BG);
+    tft.fillRect(0, 0, 480, PAGE_BOTTOM, COLOR_BG);
     if (clockStyle == STYLE_FLAP) {
       char cur[7];
       snprintf(cur, sizeof(cur), "%02d%02d%02d", h, m, s);
@@ -946,6 +998,7 @@ void modeClock() {
     // 注意: 不画 "NTP OK" �?preview (make_preview.scene / draw_analog_scene) 均不显示,
     // �?件必须与预�?�一�?(预�?��??target)�?
     drawDateRow(year, mon, mday, wday);
+    drawNavCornerBtn();   // 右上角 ≡ 唯一唤出入口 (底部指示条已取消)
     checkFestivalMusic(year, mon, mday);   // 节日/节气音乐 (每天�?�?
     prevH = h; prevM = m; prevS = s;
     modeDrawn[MODE_CLOCK] = true;

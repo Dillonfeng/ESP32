@@ -105,6 +105,13 @@ private:
     mutable File _aaFile;            // BUILDV5-FONTF: Flash 直读模式常驻句柄 (mutable 供 const 绘制方法 seek+read)
     mutable uint16_t _buf[256] = {0}; // 16x16 合成缓冲 (const 方法内复用)
 
+    // 2026-11-02 SCROLLFIX: 16x16 字形缓存 (Flash 直读模式下每字形 seek+read 约 0.1-0.2ms,
+    // 电台列表一帧要 ~130 个字形 -> 20ms+ 拖慢滚动)。直接映射 256 槽 (idx & 255),
+    // 灰度数据存 PSRAM 64KB; 只在 _aaSize==16 时启用 (font32 的 4KB 字形不进缓存)。
+    static const int kGlyphCacheSlots = 256;
+    mutable int16_t _aaCacheTag[kGlyphCacheSlots];   // 槽内字形 idx (-1=空)
+    mutable uint8_t* _aaCacheData = nullptr;         // PSRAM: 256 槽 x 256B
+
     // ===== 内部方法 =====
     String utf8ToUnicode(const String& utf8Str);
     String getCodeFromFile(const String& unicodeStr);

@@ -51,19 +51,19 @@
 // 左区: 图标 46..166 (120px) | 温度 170..214 | 天气 220 | UV 244 | 日出日落 266 (全部 <=282, 让出 288 起的功能栏)
 #define WX_ICON_Y    46
 #define WX_ICON_S    120
-#define WX_TEMP_Y    170
-#define WX_WTXT_Y    220
-#define WX_UV_Y      244
-#define WX_SUN_Y     266
-// 右区: AQI 46..106 | 详情卡 114..214 (3 行, 含室内) | 预警 222..250 | 预报入口 258..286
+#define WX_TEMP_Y    172
+#define WX_WTXT_Y    224
+#define WX_UV_Y      250
+#define WX_SUN_Y     276
+// 右区: AQI 46..110 | 详情卡 118..224 (3 行, 含室内) | 预警 232..262 | 预报入口 270..306
 #define WX_AQ_Y      46
-#define WX_AQ_H      60
-#define WX_DET_Y     114
-#define WX_DET_H     100
-#define WX_ALT_Y     222
-#define WX_ALT_H     28
-#define WX_FC_Y      258
-#define WX_FC_H      28
+#define WX_AQ_H      64
+#define WX_DET_Y     118
+#define WX_DET_H     106
+#define WX_ALT_Y     232
+#define WX_ALT_H     30
+#define WX_FC_Y      270
+#define WX_FC_H      36
 
 // 顶栏右侧按钮 (34x30, y5): 设置 262 | 预警 303 | 台风 344 | 刷新 385; 时间右对齐 460
 #define WX_BSET_X    262
@@ -76,9 +76,8 @@
 
 static uint8_t wSub = 0;          // 0=主页 1=7天预报 2=预警弹窗 3=台风弹窗 4=城市弹窗
 static int     wLastMin = -1;     // 顶栏时钟分钟缓存
-// 功能栏唤出 (全屏主页: 点顶栏齿轮唤出底部导航, 5s 无操作自动收起)
-static bool     wNavPeek   = false;
-static uint32_t wNavPeekAt = 0;   // NAV_PEEK_MS 定义在 ui_common.h (2026-10-31 统一)
+// 功能栏唤出 (2026-11-02: 点顶栏齿轮或底部指示条唤出, 用户手动收起, 无超时)
+// 唤出状态用全局 navPeek (main.cpp), 本文件不再自持 wNavPeek/wNavPeekAt
 
 // ---- 文字工具 ----
 // 清晰度修复: size<=16 直接用 16px 原生 AA 字库 (font16.drawStringFastAA, 逐字真实 advance,
@@ -339,7 +338,7 @@ static void drawDetailChrome() {
 static void drawDetailValues(const WData& w) {
   const gy39::Data& gs = gy39::get();
   const int cx0 = WX_RX + 10, cx1 = WX_RX + 128, rgt = WX_RX + WX_RW - 10;
-  const int ry1 = WX_DET_Y + 12, ry2 = WX_DET_Y + 44, ry3 = WX_DET_Y + 76;
+  const int ry1 = WX_DET_Y + 14, ry2 = WX_DET_Y + 47, ry3 = WX_DET_Y + 80;
   static int pwHum = 0, pwPres = 0, pwWind = 0, pwVis = 0, pwIndoor = 0, axAlt = -1;
   char vb[24];
   // 行1 左: 湿度
@@ -427,11 +426,37 @@ static void drawSunLine(const WData& w) {
   wText(sx, WX_SUN_Y, String(w.sunset), 16, WX_SUN, WX_BG, true);
 }
 
-// ---- 功能栏收起后恢复: 288..320 里只有底色 (内容全部在 286 以上) ----
+// ---- 7 天预报入口按钮 (主页右下, 270..306; 整页绘制与导航收起后局部恢复共用) ----
+static void drawForecastEntry() {
+  tft.fillRoundRect(WX_RX, WX_FC_Y, WX_RW, WX_FC_H, 9, WX_BTNRED);
+  String fb = "7 天预报";
+  int fw = wMeasure(fb, 16);
+  int fx = WX_RX + (WX_RW - fw - 12) / 2;
+  wText(fx, WX_FC_Y + (WX_FC_H - 16) / 2, fb, 16, WX_CREAM, WX_BTNRED, true);
+  wChevronRight(fx + fw + 5, WX_FC_Y + (WX_FC_H - 12) / 2, 12, WX_CREAM);
+}
+
+// ---- 功能栏收起后恢复: 重画被盖住的预报入口 (288..306) + 底色 ----
 static void restoreBottom() {
   tft.startWrite();
   tft.fillRect(0, NAV_BAR_Y, 480, 320 - NAV_BAR_Y, WX_BG);
+  if (wSub == 0) {
+    drawForecastEntry();   // 全屏重排后按钮底部压到 306, 必须重画
+    // 2026-11-03: 日出日落行底边(292)也压在 288 以下, 收起时被填掉, 整行重画
+    tft.fillRect(WX_LX, WX_SUN_Y - 1, WX_LW, 20, WX_BG);
+    drawSunLine(wData());
+  }
+  // 2026-11-03: 天气顶栏已有齿轮唤出, 底部指示条取消
   tft.endWrite();
+}
+void weatherRestoreBottom() { restoreBottom(); }   // main.cpp restoreNavStrip 调用
+// 2026-11-02: 仅天气主页允许唤出导航 (7天预报/弹窗有自己的返回)
+bool weatherNavCueEnabled() { return wSub == 0; }
+// 2026-11-03: 闲置自动轮播用 —— 编程式切换天气主页(0)/7天预报(1)。
+// 只改显示层级并标记本页重绘, 不调用任何刷新接口; 数据仍由 weather::tick 按原节奏拉取。
+void weatherSetSub(uint8_t sub) {
+  wSub = sub;
+  modeDrawn[MODE_WEATHER] = false;
 }
 
 // ---- 主页面 (全屏 480x320, 功能栏默认隐藏, 齿轮唤出) ----
@@ -576,14 +601,7 @@ static void drawWeatherScreenEx(bool soft) {
   }
 
   // 7 天预报入口 (静态内容, 软刷新不重画)
-  if (!soft) {
-    tft.fillRoundRect(WX_RX, WX_FC_Y, WX_RW, WX_FC_H, 9, WX_BTNRED);
-    String fb = "7 天预报";
-    int fw = wMeasure(fb, 16);
-    int fx = WX_RX + (WX_RW - fw - 12) / 2;
-    wText(fx, WX_FC_Y + 5, fb, 16, WX_CREAM, WX_BTNRED, true);
-    wChevronRight(fx + fw + 5, WX_FC_Y + 8, 12, WX_CREAM);
-  }
+  if (!soft) drawForecastEntry();
 }
 
 void drawWeatherScreen() { drawWeatherScreenEx(false); }
@@ -869,31 +887,22 @@ void handleWeatherTap(uint16_t x, uint16_t y) {
     }
     return;
   }
-  // 底部功能栏区 (全屏主页: 唤出后点按钮切页; 未唤出则忽略)
-  if (y >= NAV_BAR_Y) {
-    if (wNavPeek) {
-      wNavPeek = false;
-      int idx = x / NAV_BTN_WIDTH;
-      if (idx >= 0 && idx < MODE_COUNT && idx != (int)currentMode) {
-        currentMode = (UIMode)idx;
-        modeChanged = true;
-        navDirty = true;
-        for (int i = 0; i < MODE_COUNT; i++) modeDrawn[i] = false;
-        prevH = prevM = prevS = -1;
-      } else {
-        restoreBottom();   // 点当前页/空白: 收起并恢复底部内容
-      }
-    }
+  // 导航栏唤出中: 点内容区 → 收起并吞掉本次点击 (防误触刷新/弹窗/切城)
+  if (navPeek && y < NAV_BAR_Y) { navDismiss(); return; }
+  // 底部功能栏区 (唤出后点按钮切页; 点当前页/空白收起)。未唤出时继续走下方内容命中,
+  // 因为全屏重排后预报入口已压到 306 (低于 NAV_BAR_Y), 不能被这里拦掉。
+  if (navPeek && y >= NAV_BAR_Y) {
+    int idx = x / NAV_BTN_WIDTH;
+    if (idx != (int)currentMode) navSwitchTo(idx);   // 切页 (内含收起)
+    else navDismiss();                               // 点当前页/空白: 收起并恢复底部
     return;
   }
   if (y < WX_TOP_H) {
     // 城市名 (左区, 点击切城)
     if (x < 200) { wSub = 4; modeDrawn[MODE_WEATHER] = false; return; }
-    // 齿轮: 唤出/收起底部功能栏 (5s 无操作自动收起)
+    // 齿轮: 唤出/收起底部功能栏 (2026-11-02: 用户手动控制, 无超时)
     if (x >= WX_BSET_X - 4 && x <= WX_BSET_X + WX_BTN_W + 4) {
-      wNavPeek = !wNavPeek;
-      if (wNavPeek) { wNavPeekAt = millis(); drawNavBar(); }
-      else restoreBottom();
+      if (navPeek) navDismiss(); else navSummon();
       return;
     }
     // 预警按钮 (有预警时)
@@ -967,7 +976,8 @@ void modeWeather() {
     else if (wSub == 3) drawTyphoonModal();
     else if (wSub == 4) drawCityModal();
     else                drawWeatherScreenEx(!force);   // 已在屏上则软刷新, 不整屏清底
-    if (wNavPeek) drawNavBar();   // 整页重绘会擦掉唤出的功能栏, 补画
+    if (navPeek) drawNavBar();   // 整页重绘会擦掉唤出的功能栏, 补画
+    // 2026-11-03: 底部指示条取消 (顶栏齿轮唤出)
     tft.endWrite();
     modeDrawn[MODE_WEATHER] = true;
     wLastMin = -1;
@@ -982,11 +992,7 @@ void modeWeather() {
       tft.endWrite();
     }
   }
-  // 功能栏唤出 5s 无操作自动收起, 恢复底部内容
-  if (wNavPeek && (uint32_t)(millis() - wNavPeekAt) >= NAV_PEEK_MS) {
-    wNavPeek = false;
-    if (wSub == 0) restoreBottom();
-  }
+  // 2026-11-02: 功能栏无自动收起 —— 用户手动收起 (齿轮/指示条/下划/点内容区)
   // 顶栏时钟分钟级刷新 (仅主页)
   if (wSub == 0) {
     time_t now = time(nullptr);

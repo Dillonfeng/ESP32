@@ -3,15 +3,15 @@
 
 String readURLForSid(int sid) {
   RadioStation* s = stn(sid); if (!s) return "";
-  if (s->in_bin) {
-    File f = sdstore::openRead("/stations.bin"); if (!f) return "";
-    f.seek(s->url_offset);
-    uint8_t nl = f.read(); f.seek(f.position() + nl);
-    uint16_t ul = f.read() | (f.read() << 8);
-    uint8_t ub[257]; f.read(ub, min(ul, (uint16_t)256)); ub[min(ul, (uint16_t)256)] = 0;
-    f.close(); return String((char*)ub);
-  }
-  int ei = (int)s->url_offset; return (ei >= 0 && ei < extraUrlCount) ? String(extraUrl[ei]) : String();
+  // 2026-11-01 MEM: 用户台 URL 不再常驻 RAM (原 extraUrl[24][260]=6.2KB)。
+  // 约定: !in_bin 时 url_offset = /radio_meta.bin 里 URL 长度字段的绝对偏移; 0 = 无 URL。
+  if (!s->in_bin && s->url_offset == 0) return "";
+  File f = sdstore::openRead(s->in_bin ? "/stations.bin" : "/radio_meta.bin"); if (!f) return "";
+  f.seek(s->url_offset);
+  if (s->in_bin) { uint8_t nl = f.read(); f.seek(f.position() + nl); }   // 跳过 name 长度 + name
+  uint16_t ul = f.read() | (f.read() << 8);
+  uint8_t ub[257]; f.read(ub, min(ul, (uint16_t)256)); ub[min(ul, (uint16_t)256)] = 0;
+  f.close(); return String((char*)ub);
 }
 bool loadRadioDB() {
   File f = sdstore::openRead("/stations.bin");
@@ -45,8 +45,8 @@ const char* radioPinnedKey() {
   return (p && p[0]) ? p : RPINNED;
 }
 // 2026-10-24 问题①: 设计稿"我的"组含"助眠"分类 (6 台演示: 雨声/海浪/林间鸟鸣/篝火/咖啡馆/白噪音)。
-// 无真实音源 URL (readURLForSid 对 !in_bin 台读 extraUrl, url_offset=extraUrlCount 越界 -> 返回空 -> 点击不播放, 安全)。
-// 待用户提供音源后可把 URL 填进 extraUrl[extraUrlCount+i] 并让 url_offset 指向它。
+// 无真实音源 URL (readURLForSid 对 !in_bin 且 url_offset==0 的台直接返回空 -> 点击不播放, 安全)。
+// 待用户提供音源后, 把 URL 写进 /radio_meta.bin 对应记录并让 url_offset 指向它即可。
 static const char* SLEEP_NAMES[6] = { "雨声", "海浪", "林间鸟鸣", "篝火", "咖啡馆", "白噪音" };
 void addSleepStations() {
   for (int i = 0; i < 6 && radioStnTotal < RMAX_STN; i++) {
@@ -57,7 +57,7 @@ void addSleepStations() {
     truncCopy(s.cat, sizeof(s.cat), (const uint8_t*)"助眠", (int)strlen("助眠"));
     s.r = 0x78; s.g = 0xA0; s.b = 0xC8;
     s.is_user = true; s.in_bin = false;
-    s.url_offset = extraUrlCount;   // 空 URL 槽 -> readURLForSid 返回空
+    s.url_offset = 0;   // 无 URL (readURLForSid 直接返回空)
     radioStnTotal++;
   }
 }
@@ -135,6 +135,18 @@ void buildRadioCats() {
   }
   addCat(RLBL[2], RLBL[2], true, histSids, histCount, 2); // 历史
 }
+// 2026-11-01 FIX(栈越界崩溃): 原来的 `uint8_t rn[41]; sf.read(rn, nl); rn[nl] = 0;` 直接用
+// 文件里的名字字节数 nl 写入固定数组 —— nl 可以 >40 (实测 "Phate Radio 飞翔电台 - anime,
+// games and pop" 为 47 字节), 越界写踩坏同一栈帧里 File sf 的 shared_ptr, 下一条 sf.read()
+// 在脏指针上解引用 -> LoadProhibited (EXCVADDR 0x4c)。改为按缓冲容量截断读取, 余下字节用 seek 跳过
+// (UI 里 RadioStation::name 也只有 32 字节, 本来就要截断)。
+static void readVarStr(File& f, uint8_t* dst, int cap, int len) {
+  if (len < 0) { dst[0] = 0; return; }
+  int take = (len < cap - 1) ? len : cap - 1;
+  if (take > 0 && f.read(dst, (size_t)take) != (size_t)take) { dst[0] = 0; return; }
+  dst[take] = 0;
+  if (len > take) f.seek(f.position() + (uint32_t)(len - take));
+}
 bool loadRadioMeta() {
   File f = sdstore::openRead("/radio_meta.bin");
   if (!f) { Serial.println(F("radio_meta.bin not found")); return false; }
@@ -165,41 +177,59 @@ bool loadRadioMeta() {
   for (int i = 0; i < favCnt; i++) fav[i] = f.read() | (f.read() << 8);
   for (int i = 0; i < histCnt; i++) hist[i] = f.read() | (f.read() << 8);
   radioStnTotal = 0;
-  for (uint16_t ri = 0; ri < regionCount && radioStnTotal < RMAX_STN; ri++) {
-    File sf = sdstore::openRead("/stations.bin"); if (!sf) break;
+  File sf = sdstore::openRead("/stations.bin");   // 一次打开, 40 个 region 复用同一句柄
+  for (uint16_t ri = 0; sf && ri < regionCount && radioStnTotal < RMAX_STN; ri++) {
     sf.seek(regionEntries[ri].first_offset);
     for (uint16_t c = 0; c < regionEntries[ri].count && radioStnTotal < RMAX_STN; c++) {
       uint32_t recStart = sf.position();
-      uint8_t nl = sf.read(); uint8_t rn[41]; sf.read(rn, nl); rn[nl] = 0;
-      uint16_t ul = sf.read() | (sf.read() << 8); sf.seek(sf.position() + ul);
-      uint8_t ridx = sf.read();
-      uint8_t cl = sf.read(); uint8_t rc[13]; sf.read(rc, cl); rc[cl] = 0;
-      uint8_t fl = sf.read(); uint8_t rf[21]; sf.read(rf, fl); rf[fl] = 0;
+      int nl = sf.read();
+      if (nl <= 0) { Serial.printf("[RADIO] rec bad r%u c%u pos=%u nl=%d\n", ri, c, (unsigned)recStart, nl); break; }
+      uint8_t rn[40]; readVarStr(sf, rn, (int)sizeof(rn), nl);
+      int lo = sf.read(), hi = sf.read();
+      if (lo < 0 || hi < 0) break;
+      uint16_t ul = (uint16_t)(lo | (hi << 8));
+      if (!sf.seek(sf.position() + ul)) break;          // 跳过 URL 正文, 不常驻 RAM
+      int ridx = sf.read();
+      int cl = sf.read(); if (ridx < 0 || cl < 0) break;
+      if (ridx >= regionCount) break;                   // 2026-11-01: 原代码直接用 regionEntries[ridx] 无边界检查
+      uint8_t rc[13]; readVarStr(sf, rc, (int)sizeof(rc), cl);
+      int fl = sf.read(); if (fl < 0) break;
+      uint8_t rf[13]; readVarStr(sf, rf, (int)sizeof(rf), fl);
+      int rr = sf.read(), gg = sf.read(), bb = sf.read(); if (bb < 0) break;
       RadioStation& s = radioStn[radioStnTotal];
       truncCopy(s.name, sizeof(s.name), rn, nl);
       truncCopy(s.freq, sizeof(s.freq), rf, fl);
       memcpy(s.region, regionEntries[ridx].name, 17);
       truncCopy(s.cat, sizeof(s.cat), rc, cl);
-      s.r = sf.read(); s.g = sf.read(); s.b = sf.read();
+      s.r = (uint8_t)rr; s.g = (uint8_t)gg; s.b = (uint8_t)bb;
       s.is_user = false; s.in_bin = true; s.url_offset = recStart; radioStnTotal++;
     }
-    sf.close();
   }
+  if (sf) sf.close();
   for (int e = 0; e < extraCount && radioStnTotal < RMAX_STN; e++) {
-    uint8_t nl = f.read(); uint8_t rn[41]; f.read(rn, nl); rn[nl] = 0;
-    uint16_t ul = f.read() | (f.read() << 8); uint8_t ur[257]; f.read(ur, min(ul, (uint16_t)256)); ur[min(ul, (uint16_t)256)] = 0;
-    uint8_t rl = f.read(); uint8_t rr[18]; f.read(rr, rl); rr[rl] = 0;
-    uint8_t cl = f.read(); uint8_t rc[13]; f.read(rc, cl); rc[cl] = 0;
-    uint8_t fl = f.read(); uint8_t rf[17]; f.read(rf, fl); rf[fl] = 0;
-    uint8_t r = f.read(), g = f.read(), bb = f.read(); uint8_t isUser = f.read();
-    if (extraUrlCount < RMAX_EXTRA) { memcpy(extraUrl[extraUrlCount], (char*)ur, min(ul, (uint16_t)259)); extraUrlCount++; }
+    int nl = f.read();
+    if (nl <= 0) break;
+    uint8_t rn[40]; readVarStr(f, rn, (int)sizeof(rn), nl);
+    uint32_t urlOff = (uint32_t)f.position();        // URL 长度字段绝对偏移 (起播时按需读)
+    int lo = f.read(), hi = f.read();
+    if (lo < 0 || hi < 0) break;
+    uint16_t ul = (uint16_t)(lo | (hi << 8));
+    if (!f.seek(f.position() + ul)) break;            // 跳过 URL 正文, 不常驻 RAM
+    int rl = f.read(); if (rl < 0) break;
+    uint8_t rr[18]; readVarStr(f, rr, (int)sizeof(rr), rl);
+    int cl = f.read(); if (cl < 0) break;
+    uint8_t rc[13]; readVarStr(f, rc, (int)sizeof(rc), cl);
+    int fl = f.read(); if (fl < 0) break;
+    uint8_t rf[13]; readVarStr(f, rf, (int)sizeof(rf), fl);
+    int r = f.read(), g = f.read(), bb = f.read(), isUser = f.read();
+    if (isUser < 0) break;
     RadioStation& s = radioStn[radioStnTotal];
     truncCopy(s.name, sizeof(s.name), rn, nl);
     truncCopy(s.freq, sizeof(s.freq), rf, fl);
     truncCopy(s.region, sizeof(s.region), rr, rl);
     truncCopy(s.cat, sizeof(s.cat), rc, cl);
-    s.r = r; s.g = g; s.b = bb; s.is_user = (isUser != 0);
-    s.in_bin = false; s.url_offset = extraUrlCount - 1; radioStnTotal++;
+    s.r = (uint8_t)r; s.g = (uint8_t)g; s.b = (uint8_t)bb; s.is_user = (isUser != 0);
+    s.in_bin = false; s.url_offset = urlOff; radioStnTotal++;
   }
   memcpy(allSeq, all, (size_t)allCnt * 2); allCount = allCnt;
   memcpy(favSids, fav, (size_t)favCnt * 2); favCount = favCnt;

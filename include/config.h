@@ -78,7 +78,8 @@
 #define SD_SCK_PIN          15
 #define SD_MOSI_PIN         7
 #define SD_MISO_PIN         16
-#define SD_SPI_FREQ         1000000   // 1MHz (已实测可挂载; 音频流足够)
+#define SD_SPI_FREQ         1000000   // 兜底 1MHz (长线/劣质卡不稳时回退到这一级)
+#define SD_SPI_FAST_FREQ    20000000  // 2026-11-01: 首选 20MHz (SD 库内部仍用 400kHz 完成 CMD0/ACMD41)
 #define SD_MOUNT_POINT      "/sdcard"
 #define SD_MAX_FILES        5
 

@@ -3,7 +3,7 @@
 // ---------- 万年历页�?(布局�?preview draw_calendar_scene 完全�?�? ----------
 #define CAL_X0       16
 #define CAL_CELL_W   64
-#define CAL_CELL_H   30
+#define CAL_CELL_H   34   // 2026-11-02: keep in sync with ui_common.h (full-screen layout)
 #define CAL_X1       (CAL_X0 + 7 * CAL_CELL_W)   // 464
 #define CAL_GRID_TOP 54
 #define CAL_WKND     0xF800   // 周末 - �?
@@ -87,6 +87,17 @@ static void drawCalBottomStrip(int ty, int tmn, int td) {
   }
 }
 // selection changed: erase old border + draw new + redraw bottom strip (no full-page redraw)
+// 2026-11-02: 导航栏收起后恢复日历底部 (信息条 266..300 + 底边 + 指示条)。
+// 全屏重排后信息条压到 300, 导航栏(288..320)会盖住它, 收起时必须重画而不是填背景。
+void calendarRestoreBottom() {
+  time_t now = time(nullptr);
+  struct tm t;
+  epochToLocalNoLock(now, t);
+  drawCalBottomStrip(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+  int stripBot = CAL_GRID_TOP + 6 * CAL_CELL_H + 8 + 34;
+  tft.fillRect(0, stripBot, 480, PAGE_BOTTOM - stripBot, CAL_LIGHT_BG);
+  // 2026-11-03: 日历改用顶栏 ≡ 唤出, 底部指示条取消
+}
 static void redrawCalSelection(int ty, int tmn, int td) {
   bool prevIsToday = (calPrevSelY == ty && calPrevSelM == tmn && calPrevSelD == td);
   if (calPrevSelY == calYear && calPrevSelM == calMon && calPrevSelD >= 1 && calPrevSelD <= calDim && !prevIsToday) {
@@ -120,7 +131,7 @@ void drawCalendar() {
   if (calYear <= 0) { calYear = ty; calMon = tmn; }
   if (calSelY <= 0) { calSelY = ty; calSelM = tmn; calSelD = td; }   // 默�?��?�中今天
   holiday::ensureYear(calYear);   // 浏�?�到某年且无缓�??-> 排队网络同�??(在线时立即做)
-  tft.fillRect(0, 0, 480, NAV_BAR_Y, CAL_LIGHT_BG);
+  tft.fillRect(0, 0, 480, PAGE_BOTTOM, CAL_LIGHT_BG);
   if (calPickerOpen) { drawCalPicker(); return; }
   if (calAlmOpen) { drawAlmPopup(calSelY, calSelM, calSelD); return; }
   // 顶部: 上月 | 月份标�??(点击选年�? | 下月
@@ -129,7 +140,20 @@ void drawCalendar() {
   snprintf(mt, sizeof(mt), "%d年%d月", calYear, calMon);
   int mw = font16.textWidth(mt);
   font16.drawStringFast(240 - mw / 2, 16, mt, CAL_TITLE, CAL_LIGHT_BG);
-  font16.drawStringFast(446, 16, ">", CAL_HDR, CAL_LIGHT_BG);
+  font16.drawStringFast(410, 16, ">", CAL_HDR, CAL_LIGHT_BG);
+  // 2026-11-03: 右上角唤出导航栏 ("2026年10月"标题保持居中, ">" 左移让位)
+  // 2026-11-07: 图标 ≡ -> 齿轮, 与天气/时钟/收音机唤出键完全一致
+  tft.fillRoundRect(436, 4, 38, 24, 7, CAL_TITLE);
+  {
+    const int cx = 455, cy = 16;
+    tft.drawCircle(cx, cy, 6, 0xFFFF);
+    tft.fillCircle(cx, cy, 2, 0xFFFF);
+    for (int i = 0; i < 8; i++) {
+      float a = i * 3.14159265f / 4.0f;
+      tft.drawLine(cx + (int)(cosf(a) * 7), cy + (int)(sinf(a) * 7),
+                   cx + (int)(cosf(a) * 9), cy + (int)(sinf(a) * 9), 0xFFFF);
+    }
+  }
   // 星期表头
   for (int i = 0; i < 7; i++) {
     int cx = CAL_X0 + i * CAL_CELL_W + CAL_CELL_W / 2;
@@ -187,12 +211,13 @@ void drawCalendar() {
   }
   // 底部信息�? 干支�?+ 选中日的农历 (点击某天即显示那�? 默�??=今天)
   drawCalBottomStrip(ty, tmn, td);
+  // 2026-11-03: 底部指示条取消 (改顶栏 ≡ 唤出)
   calPrevSelY = calSelY; calPrevSelM = calSelM; calPrevSelD = calSelD;
 }
 
 // 年月选择弹层: 顶部 < 年份 > 步进 + 6x2 月份网格 + �?�?/取消
 void drawCalPicker() {
-  tft.fillRect(0, 0, 480, NAV_BAR_Y, CAL_LIGHT_BG);
+  tft.fillRect(0, 0, 480, PAGE_BOTTOM, CAL_LIGHT_BG);
   tft.fillRoundRect(PICK_PANEL_X, PICK_PT, PICK_PANEL_W, PICK_PB - PICK_PT, 12, CAL_LIGHT_BG);
   tft.drawRoundRect(PICK_PANEL_X, PICK_PT, PICK_PANEL_W, PICK_PB - PICK_PT, 12, CAL_GRID);
   font16.drawStringFast(240 - font16.textWidth("选择年月") / 2, PICK_PT + 12, "选择年月", CAL_HDR, CAL_LIGHT_BG);
@@ -430,7 +455,7 @@ static const char* almHolidayFest(int y, int m, int d, char* buf, int bufsz) {
 static void drawAlmPopup(int y, int m, int d) {
   // lint:skip-rule-1  (alm popup: one-shot static draw, no continuous dynamic region)
 
-  const int PX = 24, PW = 432, PT = 16, PH = 272;
+  const int PX = 8, PW = 464, PT = 6, PH = 308;   // 2026-11-03: 再放大, 纸面 8..472 / 6..314
 
   int cx = 240;
 
@@ -526,15 +551,15 @@ static void drawAlmPopup(int y, int m, int d) {
   }
 
   // ---- 顶行 (y=30): 年份 干支X年 | 月份 月 | 农历X月X | 花名月·节气后/今日X | 右上 节日框 ----
-  almBigText(PX + 14, 30, String(yistr), 24, ALM_DARK, ALM_PAPER, false);  // 2026
+  almBigText(PX + 14, 24, String(yistr), 24, ALM_DARK, ALM_PAPER, false);  // 2026
   int ygzX = PX + 14 + 4 * (24 * 7 / 10) + 8;
-  almScaledText(ygzX, 36, String(ygz), 13, ALM_DARK, ALM_PAPER, false);  // 丙午马 (13px)
+  almScaledText(ygzX, 30, String(ygz), 13, ALM_DARK, ALM_PAPER, false);  // 丙午马 (13px)
   const int monX = 162;
-  almBigText(monX, 30, String(mistr), 24, ALM_RED, ALM_PAPER, false);  // 10 (大红)
-  almScaledText(monX + 2 * (24 * 7 / 10) + 4, 36, "月", 13, ALM_RED, ALM_PAPER, false);  // 月
+  almBigText(monX, 24, String(mistr), 24, ALM_RED, ALM_PAPER, false);  // 10 (大红)
+  almScaledText(monX + 2 * (24 * 7 / 10) + 4, 30, "月", 13, ALM_RED, ALM_PAPER, false);  // 月
   const int lunX = 218;
   String lunStr2 = String("农历") + lunarMonths[lm - 1] + "月" + lunarDays[ldn - 1];
-  almScaledText(lunX, 36, lunStr2, 13, ALM_DARK, ALM_PAPER, false);  // 农历X月X
+  almScaledText(lunX, 30, lunStr2, 13, ALM_DARK, ALM_PAPER, false);  // 农历X月X
   char pjText[24];
   if (jqCur < 0) snprintf(pjText, sizeof(pjText), "%s", pmon);
   else if (_jqCurD == 0) snprintf(pjText, sizeof(pjText), "今日%s", nl_jq_text[jqCur]);  // 节气当日 -> 今日X
@@ -547,10 +572,10 @@ static void drawAlmPopup(int y, int m, int d) {
   if (pjX + pjW > boxLeft - 4) pjX = max(lunX + lunW + 2, boxLeft - 4 - pjW);  // 不越过节日框
   // BUILD21: 花名月·节气 节日当天也显示(与右上节日框并排, 靠左由上方 clamp 保证不重叠)。
   // 旧版 if(!fest[0]) 会在节日天隐藏它 -> 用户看到"节日那天节气/花月名消失"。
-  almScaledText(pjX, 36, String(pjText), 13, ALM_DARK, ALM_PAPER, false);  // 花名月·节气后 / 今日X
+  almScaledText(pjX, 30, String(pjText), 13, ALM_DARK, ALM_PAPER, false);  // 花名月·节气后 / 今日X
   if (fest[0]) {
-    tft.drawRect(PX + PW - 12 - fw, 28, fw, 26, ALM_RED);
-    almScaledText(PX + PW - 12 - fw + 7, 34, String(fest), 15, ALM_RED, ALM_PAPER, false);
+    tft.drawRect(PX + PW - 12 - fw, 22, fw, 26, ALM_RED);
+    almScaledText(PX + PW - 12 - fw + 7, 28, String(fest), 15, ALM_RED, ALM_PAPER, false);
   }
   // ---- 三列中部 (左列 农历 红 / 右列 干支 深褐; 中央环 + 大数字 红; 环中心 y=148) ----
   const int LC = 90, RC = 390;
@@ -562,39 +587,39 @@ static void drawAlmPopup(int y, int m, int d) {
     else if (weekdayFromYMD(y, m, d) == 0 || weekdayFromYMD(y, m, d) == 6) numCol = ALM_WKND;   // BUILDV5-TZFIX: 无锁星期
     else numCol = ALM_JI;
   }
-  almBigText(LC, 122, String(lcol_main), 24, numCol, ALM_PAPER, true);
-  almScaledText(LC, 166, String("农历·") + pmon, 14, ALM_DARK, ALM_PAPER, true);  // 农历·桂月
-  almBigText(RC, 122, String(dgz) + "日", 24, ALM_DARK, ALM_PAPER, true);  // 壬寅日 (深褐)
-  almScaledText(RC, 166, String("干支·") + ZODIAC_D[dayStd % 12], 14, ALM_DARK, ALM_PAPER, true);  // 干支·虎
-  tft.drawCircle(cx, 148, 72, ALM_RING);  // 外环
-  tft.drawCircle(cx, 148, 57, ALM_RING);  // 内环
-  almBigNum(cx - ALM_DW, 148 - ALM_DH / 2, d, numCol);  // 大数字 (中心对齐环中心 148)
+  almBigText(LC, 118, String(lcol_main), 24, numCol, ALM_PAPER, true);
+  almScaledText(LC, 162, String("农历·") + pmon, 14, ALM_DARK, ALM_PAPER, true);  // 农历·桂月
+  almBigText(RC, 118, String(dgz) + "日", 24, ALM_DARK, ALM_PAPER, true);  // 壬寅日 (深褐)
+  almScaledText(RC, 162, String("干支·") + ZODIAC_D[dayStd % 12], 14, ALM_DARK, ALM_PAPER, true);  // 干支·虎
+  tft.drawCircle(cx, 144, 76, ALM_RING);  // 外环
+  tft.drawCircle(cx, 144, 60, ALM_RING);  // 内环
+  almBigNum(cx - ALM_DW, 144 - ALM_DH / 2, d, numCol);  // 大数字 (中心对齐环中心 144)
   // ---- 底栏 ----
-  tft.drawFastHLine(PX + 10, 230, PW - 21, ALM_LINE);
+  tft.drawFastHLine(PX + 10, 250, PW - 21, ALM_LINE);
   {
-    almScaledText(PX + 12, 240, "星期", 18, ALM_DARK, ALM_PAPER, false);  // 星期 (18px, 底栏垂直中忉)
-    almBigText(PX + 54, 234, String(wday), 30, ALM_DARK, ALM_PAPER, false);  // 六 (30px, 底栏垂直中忉)
+    almScaledText(PX + 12, 260, "星期", 18, ALM_DARK, ALM_PAPER, false);  // 星期 (18px, 底栏垂直中忉)
+    almBigText(PX + 54, 254, String(wday), 30, ALM_DARK, ALM_PAPER, false);  // 六 (30px, 底栏垂直中忉)
   }
 
   {
 
     int tx = 150;
 
-    tft.fillRect(tx, 236, 16, 16, ALM_JI);
+    tft.fillRect(tx, 256, 16, 16, ALM_JI);
 
-    font16.drawStringFast(tx, 236, String("宜"), ALM_PAPER, ALM_JI);
+    font16.drawStringFast(tx, 256, String("宜"), ALM_PAPER, ALM_JI);
 
     int xi = tx + 24;
 
-    for (int i = 0; i < 3; i++) { font16.drawStringFast(xi, 236, String(yi3[i]), ALM_DARK, ALM_PAPER); xi += font16.textWidth(String(yi3[i])) + 6; }
+    for (int i = 0; i < 3; i++) { font16.drawStringFast(xi, 256, String(yi3[i]), ALM_DARK, ALM_PAPER); xi += font16.textWidth(String(yi3[i])) + 6; }
 
-    tft.fillRect(tx, 258, 16, 16, ALM_RED);
+    tft.fillRect(tx, 278, 16, 16, ALM_RED);
 
-    font16.drawStringFast(tx, 258, String("忌"), ALM_PAPER, ALM_RED);
+    font16.drawStringFast(tx, 278, String("忌"), ALM_PAPER, ALM_RED);
 
     xi = tx + 24;
 
-    for (int i = 0; i < 3; i++) { font16.drawStringFast(xi, 258, String(ji3[i]), ALM_DARK, ALM_PAPER); xi += font16.textWidth(String(ji3[i])) + 6; }
+    for (int i = 0; i < 3; i++) { font16.drawStringFast(xi, 278, String(ji3[i]), ALM_DARK, ALM_PAPER); xi += font16.textWidth(String(ji3[i])) + 6; }
 
   }
 
@@ -608,7 +633,7 @@ static void drawAlmPopup(int y, int m, int d) {
 
     for (int r = 0; r < 3; r++) {
 
-      int yy = 234 + r * 18;
+      int yy = 254 + r * 18;
 
       tft.fillCircle(lx + 3, yy + 8, 3, lg[r]);
 
@@ -620,8 +645,8 @@ static void drawAlmPopup(int y, int m, int d) {
 
   // moon (legend-right): icon + name  (2026-10-31: WinCalender 画法, 按农历日)
   {
-    drawMoonIcon(415, 250, 9, ldn);
-    font16.drawStringFast(415 - font16.textWidth(nl_moon_name(ldn)) / 2, 264, nl_moon_name(ldn), 0xDE72, ALM_PAPER);
+    drawMoonIcon(420, 272, 9, ldn);
+    font16.drawStringFast(420 - font16.textWidth(nl_moon_name(ldn)) / 2, 286, nl_moon_name(ldn), 0xDE72, ALM_PAPER);
   }
 }
 
@@ -632,21 +657,43 @@ void modeCalendar() {
   }
 }
 
+// 2026-11-02: 弹层(年月选择/黄历)打开时禁止唤出导航 (弹层有自己的关闭方式)
+bool calendarNavCueEnabled() { return !calPickerOpen && !calAlmOpen; }
+// 2026-11-03: 闲置自动轮播用 —— 编程式开关黄历弹层。
+// 打开时固定以"今天"为选中日, 并先收起年月选择弹层, 避免两层叠加; 关闭时清弹层标记。
+void calendarSetAlmanacOpen(bool on) {
+  calPickerOpen = false;
+  if (on) {
+    time_t now = time(nullptr);
+    struct tm t;
+    epochToLocalNoLock(now, t);
+    calYear = t.tm_year + 1900;
+    calMon = t.tm_mon + 1;
+    calSelY = calYear; calSelM = calMon; calSelD = t.tm_mday;
+    calAlmOpen = true;
+  } else {
+    calAlmOpen = false;
+  }
+  modeDrawn[MODE_CALENDAR] = false;
+}
+
 // 年月选择弹层的点击�?��??
 void handlePickerTap(uint16_t tx, uint16_t ty);
 // 日历页点�?
 //  - 关闭�? 点月份标�?= 打开年月选择; 点某�?= 选中(显示其农�?; �?�?1/3 = 上一�?下一�?
 void handleCalendarTap(uint16_t tx, uint16_t ty) {
   if (calAlmOpen) {          // 黄历弹层打开: 点任意处关闭 (无关闭按钮, 镜像 preview)
-    if (tx >= 24 && tx < 24 + 432 && ty >= 16 && ty < 16 + 272) {
-      calAlmOpen = false;
-      drawCalendar();
-      Serial.printf("almanac closed\n");
-    }
+    calAlmOpen = false;
+    drawCalendar();
+    Serial.printf("almanac closed\n");
     return;
   }
   if (calPickerOpen) {
     handlePickerTap(tx, ty);
+    return;
+  }
+  if (ty < 32 && tx >= 436) {   // 2026-11-03: 右上角 ≡ = 唤出导航栏
+    navSummon();
     return;
   }
   if (ty < CAL_GRID_TOP) {
