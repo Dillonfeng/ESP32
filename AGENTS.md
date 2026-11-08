@@ -98,6 +98,17 @@
 
 ## 已完成 (历史)
 
+- **电台录音（2026-11-08；编译 SUCCESS 65.87s，RAM 30.9% 101256 / Flash 75.8% 3180211；烧录 COM4 SUCCESS 87.65s 4 段 `Hash of data verified`，boot `panic_hits=0`、电台正常在播；待实机验收）**：
+  - **功能**：收音机全屏播放页控制行（−/⏯/+ ）右侧新增红 ● 录音键（`FS_BTN_REC_X=365, FS_BTN_Y=200, r=22`），按下录**当前在播的电台**，再按变白 ■ 停止；键下方待录显示 `REC`、录音中显示 `mm:ss`、电台没播时点它显示 2.5s `先播放`。列表播放条第二行在录音时显示红色"正在录音"。
+  - **链路**：`audio_process_raw_samples` 弱符号（Audio.cpp L3954，在 VU/EQ/音量之前）→ 取**左声道 >>16** 成 16bit → PSRAM 环冲（512KB，44.1k 约 5.8s）→ 主循环 `radiorec::tick()` 8KB/次落盘。**不在回调里写 SD**（会卡 I2S 输出，电台断续）；SD 走独立 HSPI(SPI3)、屏幕 FSPI(SPI2)。
+  - **采样率跟原流**：WAV 头写 `audio.getSampleRate()`（不重采样），16bit 单声道；播放在录音机页 `audio.connecttoFS`，WAV 解码器按头里的采样率设 I2S 输出，混播没问题。
+  - **文件**：`/rad_XXXX.wav`，与麦克风录音**共用** `rec_seq.txt` 卷号（取 `rec_`/`rad_` 两前缀最大值 +1），不会撞号，最新仍在列表第一行。
+  - **录音机侧改动**：`scanTapes()` 认 `rec_`/`rad_` 两前缀；新增 `readWavFmt()` 读 WAV 头取 rate/ch/位深/data 长度算时长（原来写死 `MIC_SAMPLE_RATE*2`，44.1k 的电台卷时长会算成 1/2.75）；排序改成**按卷号降序**（混前缀时整串 strcmp 会乱）。`pickFileName()` 也扫 `rad_`。
+  - **自动收尾**（均先补齐 WAV 头再释放环冲）：电台停播/切台（采样率变了）/到 `REC_MAX_SEC`(1h)/写卡失败。
+  - **⚠️ 本轮最大坑 = 弱符号**：`Audio.h` 把 `audio_process_raw_samples` **声明成 weak**，只要同一 TU 里 include 了 Audio.h，自己写的定义也变成 `W`（`nm` 实测），两个弱定义谁赢看链接顺序，太脆。**修法**：单独 `src/audio_raw_hook.cpp`，**不 include Audio.h**，只按签名定义 → `nm` 是 `T`，final elf 里 `42002ad0 T audio_process_raw_samples`。以后要覆盖这个库的任何弱钩子都照这法。
+  - **教训**：`radiorec::tick()` 要放在 `g_spiMutex` 内（netTask 也会碰 SD 对象，VFS 不是多线程安全的），但每轮只写 8KB，别一次 16KB+ 长占锁。
+
+
 - **卡带录音机 第 9 轮 UI/交互修复（2026-11-08；编译 SUCCESS 63.32s，RAM 30.8% / Flash 75.7%；烧录 COM4 SUCCESS 88.10s `Hash of data verified`，串口无 crash；待实机验收）**：
   - **用户 6 点**：① 磁带索引里非选中行右上角有彩色色块；② 删掉一些录音后新录音"填补"被删文件名 → 找不到最新；③ 卷号与文件名序号顺序反了；④ 快进/快退装入某卷后点 PLAY 仍弹选带卡片；⑤ 整个画面偏暗看不清；⑥ 收音机在播时进不来录音机且点录音键无提示。
   - **① 色块**：`delButton()` 未上膛时原本 `fillRoundRect(C_SEL)` + `drawRoundRect(C_LINE)` → 奶油行里就是一块彩色方块。改为未上膛只画两笔 `C_LBL` 淡叉（无底无框），上膛才铺琥珀块。

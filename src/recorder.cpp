@@ -143,9 +143,9 @@ uint32_t  s_delArmMs   = 0;
 static const int PATCH_MAXW = 128, PATCH_MAXH = 72;   // 面板文字区 118x64 要整块合成 (照片上不留色块)
 static const int BG_ROWS    = 8;
 
-// ---- 磁带索引 (TF 卡 /rec_XXXX.wav) ----
+// ---- 磁带索引 (TF 卡 /rec_XXXX.wav 麦克风录音 + /rad_XXXX.wav 电台录音) ----
 static const int TAPE_MAX = 40;
-struct TapeInfo { char name[20]; uint32_t dur; };   // name 带前导 '/', dur 秒
+struct TapeInfo { char name[20]; uint32_t dur; uint32_t rate; uint16_t ch; };   // name 带前导 '/', dur 秒
 TapeInfo s_tapes[TAPE_MAX];
 int      s_tapeN   = 0;
 int      s_curTape = 0;
@@ -255,7 +255,7 @@ bool pickFileName() {
         if (p) {
           const char* b = strrchr(p, '/');
           b = b ? (b + 1) : p;
-          if (strncmp(b, "rec_", 4) == 0) {
+          if (strncmp(b, "rec_", 4) == 0 || strncmp(b, "rad_", 4) == 0) {   // 电台录音共用卷号
             const char* d = b + 4;
             while (*d && (*d < '0' || *d > '9')) d++;
             int n = atoi(d);
@@ -883,6 +883,44 @@ uint32_t counterSec() {
   return 0;
 }
 
+// 从 WAV 头取采样率/声道/位深/data 长度 (2026-11-08: 电台录音采样率跟原流走,
+// 原来 scanTapes 一律按 MIC_SAMPLE_RATE*2 算时长 → 44.1k 的电台卷时长会算成 1/2.75)
+static void readWavFmt(File& f, uint32_t sz, uint32_t* rate, uint16_t* ch, uint16_t* bits,
+                       uint32_t* dataBytes) {
+  *rate = MIC_SAMPLE_RATE; *ch = 1; *bits = 16;
+  *dataBytes = (sz > 44) ? (sz - 44) : 0;
+  uint8_t h[64];
+  size_t n = (sz > sizeof(h)) ? sizeof(h) : sz;
+  f.seek(0);
+  size_t got = f.read(h, n);
+  if (got < 44) return;
+  if (memcmp(h, "RIFF", 4) != 0 || memcmp(h + 8, "WAVE", 4) != 0) return;
+  for (size_t i = 12; i + 8 <= got; ) {
+    uint32_t csz = (uint32_t)h[i + 4] | ((uint32_t)h[i + 5] << 8) |
+                   ((uint32_t)h[i + 6] << 16) | ((uint32_t)h[i + 7] << 24);
+    if (memcmp(h + i, "fmt ", 4) == 0 && i + 24 <= got) {
+      uint16_t c = (uint16_t)(h[i + 10] | (h[i + 11] << 8));
+      uint32_t r = (uint32_t)h[i + 12] | ((uint32_t)h[i + 13] << 8) |
+                   ((uint32_t)h[i + 14] << 16) | ((uint32_t)h[i + 15] << 24);
+      uint16_t b = (uint16_t)(h[i + 22] | (h[i + 23] << 8));
+      if (r >= 8000 && r <= 96000) *rate = r;
+      if (c == 1 || c == 2) *ch = c;
+      if (b == 8 || b == 16 || b == 24 || b == 32) *bits = b;
+    } else if (memcmp(h + i, "data", 4) == 0) {
+      if (csz > 0 && csz <= sz) *dataBytes = csz; else *dataBytes = (sz > i + 8) ? (sz - i - 8) : 0;
+      break;
+    }
+    if (csz < 8) break;
+    i += 8 + csz;
+  }
+}
+
+static int tapeNoOf(const char* base) {          // rec_0031.wav / rad_0007.wav -> 31 / 7
+  const char* d = base + 4;
+  while (*d && (*d < '0' || *d > '9')) d++;
+  return atoi(d);
+}
+
 void scanTapes() {
   s_tapeN = 0;
   if (!sdstore::mounted()) return;
@@ -898,23 +936,32 @@ void scanTapes() {
     const char* base = strrchr(p, '/');
     base = base ? (base + 1) : p;
     uint32_t sz = (uint32_t)f.size();
-    if (strncmp(base, "rec_", 4) == 0 && sz > 44) {
+    bool isTape = (strncmp(base, "rec_", 4) == 0 || strncmp(base, "rad_", 4) == 0);
+    if (isTape && sz > 44) {
       TapeInfo& t = s_tapes[s_tapeN];
       snprintf(t.name, sizeof(t.name), "/%s", base);
-      t.dur = (sz - 44) / (MIC_SAMPLE_RATE * 2);
+      uint32_t dataBytes = 0;
+      uint16_t bits = 16;
+      readWavFmt(f, sz, &t.rate, &t.ch, &bits, &dataBytes);
+      uint32_t bps = t.rate * t.ch * 2;                          // 本工程只写 16bit
+      t.dur = bps ? (dataBytes / bps) : 0;
       s_tapeN++;
     }
     f.close();
   }
   if (f) f.close();          // TAPE_MAX 提前退出时最后一个句柄也要关 (SD_MAX_FILES=5)
   root.close();
-  // 新的在前 (名字越大越新)
+  // 新的在前: 按卷号降序 (rec_/rad_ 混排也能正确排序; 旧版按整串名字 strcmp, 前缀不同会乱)
   for (int i = 1; i < s_tapeN; i++) {
     TapeInfo key = s_tapes[i];
+    int32_t kn = tapeNoOf(key.name + 1);
     int j = i - 1;
-    while (j >= 0 && strcmp(s_tapes[j].name, key.name) < 0) {
-      s_tapes[j + 1] = s_tapes[j];
-      j--;
+    while (j >= 0) {
+      int32_t jn = tapeNoOf(s_tapes[j].name + 1);
+      if (jn > kn || (jn == kn && strcmp(s_tapes[j].name, key.name) > 0)) {
+        s_tapes[j + 1] = s_tapes[j];
+        j--;
+      } else break;
     }
     s_tapes[j + 1] = key;
   }
