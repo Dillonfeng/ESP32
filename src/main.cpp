@@ -49,7 +49,6 @@ using weather::WData;  // WData 在 weather 命名空间内, 天气页绘制代�
 #include "gy39.h"          // 2026-10-25: GY-39 气象传感器 (UART2)
 #include "backlight.h"     // 2026-10-25: 背光自动亮度 / 夜间熄屏
 #include "recorder.h"      // 2026-11-07: 录音机 (验证 麦克风I2S1 + TF卡 并行)
-#include "radio_rec.h"     // 2026-11-08: 电台录音 (audio_process_raw_samples 弱符号抓原始 PCM)
 #include "driver/i2s.h"
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1184,7 +1183,6 @@ void setup() {
   Serial.printf("[CAROUSEL] idle baseline at %lums\n", (unsigned long)carouselLastInput);
 
   recorderInit();  // 2026-11-07: 录音机 (BOOT 键 INPUT_PULLUP)
-  radiorec::init(); // 2026-11-08: 打印上次电台录音的自检结果 (/rad_diag.txt)
 }
 
 // ========== 板载 RGB 状态灯 (WS2812B-5050RGB, 原理图 LED2, DIN←GPIO48) ==========
@@ -1353,9 +1351,6 @@ void loop() {
   // touch 竞争——touch 在 g_spiMutex 外等待）。
   if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
   recorderTick();                // 2026-11-07: 录音机按键状态机 + 录音泵 (REC UI 在锁内绘制)
-  // 2026-11-08: 电台录音落盘 (PSRAM 环冲 -> SD)。与录音机写卡一样放在 g_spiMutex 内,
-  // 避免和 netTask 的缓存读写同时碰 SD 对象; 每次最多 8KB, 主循环频率远高于 88KB/s 所需。
-  radiorec::tick();
   if (recorderActive()) {        // 2026-11-08: 卡带录音机全屏独占 (待机面板/录音/回放), 屏蔽触摸与正常页面绘制
     // 待机面板下电台还在播 -> 继续断流自愈/续播 (pumpRadio 只在 radioPlaying 时才有动作;
     // 录音/回放时 recorder 已把 radioPlaying 置 false, 这里是空操作)

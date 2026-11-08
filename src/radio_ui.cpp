@@ -1,6 +1,5 @@
 #include "ui_common.h"
 #include "recorder.h"   // 2026-11-07: title 栏 REC 录音键
-#include "radio_rec.h"  // 2026-11-08: 电台录音 (录当前在播的电台, 采样率跟原流)
 
 // ============================================================================
 // 收音机 UI -- 2026-10-20 按 doubao app_17g7jt0w5v1 设计稿重构 (浅色主题)
@@ -117,8 +116,6 @@ static void fbPushRect(int sx, int sy, int w, int h) {
 void updateSpectrum();    // 全屏 VU 表刷新 (后文定义)
 void refreshMiniEq();     // 播放条均衡器动画 (后文定义)
 static void drawFsVolumeLabel();  // 全屏音量%局部刷新 (后文定义, handleRadioTap 提前调用)
-static void drawFsRecBtn(bool force = false);   // 2026-11-08: 电台录音键 (modeRadio/handleRadioTap 提前调用)
-static uint32_t s_recHintAt = 0;                // "先播放" 短提示时间戳 (点录音但电台没在播)
 
 // ===== 设计稿浅色配色 =====
 #define RGBC(r,g,b) ((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3))
@@ -144,8 +141,6 @@ static const uint16_t C_WIFI   = RGBC(0x2E,0x8B,0x57);   // WiFi 绿
 #define FS_BTN_UP_X 298
 #define FS_BTN_R   22
 #define FS_BTN_MAIN_R 26
-// 2026-11-08: 电台录音键 (播放控制行右侧, 与 −/▶/+ 同一行; 频谱右组从 404 起, 不压)
-#define FS_BTN_REC_X 365
 static unsigned long lastFsTap = 0;   // 全屏底部提示条双击返回判定
 
 // ===== VU 采样 (ESP32-audioI2S v4 弱符号覆盖) =====
@@ -324,7 +319,6 @@ void modeRadio() {
   if (showingFullscreen) {
     if (!modeDrawn[MODE_RADIO]) { drawStationFullscreen(); modeDrawn[MODE_RADIO] = true; }
     updateSpectrum();
-    drawFsRecBtn();          // 录音状态/时长秒级刷新 (内部有状态缓存, 没变就什么都不画)
     return;
   }
 
@@ -456,22 +450,6 @@ void handleRadioTap(uint16_t tx, uint16_t ty) {
         if (radioPlaying) radioPause();
         else if (currentPlayingSid >= 0) playStationAt(currentPlayingSid);
         modeDrawn[MODE_RADIO] = false; return;
-      }
-      // 2026-11-08: 电台录音键 (开始/停止录当前在播的电台)
-      if (tx >= FS_BTN_REC_X - FS_BTN_R - 6 && tx <= FS_BTN_REC_X + FS_BTN_R + 6) {
-        if (radiorec::active()) {
-          Serial.println("[RADIO-TAP] rec stop");
-          radiorec::stop();
-        } else if (!radioPlaying) {
-          Serial.println("[RADIO-TAP] rec ignored: not playing");
-          s_recHintAt = millis();       // 按钮下方显示 2.5s "先播放" (不静默)
-        } else {
-          Serial.println("[RADIO-TAP] rec start");
-          radiorec::start();
-        }
-        playBarDirty = true;
-        drawFsRecBtn(true);
-        return;
       }
     }
     // 底部提示条 (NAV_BAR_Y..NAV_BAR_Y+30): 双击返回 (设计稿 fs-hint)
@@ -849,10 +827,7 @@ void drawRadioPlayBar() {
   if (st) {
     String nm(st->name); fitText(nm, volX - nx - 8);
     font16.drawStringFast(nx, y + 4, nm.c_str(), C_TXT, C_CARD);
-    // 2026-11-08: 电台录音中优先显示红色"正在录音" (全屏页那颗录音键的状态回显)
-    bool recOn = radiorec::active();
-    const char* s2 = recOn ? "正在录音" : (radioPlaying ? "正在播放" : "已暂停");
-    font16.drawString(nx, y + 25, s2, recOn ? C_LIVE : (radioPlaying ? C_ACC : C_DIM), C_CARD);   // 16px 原生
+    font16.drawString(nx, y + 25, radioPlaying ? "正在播放" : "已暂停", radioPlaying ? C_ACC : C_DIM, C_CARD);   // 16px 原生
   } else {
     font16.drawStringFast(nx, y + 7, "点击电台开始播放", C_DIM, C_CARD);
     font16.drawString(nx, y + 27, "左列选分类 · 右列点电台", C_DIM, C_CARD);   // 16px 原生
@@ -958,32 +933,6 @@ static void drawFsVolumeLabel() {
   font16.drawString(240 - font16.textWidth(vtx) / 2, FS_BTN_Y + 36, vtx, radioMuted ? C_LIVE : C_DIM, C_BG);
 }
 
-// 2026-11-08: 电台录音键 (全屏控制行右侧: 深红底红 ● = 待录 / 红底白 ■ = 录音中, 下面跟已录时长)
-static void drawFsRecBtn(bool force) {
-  static int8_t   s_lastOn = -1;
-  static uint32_t s_lastSec = 0xFFFFFFFF;
-  static bool     s_lastHint = false;
-  bool on = radiorec::active();
-  uint32_t sec = on ? radiorec::elapsedSec() : 0;
-  bool hint = (!on && s_recHintAt && (millis() - s_recHintAt < 2500));
-  if (!force && hint == s_lastHint && (int8_t)on == s_lastOn && sec == s_lastSec) return;
-  s_lastOn = (int8_t)on; s_lastSec = sec; s_lastHint = hint;
-  tft.fillCircle(FS_BTN_REC_X, FS_BTN_Y, FS_BTN_R, C_BG);                  // 清圆区
-  tft.fillCircle(FS_BTN_REC_X, FS_BTN_Y, FS_BTN_R, on ? C_LIVE : 0x3800);  // 红底 (待录暗红)
-  if (on) tft.fillRect(FS_BTN_REC_X - 7, FS_BTN_Y - 7, 14, 14, TFT_WHITE); // ■ 停止
-  else    tft.fillCircle(FS_BTN_REC_X, FS_BTN_Y, 8, C_LIVE);               // ● 录制
-  tft.fillRect(FS_BTN_REC_X - 34, FS_BTN_Y + FS_BTN_R + 1, 68, 17, C_BG);  // 清标签区
-  if (on) {
-    char b[12];
-    snprintf(b, sizeof(b), "%02u:%02u", (unsigned)(sec / 60), (unsigned)(sec % 60));
-    font16.drawString(FS_BTN_REC_X - font16.textWidth(b) / 2, FS_BTN_Y + FS_BTN_R + 1, b, C_LIVE, C_BG);
-  } else {
-    const char* lb = hint ? "先播放" : "REC";
-    uint16_t lc = hint ? C_LIVE : C_DIM;
-    font16.drawString(FS_BTN_REC_X - font16.textWidth(lb) / 2, FS_BTN_Y + FS_BTN_R + 1, lb, lc, C_BG);
-  }
-}
-
 void drawStationFullscreen() {
   tft.fillRect(0, 0, 480, PAGE_BOTTOM, C_BG);
   RadioStation* st = (currentPlayingSid >= 0) ? stn(currentPlayingSid) : nullptr;
@@ -1060,7 +1009,6 @@ void drawStationFullscreen() {
   tft.fillCircle(FS_BTN_UP_X, FS_BTN_Y, FS_BTN_R, C_CARD);
   tft.fillRect(FS_BTN_UP_X - 7, FS_BTN_Y - 1, 14, 3, C_TXT);   // + 横 (3px, 与 − 号 14×3 一致)
   tft.fillRect(FS_BTN_UP_X - 1, FS_BTN_Y - 7, 3, 14, C_TXT);   // + 竖 (3px)
-  drawFsRecBtn(true);                                         // 2026-11-08: 录音键 (含已录时长)
   // 音量% 16px (字库原生; 主按钮下方 — 2026-10-28 二批: +30→+36, 与主按钮底(226)拉开 10px 明显可见)
   drawFsVolumeLabel();
   // L/R 声道标签 (设计稿 ch-label, canvas 下方 — 2026-10-28 二批: +4→+8 中心 264, 避让下移的音量%)
