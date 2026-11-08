@@ -1,4 +1,5 @@
-﻿#include "ui_common.h"
+#include "ui_common.h"
+#include "recorder.h"   // 2026-11-07: title 栏 REC 录音键
 
 // ============================================================================
 // 收音机 UI -- 2026-10-20 按 doubao app_17g7jt0w5v1 设计稿重构 (浅色主题)
@@ -176,19 +177,40 @@ void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S
   if (pr > (int32_t)g_vuR) g_vuR = (uint16_t)pr;
 }
 
+// 2026-11-07: 断流自动恢复 —— 取证阶段结束 (cap_now.log 铁证: 上游停发后库内部静默放弃,
+// isRunning=0/radioPlaying=1/缓冲空/字节计数冻结, 三条看门狗全中但 log-only -> 永久无声)。
+// 看门狗改回"自动重连当前台", 走 radioPendingPlayTick 现成路径 (stopSong + connecttohost,
+// 任意页面生效)。60s 窗口内连救 5 次仍死 -> 台源真死, 按 flush"3次失败"同款方式真正停播;
+// 健康播放超过 60s 窗口自动过期, 计数清零 (偶发断流无限自愈)。
+static uint32_t s_recovWinStart = 0;
+static int s_recovCnt = 0;
+static void radioTryRecover(const char* why) {
+  uint32_t now = millis();
+  int sid = currentPlayingSid;
+  Serial.printf("[RADIO] recover (%s) sid=%d buff_f=%u\n", why, sid, (unsigned)audio.inBufferFilled());
+  ringLog("[RADIO] recover (%s) sid=%d", why, sid);
+  if (sid < 0 || !radioPlaying) return;
+  if (now - s_recovWinStart > 60000) { s_recovWinStart = now; s_recovCnt = 0; }
+  if (++s_recovCnt > 5) {
+    s_recovCnt = 0;
+    Serial.println("[RADIO] recover x5 in 60s -> stopped");
+    ringLog("[RADIO] recover x5 -> stop");
+    radioPlaying = false; currentPlayingSid = -1;
+    if (!musicPlaying) STATUS_LED_OFF();
+    modeDrawn[MODE_RADIO] = false; navDirty = true;
+    listScrollDirty = true; playBarDirty = true;
+    return;
+  }
+  pendingPlaySid = sid; pendingPlayAt = now;
+  radioWasRunAt = now;   // 重连宽限: 防看门狗在 FLUSH 延迟+连流期间连环触发
+}
+
 void pumpRadio() {
-  // 2026-11-05: 取证优先。确认断流后不再自动重连 —— 自动重连只会掩盖根因。
-  // 行为: 保存现场(ring buffer + stall dump) -> 停止播放, 事后读文件定位。
   bool running = audio.isRunning();
   if (running) radioWasRunAt = millis();
 
   if (radioPlaying && !running && millis() - radioWasRunAt > 8000) {
-    int sid = currentPlayingSid;
-    ringLog("[RADIO] stream dead >8s (log only) sid=%d buff_f=%u", sid, (unsigned)audio.inBufferFilled());
-    Serial.printf("[RADIO] stream dead >8s (log only) sid=%d buff_f=%u buff_free=%u heap=%u psram=%u\n",
-                  sid, (unsigned)audio.inBufferFilled(), (unsigned)audio.inBufferFree(),
-                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
-    radioWasRunAt = millis();   // 避免每帧刷屏
+    radioTryRecover("dead>8s");   // isRunning=0: 库内部已放弃连接 (今日断流的实测形态)
   }
   // 2026-10-28 死流 watchdog: isRunning true 但数据不推进 (缓冲水位+播放时间戳 8s 无变化)
   // = audio.loop 卡死在网络锁 (streamDetection connected() lwip 锁), 传统 8s/30s watchdog 失效
@@ -198,20 +220,24 @@ void pumpRadio() {
   uint32_t fill = audio.inBufferFilled();
   uint32_t tNow = audio.getAudioCurrentTime();
   if (!s_progInit) { s_lastProgMs = nowMs; s_lastT = tNow; s_lastFill = fill; s_progInit = true; }
-  else if (tNow == s_lastT && fill == s_lastFill && nowMs - s_lastProgMs > 8000) {
-    ringLog("[RADIO] dead-flow buff_f=%u t=%u (log only) sid=%d",
-            (unsigned)fill, (unsigned)tNow, currentPlayingSid);
-    Serial.printf("[RADIO] dead-flow buff_f=%u t=%u (log only) sid=%d\n",
-                  (unsigned)fill, (unsigned)tNow, currentPlayingSid);
-    s_lastProgMs = nowMs;   // 避免每帧刷屏, 下一窗口继续观察
+  else if (radioPlaying && tNow == s_lastT && fill == s_lastFill && nowMs - s_lastProgMs > 8000) {
+    radioTryRecover("dead-flow");   // running=1 但 8s 无数据推进: 连接假活
+    s_lastProgMs = nowMs; s_lastT = tNow; s_lastFill = fill;   // 复位进度基线, 防连环触发
   }
   if (tNow != s_lastT || fill != s_lastFill) { s_lastProgMs = nowMs; s_lastT = tNow; s_lastFill = fill; }
+  // 2026-11-07 快速断流: 缓冲见底 + 播放时间戳冻结 1.5s -> 上游停发/解码已停。
+  // 不等上面 8s 看门狗 (它要等库内部彻底放弃 isRunning=0), 提前重连把空档从 ~10s 压到 ~1~3s。
+  // tNow>1000ms 门槛: 跳过刚连流时的首次缓冲突发 (此时 t=0、buff 也是空, 否则必误杀)。
+  static uint32_t s_stallSince = 0;
+  if (radioPlaying && tNow > 1000 && fill < 500 && tNow == s_lastT) {
+    if (!s_stallSince) s_stallSince = nowMs;
+    else if (nowMs - s_stallSince > 1500) { radioTryRecover("stall-1.5s"); s_stallSince = nowMs; }
+  } else {
+    s_stallSince = 0;
+  }
   // BUILD16 watchdog: "connected but silent" (isRunning true 但 30s 无解码输出 = 毒流)
   if (radioPlaying && millis() - radioWasRunAt > 30000 && audio.getAudioCurrentTime() == 0) {
-    int sid = currentPlayingSid;
-    ringLog("[RADIO] no audio >30s (log only) sid=%d", sid);
-    Serial.printf("[RADIO] no audio >30s (log only) sid=%d\n", sid);
-    radioWasRunAt = millis();
+    radioTryRecover("silent>30s");   // 连接后 30s 无任何解码输出: 毒流
   }
   // 2026-11-06 故障 B 取证: "绿灯但无声" —— isRunning 仍为 1、currentTime 照常递增、
   // 缓冲正常, 但 I2S 输出连续 10s 全零 (解码器只吐静音)。只落盘 + 停播, 不重连、不换源。
@@ -439,6 +465,7 @@ void handleRadioTap(uint16_t tx, uint16_t ty) {
   }
   if (ty < RADIO_HEADER_H) {                          // 状态栏
     if (tx >= 100 && tx <= 134) navSummon();          // 2026-11-02: 顶栏 ≡ 唤出导航栏 (仿天气齿轮)
+    if (tx >= 144 && tx <= 198) recorderStartFromUi(); // 2026-11-08: REC = 只打开录音机界面(不立即录)
     return;
   }
   // ---- 左列分类 (整列滚动: 分组标题+分类行, regionScrollTop = 像素偏移) ----
@@ -522,6 +549,10 @@ void drawRadioHeader() {
                    cx + (int)(cosf(a) * 9), cy + (int)(sinf(a) * 9), C_ACC);
     }
   }
+  // 2026-11-07: REC 录音键 (齿轮右侧; 深红底+红点+红字, 与右侧状态文字留距)
+  tft.fillRoundRect(144, 1, 54, 22, 5, 0x3800);
+  tft.fillCircle(156, 12, 4, TFT_RED);
+  font16.drawString(166, 4, "REC", TFT_RED, 0x3800);
   char buf[12];
   time_t tn = time(nullptr); struct tm tmv; epochToLocalNoLock(tn, tmv);   // BUILDV5-TZFIX: 无锁
   snprintf(buf, sizeof(buf), "%02d:%02d", tmv.tm_hour, tmv.tm_min);

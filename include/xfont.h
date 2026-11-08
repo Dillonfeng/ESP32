@@ -72,7 +72,11 @@ public:
     static int       s_fbOX;       // 缓冲在屏幕上的原点 x (左上角屏幕坐标)
     static int       s_fbOY;       // 缓冲在屏幕上的原点 y (左上角屏幕坐标)
     static void fbBegin(uint16_t* buf, int w, int h, int ox, int oy) { s_fbTarget = buf; s_fbW = w; s_fbH = h; s_fbOX = ox; s_fbOY = oy; }
-    static void fbEnd() { s_fbTarget = nullptr; }
+    static void fbEnd() { s_fbTarget = nullptr; s_fbDstBg = false; }
+    // 2026-11-08 RECP: fb 模式下用"目标缓冲现有像素"当背景色合成字形 —
+    // 在照片/图片底图上叠字时不会出现一块统一的色块 (原有默认 false = 统一 bg, 行为不变)。
+    static bool s_fbDstBg;
+    static void fbDstBg(bool on) { s_fbDstBg = on; }
 
 private:
     TFT_eSPI* _tft;

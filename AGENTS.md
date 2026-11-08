@@ -16,6 +16,14 @@
 - 烧 LittleFS：`& 'D:\ESP32-S3\.platformio\penv\Scripts\pio.exe' run -e s3v5 -t uploadfs`（推送 `data/festival.json` 等）
 - **绝不裸 `pio run`**（会连带旧 env `esp32-s3-devkitc-1` 全量编译，并覆盖共享 `framework-arduinoespressif32`）；`platformio.ini` 已加 `default_envs = s3v5` 作双保险。
 - 串口：`& 'D:\ESP32-S3\.platformio\penv\Scripts\pio.exe' run -e s3v5 -t monitor`，115200，关注 `[Fest] festival.json loaded`
+- **核验"真的用了项目 pio + 真的链的是 V5 音频库"（2026-11-08 加，只读）**：项目 core 是 6.2.0，PATH 里的 `pio.exe` 已坏（`ModuleNotFoundError: platformio`，裸跑直接失败）；`lib_extra_dirs = legacy`，所以 `legacy/` 也在库搜索路径里，必须确认编译用的是 `lib/ESP32-audioI2S` 而不是 legacy 副本：
+  ```powershell
+  & 'D:\ESP32-S3\.platformio\penv\Scripts\pio.exe' --version   # 应为 6.2.0
+  $o='D:\ESP32-S3\.pio\build\s3v5\lib8e3\ESP32-audioI2S\Audio.cpp.o'
+  $t=[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($o))
+  ([regex]::Matches($t,'[ -~]{20,}')) | %{$_.Value} | ?{$_ -match 'audioI2S/src(/Audio\.[ch]pp|/Audio\.h)'} | Select -Unique -First 3
+  ```
+  输出应是 `lib/ESP32-audioI2S/src/Audio.cpp`、且 `legacy` 命中 0 次。若出现 `legacy/...` 说明链到了旧副本（API 不同，`setAudioPlayPosition` 之类会编译不过）。
 - 烧录端口以 `Get-PnpDevice -Class Ports` 里的 **CH340** 为准（当前 **COM4**；COM5/COM6 是蓝牙串口，不能用）。
 - **脱离终端烧录（终端集成抽风时的可靠法，2026-09-25 验证）**：前台 `pio run -t upload` 会被 shell 集成反复掐掉，且之前失败的 `_bootlog.py`/`pio` 子进程会**独占 COM5** → 后续 esptool 卡在 `Connecting...`（**端口抢占死锁**）。解法 = `scripts/flash2.py` + `scripts/_kill_port.ps1`：
   ```powershell
@@ -89,6 +97,68 @@
    - 环境变量 `PREVIEW_TIME=HH:MM:SS` 可指定起始时刻。
 
 ## 已完成 (历史)
+
+- **卡带录音机 第 9 轮 UI/交互修复（2026-11-08；编译 SUCCESS 63.32s，RAM 30.8% / Flash 75.7%；烧录 COM4 SUCCESS 88.10s `Hash of data verified`，串口无 crash；待实机验收）**：
+  - **用户 6 点**：① 磁带索引里非选中行右上角有彩色色块；② 删掉一些录音后新录音"填补"被删文件名 → 找不到最新；③ 卷号与文件名序号顺序反了；④ 快进/快退装入某卷后点 PLAY 仍弹选带卡片；⑤ 整个画面偏暗看不清；⑥ 收音机在播时进不来录音机且点录音键无提示。
+  - **① 色块**：`delButton()` 未上膛时原本 `fillRoundRect(C_SEL)` + `drawRoundRect(C_LINE)` → 奶油行里就是一块彩色方块。改为未上膛只画两笔 `C_LBL` 淡叉（无底无框），上膛才铺琥珀块。
+  - **② 名字回收**：`pickFileName()` 旧逻辑"1..9999 取第一个空号"，删掉 rec_0003 后新录音又叫 3 → 按名字降序排到列表中间。改为 `max(现有最大号, /rec_seq.txt 记录) + 1`，并把新号写回 LittleFS `/rec_seq.txt`（**SD 删文件不影响已用过的号，连最新一卷被删也不会回退**）。列表降序 → 新录永远第一行。
+  - **③ 序号反**：`drawSheet()` 行首原本 `page*SH_ROWS+1` 递增（01/02/03），而列表按文件名降序。新增 `tapeNum(idx)`（从 `/rec_0031.wav` 解析 `31`），行首 / 面板 `TAPE %02d` / "装入·播放" toast 统一用卷号。
+  - **④ PLAY 不播已装入卷**：原 `KEY_PLAY` 在 DECK 下无脑 `openSheet()`。改为 **短按 = 播放当前装入的那一卷**（`playLoadedTape()`），**长按 700ms = 打开磁带索引**（`s_lpKey/s_lpAt/s_lpFired`，松手时若未到 700ms 才执行短按）。另加"点面板 TAPE/文件名区域 = 打开索引"（录音中不响应）。
+  - **⑤ 偏暗根因（已实证，不是照片）**：`data/deck_face.bin` 采样 R 均值 8bit≈156，与原图 PNG 完全一致；原图亮度直方图 **48.6% 像素 > 200**，说明底图本身不暗。真正原因是 **`backlight` 自动亮度（GY-39 环境光）** 在暗房间只给 8~30% duty。修法：`backlight` 新增 `setForceMax(bool)`（强制 100% + 不熄屏 + 不被 tick 覆盖），`enterDeck()` 开、`exitDeck()` 关。**注意：不要在载入时给底图做 ×5/4 提亮——会高光过曝。**
+  - **⑥ 电台在播时进不来**：`recorderStartFromUi()` 原来只 `enterDeck()`。改成先 `radioPlaying=false / musicPlaying=false / pendingPlaySid=-1 / audio.stopSong()` 再进（音频库占着 I2S0 与 PSRAM，`loadDeckFace()` 的 300KB 可能分配失败 → 静默无反应），失败写 log。
+  - **⚠️ 待实机验收**：① 索引非选中行不再有色块；② 删掉中间/最新一卷后新录音号仍继续增大、永远第一行；③ 行首数字=文件名数字（降序一致）；④ 装入 TAPE 后短按 PLAY 直接播，长按 PLAY / 点面板开索引；⑤ 录音机界面满亮（退出后恢复自动亮度）；⑥ 电台在播时点顶栏 REC 能进录音机（电台被停）。
+  - **第二轮返工（用户更正后，2026-11-08；编译 SUCCESS 69.42s / 烧录 COM4 SUCCESS 92.77s `Hash of data verified`，串口无 crash）**：
+    - **① 色块位置更正 = "装入 TAPE XX" 提示条里 XX 右上角，"播放 TAPE XX" 没问题**。排查已排除字库缺字/坏字模（`font_simhei_16.font` 6989 字、"装入播放"advance 全 16、maxA 255），`compositeGlyph` 的 `fbDstBg` 无调用者。修法：`toastTick()` 改**方角 `fillRect`**（圆角会露照片像素）、宽改 `textWidth+26`（AA 字形块 16px 可能宽于 advance，右padding 上限 320）、绘制前先 `pushBgRect` 清边、上下加 `0x39E7` 细描边、画前 `XFont::fbEnd()` 复位（防收音机帧缓冲目标残留）。**根因仍属推定，需实机确认**。
+    - **④ 恢复选带路径**：新增左上角常驻 **"选带"圆角钮** `SEL_X/Y/W/H = 8,4,70,22`（`drawStaticOverlays()` 画、`handleTap()` 最前面命中即 `openSheet()`，录音中只 toast"录音中不能选带"）；PLAY 语义保持 **短按=播装入那卷 / 长按 700ms=开索引**，另保留"点面板 TAPE 区开索引"；`enterDeck()` 引导语改 "REC 录音 · 左上角选带"。
+    - **⚠️ 待实机验收（本轮）**：① 装入 toast 上不再有色块（播放 toast 保持正常）；② 左上"选带"钮能随时调出磁带索引并选带播放；③ 短按 PLAY 仍直接播装入那卷、长按仍开索引。
+  - **第三轮返工：刷新分层（2026-11-08；编译 SUCCESS 75.59s / 烧录 COM4 SUCCESS 102.19s 4 段 `Hash of data verified`，串口无 crash）**：
+    - **用户 3 点（附屏幕照）**：① "快进 10s" 右上角有色块；② 长按 PLAY 600ms 根本点不到；③ 选带卡片打开时两个卷轴还压在卡片上，要求整体梳理刷新逻辑。
+    - **界面分三层（本次确立的模型）**：底图层 = `drawDeckBackground()`/`pushBgRect()`（PSRAM 照片→内部 RAM 中转）；面板层 = `drawReels/drawCounter/drawPanelText/drawLevel/drawRecGlow/drawKeyState`（都是 patch 合成后整块 push）；浮层 = `drawSheet` 卡片 / `toastTick` 提示条 / `drawStaticOverlays` 的选带·✕钮。
+    - **③ 根因 = 浮层画完后没有任何"挂起"机制**：`drawSheet()` 只画一次，之后面板层每帧照旧重画，把卡片一块块"打洞"（照片里卡片内的两个深色方块就是卷盘 patch、卡片右下是面板字、卡片底部是琴键背景）。**修法**：六个面板层函数开头统一 `if (s_sheet) return;`，`animTick()` 顶部同时 `if (s_sheet) return;`（卷盘/计数器/电平/红光全部冻结）；`closeSheet()` 不再逐块还原，改成 `s_sheet=false` 后直接 `repaintDeck()` 整页重铺（少还原一块就会留下"卡片外的碎片"）。
+    - **② 长按 PLAY 点不到的根因 = 状态门只开在 DECK**：`doKey(KEY_PLAY)` 在 `PLAYING` 时只 toast "正在播放"、不置 `s_lpKey` → 长按永远走不到 `openSheet()`。修法：录音态仍只提示"请先停止录音"，**其余状态一律置 `s_lpKey/s_lpAt/s_lpFired`**，长按判定改 `s_state != RECORDING`；松手时只有待机才 `playLoadedTape()`（回放中松手不动）。`LP_MS 700→600`。
+    - **① "10s 右上角色块"的第一版判断（已推翻，见第四轮）**：曾按 `data/deck_face.bin` 的像素统计（提示条带 y26..58 无高饱和像素、红像素只在 x66..199/y81..233）推断为相机紫边；用户实测换文字/换角度色块位置不变，排除反光，属固件。这一版同时把提示条改成**固定几何 280×22 居中**（不再按 `textWidth` 变宽），保留至今。
+  - **第四轮：提示条改"整带原子推屏"（2026-11-08；编译 SUCCESS 62.30s / 烧录 COM4 SUCCESS 89.22s 4 段 `Hash of data verified`，串口无 panic、`internal buf alloc` 正常）**：
+    - **用户否决"反光/硬件"**：色块换文字、换角度都在同一位置，且只在"装入 TAPE XX / 快进 10s"这类提示出现时才有 → 不是常驻缺陷，判定为固件画上去的。
+    - **改法（结构性修法，不是调颜色）**：新增 `composeToastBand(bool)`，把提示条所在的**整条横带**（`BAND_X=0,BAND_W=380,BAND_Y=28,BAND_H=28` → x0..379 / y28..55）在内部 RAM（`s_toastBand`，21KB，`ensureUiBuffers()` 分配、`freeDeckFace()` 释放）里整条合成：先 `memcpy` 底图整带 → 画提示条方角底与上下描边 → 文字用 `XFont::fbBegin(带, W, H, BAND_X, BAND_Y)` 直接写进带里 → **一次 `pushImage` 推整带**。擦除同样整带重铺（`composeToastBand(false)`），不再做"fillRect + 2 条 hline + 逐字形 16×16 贴片"的多事务分步推屏。
+    - **封闭性**：该带内除提示条外没有任何其他绘制（选带/✕ 钮到 y26、卡片 y56 起、计数器 x381 起、面板 x362/y80 起、卷盘 y77 起、电平 y147 起）→ 带内每个像素只可能来自提示条代码，出问题必在这段代码里，可直接按像素定位。
+    - **⚠️ 自查发现的自身坑**：整带若按 480 宽推会压掉计数器左缘（计数器 x381..447 / y34..61 与带子重叠 3px、且 DECK 态没有 animTick 重画计数器 → 会留空白）。故带子止于 x379，与计数器严格不相交。
+    - **⚠️ 待实机验收（第四轮）**：① 快进/快退/装入时提示条上不再有红蓝碎片（**已由用户确认通过**）；② 提示消失后该带完全恢复照片、计数器不残缺；③ 提示条打开时不与卡片/选带钮冲突。
+  - **第五轮：录音态面板字重叠（2026-11-08；编译 SUCCESS 62.03s RAM 30.8% / Flash 75.7%；烧录 COM4 SUCCESS 88.79s 4 段 `Hash of data verified`）**：
+    - **现象**：录音态面板（`PANEL_X=362 / PANEL_W=118`，左界 370、右对齐锚点 474）第二行同时画左 `NEW TAPE` 与右对齐 `MAX 1H` → 两个 8px 点阵串实际宽度和超过 118px 净宽，横向叠在一起。非录音态同排法（`TAPE %02d` + `00:20`）字符更短才没撞。
+    - **改法**：`drawPanelText()` 新增局部 `rowPair(left, right, y, lc, rc)`——按 `tft.textWidth()` 实测宽度算，`rx = 474 - textWidth(right)`，若 `rx < 370 + textWidth(left) + 6` **就干脆不画右边那条**（宁可少一条信息也不许叠字）。录音态首行改短标签 `REC`/`PAUSE` + 同行右侧 `MAX 1H`，第二行 `NEW TAPE` 独占，第三行文件名；非录音态走同一 `rowPair`（`TAPE %02d` + 时长）。
+    - **教训**：**面板 118px 宽里不要凭"字符数×6px"估宽**——TFT_eSPI font2 是变宽点阵（字母/数字 8~11px、空格 4px），`NEW TAPE`(8 字) + `MAX 1H`(6 字) 就能吃掉 110px+。要把左右两项放同一行，必须用 `textWidth()` 实测并留 ≥6px 净距，排不下就换行/降级文案。
+  - **第六轮：录音偶发"麦克风初始化失败"（2026-11-08；编译 SUCCESS 62.45s→64.93s；烧录 COM4 SUCCESS 89.21s→89.37s 4 段 `Hash of data verified`）**：
+    - **现象**：同一台机器有时能录、有时一律报"麦克风初始化失败"，无规律；用户描述"现在总是失败""现在又没问题了"。
+    - **实测决定性数据**（`logs\cap_mic2.log`，抓串口时让用户点一次录音）：`[REC] mic ok, freeI=27915 -> 23087 (maxBlock 10240)` —— 录音那一刻**内部 RAM 只剩 27.9KB，最大空闲块仅 10.2KB**。旧配置 `dma_desc_num=8 / dma_frame_num=256 / 32bit 立体声` ≈ 16KB DMA，且要按多个 2KB 块分配 → 在"开机 autoplay 播过电台、堆已碎片化"的会话里凑不够就失败，没播过电台时够用就成功，这就是"时好时坏"的机制。
+    - **修法**：① `dma_desc_num 8→4`、`dma_frame_num 256→128`（需求 ≈16KB→4KB，实测建立只吃 4828B）；② `micInit()` 逐步骤打 `esp_err_to_name(e)` + `freeI`（以前只打一句 `start fail: i2s`，无法判断卡在哪一步）；③ 进 `micInit()` 先清残留句柄（残留会让 `i2s_new_channel` 报没空通道，导致"失败一次之后次次失败"）；④ `startRecordingNow()` 失败后 `delay(60)` 重试一次并打 `mic ok on retry`；⑤ `enterDeck()` 日志加 `freeI/maxI`。
+    - **教训**：**内部 RAM 只剩 27.9KB / 最大块 10.2KB 时，任何"要十几 KB 且分块分配"的外设建链（I2S DMA 尤甚）都会随机失败**。录音机页常驻 patch(18KB)+底图中转(7.7KB)+提示整带(21KB)，已经把内部 RAM 吃到底，新增缓冲前先算这笔账；诊断外设初始化失败必须先打 err 码和余量，能靠"偶发"描述定位的时间远多于补日志的时间。
+    - **失败原因自报（2026-11-08 加，用户明确"我没法发你 log，也不知道怎么抓"）**：`micFail()` 一次做三件事 —— ① 面板停着显示 `MIC FAIL` / `MIC ERR<code>` / `FREE <n>K` 三行（8px font2，落在 `PANEL_X=362` 面板里），用户拍张照片就能判断是"没内存"还是"没空通道"；② 写 `LittleFS /rec_fail.txt`（完整 err 名 + freeI/maxI + uptime，断电不丢）；③ 打串口。`recorderInit()` 里 `reportPrevFail()` 读该文件 → 打 `[REC] PREV FAIL -> ...` → 删掉。**要完整原因时让用户拔插一次电源即可，助手自己抓 boot 日志，不需要用户碰终端。** `enterDeck()` 清 `s_diag`（不让上次的短码带到新会话），`micInit()` 成功时也清。
+
+- **卡带录音机 第七轮：回放"按暂停立刻变停止"（2026-11-08；编译 SUCCESS 62.74s，烧录 COM4 SUCCESS 88.36s 4 段 `Hash of data verified`，`panic_hits=0`）**：
+  - **根因**：`recorderTick()` 的回放看门狗用 `audio.isRunning()` 判"播完了"（连续 800ms false → `stopPlayback()`）。暂停时库的 `isRunning()` 本身就是 false，于是 800ms 后自动停机 —— 表现为"点暂停能停，马上变停止"。与电台那边 `radioPlaying` 标志门控无关，这里纯粹是状态判据选错。
+  - **修法**：`if (s_paused) s_noRunSince = 0; else if (!audio.isRunning()) {...}`——暂停期间不跑看门狗；`doKey(KEY_PAUSE)` 里切换后 `s_noRunSince = 0`，并 `drawPanelText()` 让面板首行在 `PLAYING`/`PAUSED` 之间跟着切。
+  - **教训**：**"自动停机"类看门狗不要只用一个库状态当判据**——凡是用户可主动静止的路径（暂停）都会让 `isRunning()` 变 false，必须先用"用户意图标志"（`s_paused`）短路掉看门狗。
+
+- **卡带录音机 第 8 轮 UI/交互打磨（2026-11-08；编译 SUCCESS 64.41s，RAM 30.8% / Flash 75.6%；烧录 COM4 SUCCESS 90.78s `Hash of data verified`，boot 正常无 crash）**：
+  - **用户 6 点**：① 快进键旁边那条"收音机播放音频条"的色块要去掉；② `16kHz`、`TAPE` 这类字带背景色块；③ 录音时跳动的电平条不灵敏；④ 录音过程要能暂停；⑤ 没有删除已有录音的地方；⑥ 面板 `◀◀▶▶` 是上一首/下一首语义（"支持不了就算了"）。
+  - **①② 色块根因 = 在照片底图上用"统一底色"叠字/叠块**：旧版 `tft.setTextFont(2)+setTextColor(fg, C_CREAM)` 把 470..480 一带的金属面糊成奶油色块；`drawLevel()` 给 9 格各画 10~12px 高的 `0x18C3` 底块 → 就是用户说的"色块"。**修法（最终形态）**：面板文字与底部 `16kHz MONO` 改回 **8px 点阵字体 + `setTextColor(fg, fg)`（bg==fg）**——TFT_eSPI 在 `bg==fg` 时走"透明背景"，字直接压在照片上，**既无奶油色块也不会胀大**；电平表改 dB 刻度 + **未亮格只画 2px 暗线**（像印在面板上的表尺），不再铺底色块。另外给 `XFont` 留了通用能力 `s_fbDstBg` / `fbDstBg(bool)`（fb 模式下背景取目标缓冲已有像素，`compositeGlyph` 用 `uint8_t mm[256]` 存覆盖率逐像素重算），供将来需要在照片上用 AA 中文的场景。
+  - **⚠️ 本轮返工教训（重要）**：先按"patch + fbDstBg + font16"改面板，用户反馈"**字体变粗变大、文字重叠并顶出面板**"（`LOADED TAPE` 11 字 ×10px ≈110px > 面板净宽 112px，16px 行高挤在 64px 高面板里）。**照片上的小字标注不要动字号**：原来是 font2（8px），保留 8px 只把底色改透明即可；换 AA 16px 会同时改大小/字重/行距，必然溢出。`PATCH_MAXW 96→128`（118×64 面板曾整块合成，内部 RAM 128*72*2=18432B）保留备用。
+  - **③ 不灵敏根因 = 包络衰减太快（每个 loop 都 `level*7/8`，语音瞬间归零）+ 线性峰值对语音几乎不动**：`pumpAudio()` 只把峰值累计到 `s_lvAcc`；`animTick()` 按帧（**50ms ≈20fps**，原 66ms）做"瞬时峰起 + 衰 13/16"，峰值保持 `s_lvPeak` 用 `63/64` 缓落；dB 归一化 `20*log10(level/32768)`，-60..0dB 映射 9 格。
+  - **④ 录音暂停**：`s_recPaused / s_recAccumMs / s_recSegMs`。暂停时 `pumpAudio()` **继续读走 I2S 但直接 return**（既不 DMA 溢出，也不往 WAV 里塞静音）；`counterSec()` 录音态 = `s_recAccumMs + (paused?0:millis()-s_recSegMs)`；`stopRecording()` 用 `counterSec()` 写 `data`/`fmt` 长度（**暂停时间不算进录音时长**）；`KEY_PAUSE` 录音态切换"录音暂停/继续录音"，面板首行变 `PAUSED`（琥珀）+ 卷盘停转 + 电平归零；上限判断也改用 `counterSec()`。
+  - **⑤ 删除已有录音**：磁带索引卡片每行尾加 20×20 删除钮（`delButton()`，`SheetHit kind=3`）。**两段式防误删**：第一次点 → 按钮变琥珀 + 行内时长换成"再点删除"；3s 内再点才 `SD.remove()` → `scanTapes()` 重扫 → 修 `s_curTape`/`s_page` → 重绘。`openSheet()/closeSheet()/翻页/点行` 均清 `s_delArm`。`s_hits[SH_ROWS*2+2]`（每行 2 个热区，删除钮**先入表**，因为它在行矩形内）。
+  - **⑥ `◀◀▶▶` 语义**：**回放中 = ±10s 快进/快退**（`seekBy()`，越界 toast"已到开头/结尾"），**待机(DECK) = 换装入的磁带**（`stepTape(±1)`），录音中仍 toast"录音中不能切带"。UI 图标本身就是快进/快退符号，故不动丝印。
+  - **⚠️ 库 API 坑（本轮编译失败）**：工程实际链接 `lib\ESP32-audioI2S`，它**没有** `setAudioPlayPosition`（只有 `setAudioPlayTime(uint16_t sec)`，按 `m_audioDataStart + bitrate*sec/8` 定位，`sec > 时长` 会直接 `stopSong()`）；`setAudioPlayPosition` 只存在于未被编译的 `legacy\ESP32-audioI2S\src\Audio.h`。**改音频 API 前先看 `lib\` 那份，别照 legacy 副本写。**
+  - **⚠️ 待实机验收**：① 面板/`16kHz MONO` 无奶油色块且字号仍是 8px 点阵（不重叠、不顶出面板）；② 电平条说话时会明显跳（dB 刻度、未亮只有细线）；③ 录音按 PAUSE 停、再按继续，计数冻结，文件时长不含暂停；④ 索引卡片点 X 两次能删掉录音（上膛时行尾显示 `DEL?`）；⑤ 回放中 ▶▶/◀◀ ±10s、待机时换带。
+- **卡带录音机 7 问题改造（2026-11-08；最终编译 SUCCESS 70.17s，RAM 30.7% / Flash 75.6%，lint 0 警告；烧录 COM4 SUCCESS 90.95s，boot `Setup done.` 无 crash，待用户实机验收）**：
+  - **用户 7 点**：① 卷盘外围有方形外框；② 顶栏 REC 只打开界面、不立即录；③ 面板琴键 REC 才开始录且支持多次录制；④ "最长录制 120s" 文字提示是怎么回事；⑤ PLAY 先让用户选带再播；⑥ 增加退出录音机路径；⑦ 遵守项目记忆（编译坑、时钟连续 PSRAM 坑）。追加硬约束：编译必须用项目内 `pio`。
+  - **① 根因（决定性）= `TFT_eSprite::pushRotated(ang, 0xF81F)` 扣色失败**：sprite 16bpp 内部存的是 `0x1FF8`（`_swapBytes=false`），传进去的 transp 是 `0xF81F`，两者不等 → 透明色一点没扣 → 30x30 整块（含四个品红圆角）被推上屏 = "滚动卷盘外面有个方框"。素材实测（`scripts/gen_deck_assets.py` 生成的数组）：`DECK_REEL_L/R` 只有 r>15.2 处是 `0xF81F`，r<14.8 内 0 个品红 → 旧版必然画出方框。**修法 = 彻底弃用 sprite/pushRotated**，在本文件内部 RAM 的 `s_patch`(96×72) 里做**反向双线性采样 + 圆形裁剪（r=14.8）**，并再按 `DECK_REEL_TRANSP` 剔除品红样本（双保险，圆边不可能出现品红描边）。
+  - **②③④⑤⑥ 交互重写**：状态机四态 `IDLE/DECK/RECORDING/PLAYING`（`DECK`=待机面板，`recorderActive()`=非 IDLE，全屏独占）。`recorderStartFromUi()` 只 `enterDeck()`（顶栏 REC 不再自动开录，BOOT 长按保留"进界面并直接开录"）；琴键 REC 启停，`stopRecording()` **不再自动回放**（旧版末尾自动 startPlayback 与"多次录制"冲突已删），停止后留在 DECK + `scanTapes()` 重扫（新录的按名字降序排最前）+ toast "已保存 MM:SS" → 可反复连录多卷；PLAY 在 DECK 下打开"磁带索引"卡片（4 行/页 + 翻页，点行即播、点卡片外关闭、空态提示"按 REC 键录一卷"）；退出 3 条路径 = 右上 ✕ 圆钮(434,4,42,22) / DECK 下 STOP 键 / BOOT 短按，统一走 `exitDeck()`（先停录停播、`freeDeckFace()`、`modeChanged+navDirty+carouselPoke`、置 `s_blockTouchUntilRelease` 吞掉这次触摸会话）。
+  - **④ "最长录制 120s" 出处**：设计稿 `recorder_ui/卡带录音机.html` L57 `REC_MAX=120`、L183 toast `录音中 · 最长 120 秒`、L386 面板 `imprintRight('MAX 120s')`，固件 `config.h REC_MAX_SEC` 同值——**它只是"单次录音"的硬保护（16kHz/16bit 单声道 32KB/s × 120s ≈ 3.8MB，防长时间占 SPI/写爆卡），不是录音总时长上限**。现放宽 `REC_MAX_SEC 3600`（60min≈115MB，对应老式 C60 磁带一盘的量），面板改印 `MAX 1H`（`(REC_MAX_SEC+59)/60` 动态算，整小时印 H），到点自动停机回待机 + toast "已到录制上限, 自动停机"，之后仍可继续录下一卷。
+  - **⑦ 硬件反模式合规**：PSRAM `s_deckBg`(300KB) **绝不直推**，只经 `pushBgRect()`（`memcpy` 到 480×8 内部 RAM `s_bgChunk` 再逐条 push，外层 `startWrite/endWrite`）→ R3；所有动态元素（卷盘/计数器/电平/REC 红光/琴键按下态）走 `patchBegin()→合成→patchPush()` 单次推 → R1/R2 达标；**完全不用 TFT_eSprite**（规避 R4）；`recorderInit()` 不分配，进界面 `loadDeckFace()`、退出 `freeDeckFace()` 全释放（含 s_patch/s_bgChunk）→ 不切碎 PSRAM 连续块（时钟常驻大块不受影响）。另在 main.cpp `recorderActive()` 分支补 `if (radioPlaying) pumpRadio();`（待机面板下电台仍能断流自愈；录/播时 recorder 已把 radioPlaying 置 false，这里是空操作）。
+  - **⚠️ 本次编译两次失败的两个坑（务必记住）**：① `const int PS = 34;` 与 xtensa `specreg.h` 的 `#define PS 230` 撞名 → `error: expected unqualified-id before numeric constant`，改名 `PSZ`；② 前向声明写成 `void startRecordingNow();` 而定义是 `bool` → `error: ambiguating new declaration`。**凡在 .cpp 里用 PS/H/W 之类短宏名先想一遍 xtensa 头里的宏。**
+  - **⚠️ 未验证（待实机验收）**：① 卷盘无方框、转动同心不晃；② 顶栏 REC 只进界面不录；③ 多次连录（每卷独立 `/rec_XXXX.wav`）；④ 面板 `MAX 1H`、到 60min 自动停并回待机；⑤ PLAY 弹"磁带索引"选带再播；⑥ ✕/STOP/BOOT 三条退出路径回收音机页；⑦ 退出后时钟页/轮播刷新正常（PSRAM 已释放）。另需实机核对的库行为：`audio.pauseResume()` 返回语义、`audio.getAudioCurrentTime()` 播放初期是否为 0、`SD.open("/")+openNextFile()` 在 ESP32 SD 库下对挂载点前缀的处理。
+  - **✅ 烧录结果（2026-11-08 COM4）**：`pio.exe run -e s3v5 -t upload --upload-port COM4` → `Hash of data verified`（firmware.bin 1797887 B compressed / 3169664 B）+ `[SUCCESS] 90.95s`；boot 日志（`boot_rec.log`）= `BUILDV5-STEP3` / `LittleFS: OK` / `font16: OK font32: OK`（6989字+361字）/ `[SD] OK total=7584MB used=1382MB` / `Setup done.`，无 crash，autoplay 正常。
+  - **✅ LittleFS 底图已确认在位**：`esptool read_flash 0x810000 0x10000` 抓分区头搜文件名，目录里已有 `deck_face.bin`（+ font16/font32/stations/festival/holidays/radio_meta），**所以只烧 app 就够，不需要 `uploadfs`**（省一次 8MB 重写，也不动设备上的节假日缓存）。判断方法可复用：`python -m esptool --chip esp32s3 -p COM4 -b 921600 read_flash 0x810000 0x10000 head.bin` 后按 ASCII 正则找 `*.bin/*.font/*.json`。
 - **全屏三问题终修：连点同台重置计时器（按钮恒▶+环球不播放）+ 音量%间距 + L/R 避让（2026-10-28 三批；编译 SUCCESS 67.23s 增量，烧录 COM4 SUCCESS 84.62s，lint 0 警告，preview lockstep 核对通过；待用户实机验收）**：
   - **用户 3 问题**：① 音量%和播放键距离"没变"；② 能暂停了但播放/暂停按钮不变（一直显示播放图标）；③ 单击双击逻辑"整个都乱了"，环球资讯直接不播放。
   - **②③ 根因（同一处）= `playStationAt`（radio_db.cpp L264）连点同台时每次 `pendingPlayAt = millis()` 重置计时器**：用户单击电台后需等 `RADIO_PLAY_FLUSH_MS(600)` 才 flush 连流；若 600ms 内（双击窗口 500ms 之外）再点同一台，`pendingPlayAt` 被重置 → `modeRadio()` flush 条件 `millis()-pendingPlayAt>=600` 永不满足 → `pendingPlaySid` 永不消费 → 永不 `connecttohost` → `radioPlaying` 恒 false → **主按钮恒画 ▶ + 环球资讯不播放 + "单击双击乱"（点了有重绘反应但不出声）**。修法 = `playStationAt` 开头（`currentPlayingSid==sid && radioPlaying` 早退之后）加 **`if (pendingPlaySid == sid) return;`**——同一台已在等待起播时不重置计时器，让 flush 正常到期连流；换台（pendingPlaySid 不同）仍重置。

@@ -16,6 +16,7 @@ int       XFont::s_fbW = 0;
 int       XFont::s_fbH = 0;
 int       XFont::s_fbOX = 0;
 int       XFont::s_fbOY = 0;
+bool      XFont::s_fbDstBg = false;
 
 // 2026-11-01 MEM: AA 字形灰度中转缓冲 (64x64 上限) —— 纯 CPU 读写, 不是 DMA 源,
 // 因此可放 PSRAM 并三处共享一块, 释放原先 compositeGlyph/drawScaledChar/drawBigChar
@@ -828,6 +829,7 @@ void XFont::compositeGlyph(int x, int y, int idx, uint16_t fg, uint16_t bg) cons
     else              { memcpy(alphaBuf, _aaPixels + idx * (3 + S * S) + 3, (size_t)S * S); }
     int fr = fg >> 11, fb = fg & 0x1F, fm = (fg >> 5) & 0x3F;
     int br = bg >> 11, bb = bg & 0x1F, bm = (bg >> 5) & 0x3F;
+    uint8_t mm[256];                                // 覆盖率 (fbDstBg 时逐像素用目标色重算)
     for (int oy = 0; oy < 16; oy++) {
         int sy0 = (oy * S) / 16, sy1 = ((oy + 1) * S) / 16;
         if (sy1 <= sy0) sy1 = sy0 + 1;
@@ -838,6 +840,7 @@ void XFont::compositeGlyph(int x, int y, int idx, uint16_t fg, uint16_t bg) cons
             for (int sy = sy0; sy < sy1; sy++)
                 for (int sx = sx0; sx < sx1; sx++) { sum += alphaBuf[sy * S + sx]; n++; }
             int m = (int)(sum / n);                 // 与 blitDialNum 同款: out = (bg*(255-m) + fg*m) / 255
+            mm[oy * 16 + ox] = (uint8_t)m;
             _buf[oy * 16 + ox] = (((br * (255 - m) + fr * m) / 255) << 11) |
                                   (((bm * (255 - m) + fm * m) / 255) << 5)  |
                                   ((bb * (255 - m) + fb * m) / 255);
@@ -846,14 +849,23 @@ void XFont::compositeGlyph(int x, int y, int idx, uint16_t fg, uint16_t bg) cons
     // 2026-10-29 BUILDV5-FB: 帧缓冲输出模式 (radio 列表/侧栏拖动防闪烁)。
     // s_fbTarget 非空时字形像素写入帧缓冲: 缓冲坐标 = 屏幕绝对坐标 - 缓冲原点 (s_fbOX/s_fbOY),
     // 裁剪到缓冲宽高。⚠️ 花屏教训: 局部缓冲必须原点换算, 否则越界错乱。
+    // 2026-11-08 RECP: s_fbDstBg=true 时背景色改为取缓冲里已有的像素 (照片底图叠字不留色块)。
     if (XFont::s_fbTarget) {
+        const bool dstBg = XFont::s_fbDstBg;
         for (int oy = 0; oy < 16; oy++) {
             int yy = y + oy - XFont::s_fbOY;
             if (yy < 0 || yy >= XFont::s_fbH) continue;   // 越界保护 (帧缓冲高度)
             for (int ox = 0; ox < 16; ox++) {
                 int xx = x + ox - XFont::s_fbOX;
                 if (xx < 0 || xx >= XFont::s_fbW) continue;
-                XFont::s_fbTarget[yy * XFont::s_fbW + xx] = _buf[oy * 16 + ox];
+                uint16_t* dp = &XFont::s_fbTarget[yy * XFont::s_fbW + xx];
+                if (!dstBg) { *dp = _buf[oy * 16 + ox]; continue; }
+                int m  = mm[oy * 16 + ox];
+                uint16_t d = *dp;
+                int dr = d >> 11, dg = (d >> 5) & 0x3F, db2 = d & 0x1F;
+                *dp = (uint16_t)((((dr * (255 - m) + fr * m) / 255) << 11) |
+                                 (((dg * (255 - m) + fm * m) / 255) << 5)  |
+                                 ((db2 * (255 - m) + fb * m) / 255));
             }
         }
     } else {

@@ -56,16 +56,44 @@
 
 // ============================================================
 // 引脚分配 - I2S1 (音频输入 ← INMP441 麦克风)
+// 2026-11-07: WS/SCK 从 15/16 迁到 41/42。15/16 是板载 TF 卡 SD_SCK/SD_MISO
+//   (旧定义与 TF 卡硬冲突, 麦克风永远不可能工作), 41/42 即扩展板
+//   "3V G SCL SDA" 4P 插座 (原 I2C 特殊功能停用): SCK←SCL针(GPIO42),
+//   WS←SDA针(GPIO41), VDD/GND 同插座 3V/G; SD 保持 17 (6P插座 V G 14 2 17 3)。
+//   音频输出(Audio库, 新版驱动)占 I2S_NUM_0, 麦克风必须用 I2S_NUM_1。
 // ============================================================
-#define I2S_MIC_BCLK_PIN    16      // I2S位时钟 ← INMP441 SCK
-#define I2S_MIC_LRC_PIN     15      // I2S左右声道时钟 ← INMP441 WS
-#define I2S_MIC_DIN_PIN     17      // I2S数据输入 ← INMP441 SD
+#define I2S_MIC_BCLK_PIN    42      // I2S位时钟 ← INMP441 SCK (4P插座 SCL 针)
+#define I2S_MIC_LRC_PIN     41      // I2S左右声道时钟 ← INMP441 WS (4P插座 SDA 针)
+#define I2S_MIC_DIN_PIN     17      // I2S数据输入 ← INMP441 SD (6P插座)
 #define I2S_MIC_PORT        I2S_NUM_1
+
+// 防呆: 15/16 是 TF 卡 SD_SCK/SD_MISO, 麦克风脚不得占用
+#if I2S_MIC_BCLK_PIN == 15 || I2S_MIC_BCLK_PIN == 16 || \
+    I2S_MIC_LRC_PIN == 15 || I2S_MIC_LRC_PIN == 16 || \
+    I2S_MIC_DIN_PIN  == 15 || I2S_MIC_DIN_PIN  == 16
+#error "I2S_MIC pins conflict with TF card (GPIO15=SD_SCK / GPIO16=SD_MISO)"
+#endif
 
 // INMP441 麦克风配置
 #define MIC_SAMPLE_RATE     16000   // 采样率 16kHz (语音识别用)
 #define MIC_SAMPLE_BITS     32      // 采样位深 32bit
 #define MIC_BUFFER_SIZE     512     // 缓冲区大小
+
+// ============================================================
+// 录音机 (验证 麦克风 I2S1 + TF 卡并行, 为语音功能铺路)
+//   BOOT(GPIO0) 长按 >=REC_LONGPRESS_MS 进界面并开录, 短按停止/退出;
+//   面板琴键 REC 启停, PLAY 先选磁带, ✕/STOP/BOOT 短按退出。
+//   16kHz 单声道 16bit PCM -> TF 卡 /rec_XXXX.wav (需插卡)
+// 2026-11-08: REC_MAX_SEC 120 -> 3600 (1 小时, 对应老式 C60 磁带一盘的量)。
+//   原来固件面板右侧印 "MAX 120s" 只是【单次录音时长上限】的硬保护
+//   (32KB/s x 120s ≈ 3.8MB, 防长时间占 SPI/写爆卡), 不是录音总时长限制;
+//   用户要"和老式磁带对应"后, 单次上限 1 小时 (32000 x 3600 ≈ 115MB),
+//   面板印 "MAX 1H", 到点自动停机回待机, 之后可以继续按 REC 录下一卷。
+// ============================================================
+#define REC_MAX_SEC         3600            // 单次最长录音秒数 (60min = 1 小时)
+#define REC_LONGPRESS_MS    1500            // 长按启动阈值
+#define REC_BTN_PIN         KEY_BOOT_PIN    // 复用 BOOT 按键
+#define REC_GAIN_SHIFT      12              // 32bit槽右移位数=数字增益: 16=原声 14=x4 13=x8 12=x16 (带削波保护)
 
 // ============================================================
 // 引脚分配 - 板载 SPI TF 卡 (2026-10-25 实测更正)

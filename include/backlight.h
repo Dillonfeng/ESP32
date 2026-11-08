@@ -17,5 +17,6 @@ uint8_t percent();
 bool isOff();                // 已熄屏 (背光=0)
 void wake();                 // 触摸唤醒: 强制点亮一段时间
 void setKeepOn(bool on);      // 2026-11-03: 轮播等场景持续点亮 (不熄屏, 暗环境给低亮)
+void setForceMax(bool on);    // 2026-11-08: 强制 100% (录音机等看照片底图的全屏页) + 不熄屏
 
 } // namespace backlight

@@ -20,6 +20,7 @@ uint32_t s_lastStep = 0;
 uint32_t s_darkSince = 0;
 uint32_t s_forceUntil = 0;
 bool     s_keepOn = false;     // 2026-11-03: 轮播等场景持续点亮, 抑制夜间熄屏
+bool     s_forceMax = false;   // 2026-11-08: 强制 100% (录音机全屏看照片底图)
 
 // lux -> 亮度 曲线 (对数区间线性插值)
 struct Pt { float lux; uint8_t pct; };
@@ -92,13 +93,31 @@ void setKeepOn(bool on) {
   }
 }
 
+void setForceMax(bool on) {
+  s_forceMax = on;
+  if (on) {
+    s_off = false;
+    s_darkSince = 0;
+    s_target = 100;          // 立即提亮 (tick 的 4%/100ms 平滑过渡会补齐)
+    apply(100);
+    s_duty = 100;
+  }
+}
+
 void tick() {
   if (!s_ready) return;
   const uint32_t now = millis();
   const gy39::Data& g = gy39::get();
 
+  // 0) 强制满亮 (录音机全屏照片底图): 不看环境光, 也不熄屏
+  if (s_forceMax) {
+    s_off = false;
+    s_darkSince = 0;
+    s_target = 100;
+  }
+
   // 1) 每 250ms 评估一次环境光 (lux 由 GY-39 光照窗口提供, 最旧约 15s)
-  if (now - s_lastEval >= 250) {
+  if (!s_forceMax && now - s_lastEval >= 250) {
     s_lastEval = now;
     if (g.luxOk) {
       if (s_keepOn) {

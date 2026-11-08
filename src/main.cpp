@@ -48,6 +48,7 @@ using weather::WData;  // WData 在 weather 命名空间内, 天气页绘制代�
 #include "sd_storage.h"    // 2026-10-25: 板载 TF 卡存储 (SD 优先/LittleFS 回退)
 #include "gy39.h"          // 2026-10-25: GY-39 气象传感器 (UART2)
 #include "backlight.h"     // 2026-10-25: 背光自动亮度 / 夜间熄屏
+#include "recorder.h"      // 2026-11-07: 录音机 (验证 麦克风I2S1 + TF卡 并行)
 #include "driver/i2s.h"
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -583,6 +584,7 @@ static bool     carouselActive = false;
 static uint8_t  carouselPage = 0;
 static uint32_t carouselPageAt = 0;
 static uint32_t carouselLastInput = 0;     // setup 末尾初始化
+void carouselPoke() { carouselLastInput = millis(); }   // 2026-11-07: 录音/回放结束重置闲置计时
 static bool     carouselSwallowTap = false; // 退出轮播的那一次触摸只退出, 不落页面功能
 
 // 轮播切页: 同 mode 只强制重绘本页(保留 wSub 等页内状态); 跨 mode 走完整切页流程
@@ -1179,6 +1181,8 @@ void setup() {
   bootAutoplayCnr1();
   carouselLastInput = millis();
   Serial.printf("[CAROUSEL] idle baseline at %lums\n", (unsigned long)carouselLastInput);
+
+  recorderInit();  // 2026-11-07: 录音机 (BOOT 键 INPUT_PULLUP)
 }
 
 // ========== 板载 RGB 状态灯 (WS2812B-5050RGB, 原理图 LED2, DIN←GPIO48) ==========
@@ -1346,7 +1350,16 @@ void loop() {
   // 单锁无死锁（touch 不持其他锁；锁内 tft beginTransaction 的 SPI_MUTEX 不与
   // touch 竞争——touch 在 g_spiMutex 外等待）。
   if (g_spiMutex) xSemaphoreTake(g_spiMutex, portMAX_DELAY);
-  handleTouch();
+  recorderTick();                // 2026-11-07: 录音机按键状态机 + 录音泵 (REC UI 在锁内绘制)
+  if (recorderActive()) {        // 2026-11-08: 卡带录音机全屏独占 (待机面板/录音/回放), 屏蔽触摸与正常页面绘制
+    // 待机面板下电台还在播 -> 继续断流自愈/续播 (pumpRadio 只在 radioPlaying 时才有动作;
+    // 录音/回放时 recorder 已把 radioPlaying 置 false, 这里是空操作)
+    if (radioPlaying) pumpRadio();
+    if (g_spiMutex) xSemaphoreGive(g_spiMutex);
+    vTaskDelay(1);               // BUILDUI8-WDTFIX: 保持 IDLE1 让位
+    return;
+  }
+  if (!recorderBlockTouch()) handleTouch();   // 2026-11-07: 触摸停止录音后吞掉本次触摸会话
   carouselTick();   // 2026-11-03: 闲置轮播计时/翻页 (只读 millis, 不依赖页面刷新)
   // 2026-11-04: 收音机断流健康检查 + pendingPlay 连接泵 —— 每帧执行且与当前页面无关,
   // 使断流自动重连在轮播/时钟/天气页也能生效 (pumpRadio 只在 radioPlaying 时才有动作)。
