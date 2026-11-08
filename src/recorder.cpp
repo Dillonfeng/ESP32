@@ -945,6 +945,10 @@ void scanTapes() {
       readWavFmt(f, sz, &t.rate, &t.ch, &bits, &dataBytes);
       uint32_t bps = t.rate * t.ch * 2;                          // 本工程只写 16bit
       t.dur = bps ? (dataBytes / bps) : 0;
+      if (strncmp(base, "rad_", 4) == 0) {   // 电台卷: 打印解析结果, 便于核对"索引里有没有这卷"
+        logLine("[REC] tape %s rate=%u ch=%u dur=%us sz=%u", base, (unsigned)t.rate,
+                (unsigned)t.ch, (unsigned)t.dur, (unsigned)sz);
+      }
       s_tapeN++;
     }
     f.close();
@@ -1460,11 +1464,9 @@ void buttonTick() {
       else if (s_state == RecState::DECK)      { exitDeck(); s_blockTouchUntilRelease = true; }
     }
   }
-  if (s_btnStable == LOW && !s_ignoreUntilRelease && s_state == RecState::IDLE &&
-      (now - s_pressMs) >= REC_LONGPRESS_MS) {
-    if (enterDeck()) startRecordingNow();       // BOOT 长按 = 直接进界面并开录
-    s_ignoreUntilRelease = true;
-  }
+  // 2026-11-08 修 BUG: 去掉"BOOT 长按自动进界面并开录"。
+  // GPIO0 是 strapping 脚, 串口工具/CH340 的 DTR-RTS 自动复位电路会把 IO0 拉低,
+  // 表现为"录音机自己弹出来还自动录音", 把 SD 写满。现在录音只能由面板 REC 键触发。
 }
 
 } // anonymous namespace
@@ -1475,6 +1477,9 @@ void buttonTick() {
 void recorderInit() {
   pinMode(REC_BTN_PIN, INPUT_PULLUP);
   s_btnStable = s_btnRaw = (uint8_t)digitalRead(REC_BTN_PIN);
+  // 开机时按键已是低 (被串口工具/自动复位电路拉低, 或真的被按住): 先忽略到松开为止,
+  // 否则一上电就当成"短按"去停机/退界面
+  if (s_btnStable == LOW) s_ignoreUntilRelease = true;
   // 不常驻分配 PSRAM: deck_face 300KB 会切碎 PSRAM 连续块, 破坏时钟的大连续块需求。
   // 进界面 loadDeckFace(), 退出 freeDeckFace()。
   reportPrevFail();      // 上次录音失败的完整原因 (存 LittleFS, 断电不丢) -> boot 日志
@@ -1545,6 +1550,16 @@ void recorderTick() {
       else if (millis() - s_noRunSince > 800) { stopPlayback(false); toastTick(); return; }
     } else {
       s_noRunSince = 0;
+    }
+    // 回放诊断: 每秒一行, 看库到底在不在跑、采样率/位置有没有动 (排查"有文件没声音")
+    static uint32_t s_playLogMs = 0;
+    if (millis() - s_playLogMs >= 1000) {
+      s_playLogMs = millis();
+      logLine("[REC] play run=%d sr=%u pos=%u tape=%s rate=%u ch=%u",
+              (int)audio.isRunning(), (unsigned)audio.getSampleRate(),
+              (unsigned)audio.getAudioCurrentTime(),
+              s_tapes[s_curTape].name, (unsigned)s_tapes[s_curTape].rate,
+              (unsigned)s_tapes[s_curTape].ch);
     }
     animTick(false);
   }

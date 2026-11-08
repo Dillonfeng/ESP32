@@ -1184,6 +1184,7 @@ void setup() {
   Serial.printf("[CAROUSEL] idle baseline at %lums\n", (unsigned long)carouselLastInput);
 
   recorderInit();  // 2026-11-07: 录音机 (BOOT 键 INPUT_PULLUP)
+  radiorec::init(); // 2026-11-08: 打印上次电台录音的自检结果 (/rad_diag.txt)
 }
 
 // ========== 板载 RGB 状态灯 (WS2812B-5050RGB, 原理图 LED2, DIN←GPIO48) ==========
