@@ -41,3 +41,13 @@ preview/*.gif
 **/*.png
 **/*.gif
 preview/diag_alm/
+
+# --- 录音机 UI 设计稿（固件界面 1:1 参照 + 底图原图，2026-11-12 补入） ---
+# 负向规则必须写在上面 "temp clutter" 之后，git 取最后匹配的一条
+!/recorder_ui/
+!/recorder_ui/*.html
+!/recorder_ui/assets/
+!/recorder_ui/assets/*.png
+!/recorder_ui/assets/*.jpg
+# 但 assets 里下划线前缀的临时测量/候选图仍不入库（纯调试中间产物）
+/recorder_ui/assets/_*
