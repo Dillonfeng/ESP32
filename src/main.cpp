@@ -1215,6 +1215,144 @@ static void statusLedTick() {
   }
 }
 
+// ============================================================
+// 2026-11-08 诊断命令（电台录音回退后的取证工具，串口手动触发，不影响正常功能）
+//   'K' 盘点 rec_ 各卷内容峰值，删掉"静音误录"的卷（峰值<300 或 0 字节）
+//   'G' 把每卷 rad_ 的前 1.0 秒样本按十六进制导出 → PC 端重建成 WAV 验证
+//   'V' 播放自检：播一卷 rad_ wav 5 秒，每 200ms 打库状态（判解码有没有推进）
+// ============================================================
+static bool diagWavHdr(File& f, uint32_t sz, uint32_t* rate, uint16_t* ch, uint16_t* bits,
+                       uint32_t* dataLen) {
+  *rate = 0; *ch = 0; *bits = 0; *dataLen = 0;
+  if (sz < 44) return false;
+  uint8_t h[44];
+  if (!f.seek(0)) return false;
+  if (f.read(h, 44) != 44) return false;
+  if (memcmp(h, "RIFF", 4) != 0) return false;
+  *ch   = (uint16_t)(h[22] | (h[23] << 8));
+  *rate = (uint32_t)h[24] | ((uint32_t)h[25] << 8) | ((uint32_t)h[26] << 16) | ((uint32_t)h[27] << 24);
+  *bits = (uint16_t)(h[34] | (h[35] << 8));
+  *dataLen = (uint32_t)h[40] | ((uint32_t)h[41] << 8) | ((uint32_t)h[42] << 16) | ((uint32_t)h[43] << 24);
+  return true;
+}
+
+static uint32_t diagPeak(File& f, uint32_t sz) {
+  uint32_t step = sz / 16;
+  if (step < 4096) step = 4096;
+  uint8_t buf[512];
+  uint32_t pk = 0;
+  for (uint32_t off = 44; off + 2 < sz; off += step) {
+    if (!f.seek(off)) break;
+    size_t n = f.read(buf, sizeof(buf));
+    for (size_t i = 0; i + 1 < n; i += 2) {
+      int16_t v = (int16_t)(buf[i] | (buf[i + 1] << 8));
+      uint32_t a = (uint32_t)(v < 0 ? -(int32_t)v : (int32_t)v);
+      if (a > pk) pk = a;
+    }
+  }
+  return pk;
+}
+
+static void cmdCleanSilentRec() {
+  if (!g_spiMutex) return;
+  xSemaphoreTake(g_spiMutex, portMAX_DELAY);
+  int nDel = 0, nKeep = 0;
+  File root = SD.open("/");
+  if (root) {
+    File f;
+    while ((f = root.openNextFile())) {
+      const char* p = f.name();
+      const char* b = p ? ((strrchr(p, '/')) ? strrchr(p, '/') + 1 : p) : nullptr;
+      bool del = false;
+      if (b && strncmp(b, "rec_", 4) == 0) {
+        uint32_t sz = (uint32_t)f.size();
+        uint32_t pk = (sz > 44) ? diagPeak(f, sz) : 0;
+        Serial.printf("[CLEAN] %s sz=%uK pk=%u\n", b, (unsigned)(sz >> 10), (unsigned)pk);
+        if (sz <= 44 || pk < 300) del = true;      // 0 字节 / 只有静音的误录卷
+      }
+      char path[32];
+      snprintf(path, sizeof(path), "/%s", b ? b : "");
+      f.close();
+      if (del && b) {
+        if (SD.remove(path)) { nDel++; Serial.printf("[CLEAN] deleted %s\n", b); }
+        else                 { Serial.printf("[CLEAN] delete FAIL %s\n", b); }
+      } else if (b && strncmp(b, "rec_", 4) == 0) nKeep++;
+    }
+    if (f) f.close();
+    root.close();
+  }
+  Serial.printf("[CLEAN] done deleted=%d kept=%d\n", nDel, nKeep);
+  xSemaphoreGive(g_spiMutex);
+}
+
+static void cmdDumpRad() {
+  if (!g_spiMutex) return;
+  xSemaphoreTake(g_spiMutex, portMAX_DELAY);
+  int n = 0;
+  File root = SD.open("/");
+  if (root) {
+    File f;
+    while ((f = root.openNextFile())) {
+      const char* p = f.name();
+      const char* b = p ? ((strrchr(p, '/')) ? strrchr(p, '/') + 1 : p) : nullptr;
+      if (b && strncmp(b, "rad_", 4) == 0) {
+        uint32_t sz = (uint32_t)f.size(), rate = 0, dl = 0;
+        uint16_t ch = 0, bits = 0;
+        if (diagWavHdr(f, sz, &rate, &ch, &bits, &dl) && ch && bits) {
+          uint32_t bps  = rate * ch * (bits / 8);
+          uint32_t want = bps;                 // 1.0 秒
+          if (want > dl) want = dl;
+          Serial.printf("[DUMP] %s rate=%u ch=%u bits=%u bytes=%u\n",
+                        b, (unsigned)rate, (unsigned)ch, (unsigned)bits, (unsigned)want);
+          f.seek(44);
+          uint32_t sent = 0;
+          uint8_t buf[32];
+          char line[32 * 2 + 1];
+          while (sent < want) {
+            size_t n2 = (want - sent > sizeof(buf)) ? sizeof(buf) : (want - sent);
+            size_t got = f.read(buf, n2);
+            if (!got) break;
+            for (size_t k = 0; k < got; k++) {
+              line[k * 2]     = "0123456789abcdef"[(buf[k] >> 4) & 0xF];
+              line[k * 2 + 1] = "0123456789abcdef"[buf[k] & 0xF];
+            }
+            line[got * 2] = 0;
+            Serial.println(line);
+            sent += (uint32_t)got;
+            delay(2);                          // 让 UART FIFO 跟得上
+          }
+          Serial.printf("[/DUMP] %s sent=%u\n", b, (unsigned)sent);
+          n++;
+        }
+      }
+      f.close();
+    }
+    if (f) f.close();
+    root.close();
+  }
+  Serial.printf("[DUMP] files=%d\n", n);
+  xSemaphoreGive(g_spiMutex);
+}
+
+static void cmdPlayTest(const char* name) {
+  radioPlaying = false; musicPlaying = false; pendingPlaySid = -1;
+  audio.stopSong();
+  delay(60);
+  bool ok = audio.connecttoFS(SD, name);
+  Serial.printf("[WAVTEST] connect %s -> %d\n", name, (int)ok);
+  if (!ok) return;
+  for (int i = 0; i < 25; i++) {
+    audio.loop();
+    Serial.printf("[WAVTEST] t=%dms run=%d sr=%u pos=%u vol=%u fsz=%u\n", i * 200,
+                  (int)audio.isRunning(), (unsigned)audio.getSampleRate(),
+                  (unsigned)audio.getAudioCurrentTime(), (unsigned)audio.getVolume(),
+                  (unsigned)audio.getFileSize());
+    delay(200);
+  }
+  audio.stopSong();
+  Serial.println("[WAVTEST] stopped (radio 已停, 需要手动再点电台)");
+}
+
 void loop() {
   // BUILDV5-HLSFIX: 常规打印已删除（生产模式）——多任务并发打印 → UART 竞争崩溃
   // （cap_fix8/9/10/11 链B 实证）。仅保留错误级与一次性状态打印。
@@ -1309,10 +1447,13 @@ void loop() {
       else if (c == 't' || c == 'T') {               // BUILDV5-STEP3-TFIX4: 原始触摸数据转储
         touchDiag(15);
       }
-      else if (c == 'D' || c == 'd') {               // 2026-10-28: 断流自取证 dump (RAM ring + /stall.txt)
+      else if (c == 'D' || c == 'd') {               // 2026-11-08: 电台录音取证命令（见上：K/G/V）
         dumpRing();
         dumpStallFile();
       }
+      else if (c == 'K' || c == 'k') { cmdCleanSilentRec(); }
+      else if (c == 'G' || c == 'g') { cmdDumpRad(); }
+      else if (c == 'V' || c == 'v') { cmdPlayTest("/rad_0030.wav"); }
       else if (c == 'c' || c == 'C') {               // BUILDV5-CALIB: 图形化触摸校准
         radioPlaying = false; musicPlaying = false;
         audio.stopSong();
